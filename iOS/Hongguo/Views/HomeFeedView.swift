@@ -258,13 +258,11 @@ struct HomeFeedView: View {
                 guard requestID == request, requestedSeriesID == series.id, model.revision == revision, activeTab else { return }
                 trace("detail_ready")
                 let record = model.record(for: series)
-                let available = detail.episodes.filter(\.isAvailable)
-                var episode = record.flatMap { entry in available.first(where: { $0.id == entry.episode.id }) } ?? available.first
-                if let entry = record, entry.progress >= 0.98,
-                   let next = available.first(where: { $0.number > entry.episode.number }) { episode = next }
-                guard let episode else { throw CatalogError.unavailablePlayback }
-                route = FeedPlaybackRoute(detail: detail, episode: episode,
-                    seconds: record?.episode.id == episode.id ? record?.seconds ?? 0 : 0, service: service,
+                guard let continuation = PlaybackContinuation.preferred(seriesID: detail.series.id, episodes: detail.episodes, record: record) else {
+                    throw CatalogError.unavailablePlayback
+                }
+                route = FeedPlaybackRoute(detail: detail, episode: continuation.episode,
+                    seconds: continuation.seconds, service: service,
                     onProgress: model.playbackProgressHandler(for: detail.series, episodes: detail.episodes))
             } catch is CancellationError {
                 if requestID == request {

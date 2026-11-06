@@ -209,16 +209,13 @@ struct DetailView: View {
 
     private var startEpisode: Episode? {
         guard let detail else { return nil }
-        if let record = model.record(for: current), let index = detail.episodes.firstIndex(where: { $0.id == record.episode.id && $0.isAvailable }) {
-            if record.progress >= 0.98, let next = detail.episodes.dropFirst(index + 1).first(where: \.isAvailable) { return next }
-            return detail.episodes[index]
-        }
-        return detail.episodes.first { $0.isAvailable }
+        return PlaybackContinuation.preferred(seriesID: detail.series.id, episodes: detail.episodes,
+                                              record: model.record(for: current))?.episode
     }
 
     private func startLabel(for episode: Episode) -> String {
         guard let record = model.record(for: current) else { return "開始觀看" }
-        if record.progress >= 0.98 && record.episode.id == episode.id { return "重新觀看 · 第 \(episode.number) 集" }
+        if record.isEpisodeCompleted && record.episode.id == episode.id { return "重新觀看 · 第 \(episode.number) 集" }
         return "接著看 · 第 \(episode.number) 集"
     }
 
@@ -252,8 +249,9 @@ struct DetailView: View {
     private func play(_ episode: Episode) {
         guard let detail, let service = loadedService, episode.isAvailable else { return }
         let record = model.record(for: detail.series)
-        route = PlaybackRoute(detail: detail, episode: episode,
-                              seconds: record?.episode.id == episode.id ? record?.seconds ?? 0 : 0,
+        guard let continuation = PlaybackContinuation.selected(seriesID: detail.series.id, episode: episode, record: record) else { return }
+        route = PlaybackRoute(detail: detail, episode: continuation.episode,
+                              seconds: continuation.seconds,
                               service: service, onProgress: model.playbackProgressHandler(for: detail.series, episodes: detail.episodes))
     }
 }
