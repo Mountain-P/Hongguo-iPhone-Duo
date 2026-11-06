@@ -45,6 +45,7 @@ final class AppModel: ObservableObject {
     var librarySyncError: String? { library.syncError }
     var lastLibrarySync: Date? { library.lastSync }
     var pendingSyncCount: Int { library.pendingCount }
+    var retryRequiredSyncCount: Int { library.retryRequiredCount }
     var accountNeedsLogin: Bool { library.needsLogin }
     var libraryCoverageText: String? { library.coverageText }
     var canUseAccountLibrary: Bool { playbackMode == .native && hasAccount }

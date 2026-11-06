@@ -216,7 +216,7 @@ struct LibraryView: View {
                     }
                 }
                 Spacer(minLength: 0)
-                Button(model.accountNeedsLogin ? "重新登入" : "立即同步") {
+                Button(model.accountNeedsLogin ? "重新登入" : model.retryRequiredSyncCount > 0 ? "同步並重試" : "立即同步") {
                     if model.accountNeedsLogin {
                         showingLogin = true
                     } else {
@@ -225,6 +225,10 @@ struct LibraryView: View {
                 }
                 .buttonStyle(.bordered).controlSize(.small).tint(Theme.accent)
                 .disabled(model.librarySyncing)
+            }
+            if model.retryRequiredSyncCount > 0 {
+                Text("有 \(model.retryRequiredSyncCount) 筆變更尚未確認，已暫停自動重送；按「同步並重試」才會再次提交。")
+                    .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.librarySyncError, !error.isEmpty {
                 Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
@@ -250,6 +254,7 @@ struct LibraryView: View {
     private var syncStatus: String {
         if model.librarySyncing { return model.librarySyncPhase.isEmpty ? "正在同步片庫" : model.librarySyncPhase }
         if model.accountNeedsLogin { return "登入已到期，片庫快取已保留" }
+        if model.retryRequiredSyncCount > 0 { return "有 \(model.retryRequiredSyncCount) 筆變更需手動重試" }
         if model.pendingSyncCount > 0 { return "有 \(model.pendingSyncCount) 筆變更等待同步" }
         if model.librarySyncError != nil { return "同步尚未完成，已保留手機片庫" }
         return model.lastLibrarySync == nil ? "可同步紅果收藏與觀看進度" : "片庫已同步"

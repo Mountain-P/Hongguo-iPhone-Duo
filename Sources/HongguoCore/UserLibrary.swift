@@ -65,10 +65,20 @@ public struct FavoriteMutation: Codable, Hashable, Identifiable, Sendable {
     public let series: Series
     public let isFavorite: Bool
     public let updatedAt: Date
+    /// Persist before an attempt; only an explicit user retry may resend it.
+    public let retryRequired: Bool
     public var id: UUID { operationID }
     public var seriesID: String { series.id }
-    public init(operationID: UUID = UUID(), series: Series, isFavorite: Bool, updatedAt: Date = Date()) {
+    public init(operationID: UUID = UUID(), series: Series, isFavorite: Bool, updatedAt: Date = Date(), retryRequired: Bool = false) {
         self.operationID = operationID; self.series = series; self.isFavorite = isFavorite; self.updatedAt = updatedAt
+        self.retryRequired = retryRequired
+    }
+    private enum CodingKeys: String, CodingKey { case operationID, series, isFavorite, updatedAt, retryRequired }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(operationID: try values.decode(UUID.self, forKey: .operationID), series: try values.decode(Series.self, forKey: .series),
+                  isFavorite: try values.decode(Bool.self, forKey: .isFavorite), updatedAt: try values.decode(Date.self, forKey: .updatedAt),
+                  retryRequired: try values.decodeIfPresent(Bool.self, forKey: .retryRequired) ?? false)
     }
 }
 
@@ -78,10 +88,19 @@ public struct ProgressMutation: Codable, Hashable, Identifiable, Sendable {
     /// nil is a local deletion intent, not a claim that an upstream delete API exists.
     public let record: WatchRecord?
     public let updatedAt: Date
+    public let retryRequired: Bool
     public var id: UUID { operationID }
     public var isDeletion: Bool { record == nil }
-    public init(operationID: UUID = UUID(), seriesID: String, record: WatchRecord?, updatedAt: Date = Date()) {
+    public init(operationID: UUID = UUID(), seriesID: String, record: WatchRecord?, updatedAt: Date = Date(), retryRequired: Bool = false) {
         self.operationID = operationID; self.seriesID = seriesID; self.record = record; self.updatedAt = updatedAt
+        self.retryRequired = retryRequired
+    }
+    private enum CodingKeys: String, CodingKey { case operationID, seriesID, record, updatedAt, retryRequired }
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(operationID: try values.decode(UUID.self, forKey: .operationID), seriesID: try values.decode(String.self, forKey: .seriesID),
+                  record: try values.decodeIfPresent(WatchRecord.self, forKey: .record), updatedAt: try values.decode(Date.self, forKey: .updatedAt),
+                  retryRequired: try values.decodeIfPresent(Bool.self, forKey: .retryRequired) ?? false)
     }
 }
 
@@ -101,6 +120,35 @@ public struct LibraryState: Codable, Hashable, Sendable {
     public var favorites: [Series] { snapshot.favorites }
     public var history: [WatchRecord] { snapshot.history }
     public var episodeHistory: [WatchRecord] { snapshot.episodeHistory }
+    public var retryRequiredCount: Int {
+        pendingFavorites.filter(\.retryRequired).count + pendingProgress.filter { !$0.isDeletion && $0.retryRequired }.count
+    }
+    public var automaticPendingCount: Int { eligibleFavorites().count + eligibleProgress().count }
+
+    public func eligibleFavorites(manualRetry: Bool = false) -> [FavoriteMutation] {
+        pendingFavorites.filter { manualRetry || !$0.retryRequired }
+    }
+    public func eligibleProgress(manualRetry: Bool = false) -> [ProgressMutation] {
+        pendingProgress.filter { !$0.isDeletion && (manualRetry || !$0.retryRequired) }
+    }
+
+    /// The caller must durably save this state before beginning any write.
+    @discardableResult
+    public mutating func markFavoriteAttempt(operationID: UUID) -> Bool {
+        guard let index = pendingFavorites.firstIndex(where: { $0.operationID == operationID }) else { return false }
+        let value = pendingFavorites[index]
+        pendingFavorites[index] = FavoriteMutation(operationID: value.operationID, series: value.series, isFavorite: value.isFavorite,
+                                                   updatedAt: value.updatedAt, retryRequired: true)
+        return true
+    }
+    @discardableResult
+    public mutating func markProgressAttempt(operationID: UUID) -> Bool {
+        guard let index = pendingProgress.firstIndex(where: { $0.operationID == operationID && !$0.isDeletion }) else { return false }
+        let value = pendingProgress[index]
+        pendingProgress[index] = ProgressMutation(operationID: value.operationID, seriesID: value.seriesID, record: value.record,
+                                                   updatedAt: value.updatedAt, retryRequired: true)
+        return true
+    }
 
     public init(scope: LibraryScope, snapshot: LibrarySnapshot = .init(), pendingFavorites: [FavoriteMutation] = [], pendingProgress: [ProgressMutation] = []) throws {
         try LibraryRules.validate(scope)
@@ -141,12 +189,12 @@ public struct LibraryState: Codable, Hashable, Sendable {
         pendingFavorites = pendingFavorites.map { value in
             guard value.seriesID == id else { return value }
             return FavoriteMutation(operationID: value.operationID, series: series,
-                                    isFavorite: value.isFavorite, updatedAt: value.updatedAt)
+                                    isFavorite: value.isFavorite, updatedAt: value.updatedAt, retryRequired: value.retryRequired)
         }
         pendingProgress = pendingProgress.map { value in
             guard value.record?.series.id == id else { return value }
             return ProgressMutation(operationID: value.operationID, seriesID: value.seriesID,
-                                    record: value.record.map(enriched), updatedAt: value.updatedAt)
+                                    record: value.record.map(enriched), updatedAt: value.updatedAt, retryRequired: value.retryRequired)
         }
     }
 
@@ -222,7 +270,8 @@ public struct LibraryState: Codable, Hashable, Sendable {
         // If a remote record legitimately wins, a pending upload must never retain an older resume position.
         for pending in copy.pendingProgress where !pending.isDeletion {
             if let latest = copy.record(for: pending.seriesID), !LibraryRules.sameProgress(pending.record, latest) {
-                copy.enqueue(ProgressMutation(seriesID: latest.series.id, record: latest, updatedAt: latest.updatedAt))
+                copy.enqueue(ProgressMutation(seriesID: latest.series.id, record: latest, updatedAt: latest.updatedAt,
+                                              retryRequired: pending.retryRequired))
             }
         }
         try copy.applyFavoriteIntents()

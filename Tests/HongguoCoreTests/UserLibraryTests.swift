@@ -280,6 +280,113 @@ struct UserLibraryTests {
             #expect(state == before)
         }
     }
+
+    @Test func attemptGateSurvivesCrashRoundTripUntilExactAcknowledgement() throws {
+        var state = try LibraryState(scope: account)
+        try state.setFavorite(librarySeries(), isFavorite: true, at: libraryDate(10))
+        try state.record(libraryRecord(seconds: 15, time: 10))
+        let favoriteID = state.pendingFavorites[0].operationID, progressID = state.pendingProgress[0].operationID
+        let favoriteMarked = state.markFavoriteAttempt(operationID: favoriteID)
+        let progressMarked = state.markProgressAttempt(operationID: progressID)
+        #expect(favoriteMarked && progressMarked)
+
+        // This is the durable snapshot saved before the request starts. Losing
+        // the process or the server reply must not authorize another attempt.
+        let savedBeforeWrite = try JSONEncoder().encode(state)
+        var relaunched = try JSONDecoder().decode(LibraryState.self, from: savedBeforeWrite)
+        #expect(relaunched.retryRequiredCount == 2 && relaunched.automaticPendingCount == 0)
+        #expect(relaunched.eligibleFavorites().isEmpty && relaunched.eligibleProgress().isEmpty)
+        #expect(relaunched.eligibleFavorites(manualRetry: true).map(\.id) == [favoriteID])
+        #expect(relaunched.eligibleProgress(manualRetry: true).map(\.id) == [progressID])
+        // Selecting a manual retry does not clear the durable gate in advance.
+        #expect(relaunched.retryRequiredCount == 2)
+        relaunched.acknowledgeFavorites(operationIDs: [UUID()])
+        relaunched.acknowledgeProgress(operationIDs: [UUID()])
+        #expect(relaunched.retryRequiredCount == 2)
+        relaunched.acknowledgeFavorites(operationIDs: [favoriteID])
+        relaunched.acknowledgeProgress(operationIDs: [progressID])
+        #expect(relaunched.retryRequiredCount == 0 && relaunched.automaticPendingCount == 0)
+    }
+
+    @Test func olderLibraryWithoutRetryFieldsRemainsAutomaticallyEligible() throws {
+        var state = try LibraryState(scope: account)
+        try state.setFavorite(librarySeries(), isFavorite: true, at: libraryDate(10))
+        try state.record(libraryRecord(time: 10))
+        var legacy = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any])
+        for key in ["pendingFavorites", "pendingProgress"] {
+            let values = try #require(legacy[key] as? [[String: Any]])
+            legacy[key] = values.map { value in var old = value; old.removeValue(forKey: "retryRequired"); return old }
+        }
+        let decoded = try JSONDecoder().decode(LibraryState.self, from: JSONSerialization.data(withJSONObject: legacy))
+        #expect(decoded == state)
+        #expect(decoded.retryRequiredCount == 0 && decoded.automaticPendingCount == 2)
+    }
+
+    @Test func blockedHeadDoesNotConsumeTheAutomaticBatchOrBlockIndependentChanges() throws {
+        var state = try LibraryState(scope: account)
+        for index in 0..<25 {
+            try state.setFavorite(librarySeries(String(100 + index)), isFavorite: true, at: libraryDate(index))
+            let marked = state.markFavoriteAttempt(operationID: state.pendingFavorites.last!.operationID)
+            #expect(marked)
+        }
+        try state.setFavorite(librarySeries("999"), isFavorite: true, at: libraryDate(30))
+        let newID = state.pendingFavorites.last!.operationID
+        #expect(Array(state.eligibleFavorites().prefix(20)).map(\.id) == [newID])
+        #expect(state.eligibleFavorites(manualRetry: true).count == 26)
+        let marked = state.markFavoriteAttempt(operationID: newID)
+        #expect(marked)
+        state.acknowledgeFavorites(operationIDs: [newID])
+        #expect(state.retryRequiredCount == 25 && state.automaticPendingCount == 0)
+        #expect(state.eligibleFavorites().isEmpty && state.eligibleFavorites(manualRetry: true).count == 25)
+    }
+
+    @Test func lateAttemptReceiptsNeverRemoveNewUserMutationUUIDs() throws {
+        var state = try LibraryState(scope: account)
+        try state.setFavorite(librarySeries(), isFavorite: true, at: libraryDate(10))
+        try state.record(libraryRecord(seconds: 15, time: 10))
+        let oldFavorite = state.pendingFavorites[0].id, oldProgress = state.pendingProgress[0].id
+        state.markFavoriteAttempt(operationID: oldFavorite); state.markProgressAttempt(operationID: oldProgress)
+
+        // The user changes the desired state while the earlier request is in flight.
+        try state.setFavorite(librarySeries(), isFavorite: false, at: libraryDate(11))
+        try state.record(libraryRecord(seconds: 25, time: 11))
+        let newFavorite = state.pendingFavorites[0].id, newProgress = state.pendingProgress[0].id
+        #expect(newFavorite != oldFavorite && newProgress != oldProgress)
+        state.acknowledgeFavorites(operationIDs: [oldFavorite]); state.acknowledgeProgress(operationIDs: [oldProgress])
+        let oldFavoriteMarked = state.markFavoriteAttempt(operationID: oldFavorite)
+        let oldProgressMarked = state.markProgressAttempt(operationID: oldProgress)
+        #expect(!oldFavoriteMarked && !oldProgressMarked)
+        #expect(state.eligibleFavorites().map(\.id) == [newFavorite] && state.eligibleProgress().map(\.id) == [newProgress])
+        #expect(state.pendingFavorites[0].isFavorite == false && state.pendingProgress[0].record?.seconds == 25)
+    }
+
+    @Test func metadataAndRemoteReconciliationCannotSilentlyUnlockAnAttempt() throws {
+        var state = try LibraryState(scope: account)
+        try state.setFavorite(librarySeries(), isFavorite: true, at: libraryDate(10))
+        try state.record(libraryRecord(seconds: 15, time: 10))
+        let favoriteID = state.pendingFavorites[0].id, progressID = state.pendingProgress[0].id
+        state.markFavoriteAttempt(operationID: favoriteID); state.markProgressAttempt(operationID: progressID)
+        try state.enrichSeries(Series(id: "100", title: "補齊的劇名", cover: "https://example.test/poster.jpg"))
+        #expect(state.pendingFavorites[0].id == favoriteID && state.pendingProgress[0].id == progressID)
+        #expect(state.retryRequiredCount == 2 && state.automaticPendingCount == 0)
+
+        try state.merge(remote: .init(history: [libraryRecord(seconds: 35, time: 12)]), scope: account)
+        let reconciled = state.pendingProgress[0]
+        #expect(reconciled.record?.seconds == 35 && reconciled.id != progressID && reconciled.retryRequired)
+        state.acknowledgeProgress(operationIDs: [progressID])
+        #expect(state.pendingProgress.map(\.id) == [reconciled.id])
+        let restored = try JSONDecoder().decode(LibraryState.self, from: JSONEncoder().encode(state))
+        #expect(restored.retryRequiredCount == 2 && restored.automaticPendingCount == 0)
+    }
+
+    @Test func localHistoryDeletionIntentsAreNeverEligibleForCloudRetry() throws {
+        let deletion = ProgressMutation(seriesID: "100", record: nil, updatedAt: libraryDate(10), retryRequired: true)
+        var state = try LibraryState(scope: account, pendingProgress: [deletion])
+        let marked = state.markProgressAttempt(operationID: deletion.id)
+        #expect(!marked)
+        #expect(state.eligibleProgress().isEmpty && state.eligibleProgress(manualRetry: true).isEmpty)
+        #expect(state.retryRequiredCount == 0 && state.automaticPendingCount == 0)
+    }
 }
 
 private func librarySeries(_ id: String = "100") -> Series { Series(id: id, title: "測試劇\(id)") }

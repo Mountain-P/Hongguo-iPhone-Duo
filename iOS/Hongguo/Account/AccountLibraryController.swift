@@ -35,6 +35,14 @@ final class AccountLibraryController: ObservableObject {
         guard showingAccountLibrary, let state = states[scope] else { return 0 }
         return state.pendingFavorites.count + state.pendingProgress.filter { $0.record != nil }.count
     }
+    var retryRequiredCount: Int {
+        guard showingAccountLibrary else { return 0 }
+        return states[scope]?.retryRequiredCount ?? 0
+    }
+    private var automaticPendingCount: Int {
+        guard showingAccountLibrary else { return 0 }
+        return states[scope]?.automaticPendingCount ?? 0
+    }
     private var scope: LibraryScope { .init(owner: selectedOwner, sourceID: sourceID) }
 
     init() {
@@ -179,10 +187,13 @@ final class AccountLibraryController: ObservableObject {
         syncing = true; syncPhase = "正在讀取觀看紀錄"; syncError = nil
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
+            var continueAutomatically = false
             defer {
                 if self.generation == token {
                     self.syncing = false; self.syncPhase = ""; self.syncTask = nil
-                    if self.pendingCount > 0, self.syncError == nil { self.scheduleSync(delay: .seconds(30)) }
+                    if continueAutomatically, self.automaticPendingCount > 0, !self.needsLogin {
+                        self.scheduleSync(delay: .seconds(30))
+                    }
                 }
             }
             do {
@@ -227,43 +238,56 @@ final class AccountLibraryController: ObservableObject {
 
                 // Favorite operations are explicit desired states. Progress is uploaded only after a successful pull.
                 self.syncPhase = "正在同步收藏變更"
-                for mutation in local.pendingFavorites.prefix(20) {
+                for selected in local.eligibleFavorites(manualRetry: userInitiated).prefix(20) {
                     try self.check(token, scope: context)
+                    // Persist the gate before any await/write. A crash, cancellation,
+                    // or lost reply must not turn this into an automatic resend.
+                    guard let mutation = try self.beginFavoriteAttempt(selected.operationID, manualRetry: userInitiated, scope: context) else { continue }
                     do {
                         if userInitiated { _ = await cloud.resetFailedMutation(mutation.operationID) }
+                        try self.check(token, scope: context)
+                        guard try self.state(for: context).pendingFavorites.contains(where: { $0.operationID == mutation.operationID }) else { continue }
                         let receipt = try await cloud.setFavorite(seriesID: mutation.seriesID, value: mutation.isFavorite,
                                                                   mutationID: mutation.operationID)
                         try self.check(token, scope: context)
                         guard receipt.accountID == session.profile.id, receipt.kind == .favorite else { throw AccountError.expired }
+                        guard receipt.mutationID == mutation.operationID else { throw UserLibraryError.invalidMutation }
                         var current = try self.state(for: context)
                         current.acknowledgeFavorites(operationIDs: [receipt.mutationID]); try self.commit(current)
                     } catch is CancellationError { throw CancellationError() }
                     catch {
                         if Self.requiresLogin(error) { throw AccountError.expired }
-                        failures.append(error.localizedDescription); break
+                        failures.append(error.localizedDescription)
                     }
                 }
                 if remoteHistory != nil {
                     self.syncPhase = "正在同步觀看進度"
-                    let pending = try self.state(for: context).pendingProgress
-                    for mutation in pending.filter({ $0.record != nil }).prefix(10) {
+                    let pending = try self.state(for: context).eligibleProgress(manualRetry: userInitiated)
+                    for selected in pending.prefix(10) {
                         try self.check(token, scope: context)
+                        guard let mutation = try self.beginProgressAttempt(selected.operationID, manualRetry: userInitiated, scope: context) else { continue }
                         do {
                             if userInitiated { _ = await cloud.resetFailedMutation(mutation.operationID) }
                             let progress = try await self.makeProgress(mutation.record!, token: token, scope: context)
+                            try self.check(token, scope: context)
+                            guard try self.state(for: context).pendingProgress.contains(where: { $0.operationID == mutation.operationID }) else { continue }
                             let receipt = try await cloud.reportProgress(progress, mutationID: mutation.operationID)
                             try self.check(token, scope: context)
                             guard receipt.accountID == session.profile.id, receipt.kind == .progress else { throw AccountError.expired }
+                            guard receipt.mutationID == mutation.operationID else { throw UserLibraryError.invalidMutation }
                             var current = try self.state(for: context)
                             current.acknowledgeProgress(operationIDs: [receipt.mutationID]); try self.commit(current)
                         } catch is CancellationError { throw CancellationError() }
                         catch {
                             if Self.requiresLogin(error) { throw AccountError.expired }
-                            failures.append(error.localizedDescription); break
+                            failures.append(error.localizedDescription)
                         }
                     }
                 }
                 try self.check(token, scope: context)
+                let remaining = try self.state(for: context)
+                continueAutomatically = !remaining.eligibleFavorites().isEmpty
+                    || (remoteHistory != nil && !remaining.eligibleProgress().isEmpty)
                 if failures.isEmpty {
                     self.lastSync = Date()
                     UserDefaults.standard.set(self.lastSync, forKey: self.syncDateKey)
@@ -278,6 +302,22 @@ final class AccountLibraryController: ObservableObject {
         }
         syncTask = task
         await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    }
+
+    private func beginFavoriteAttempt(_ id: UUID, manualRetry: Bool, scope context: LibraryScope) throws -> FavoriteMutation? {
+        var current = try state(for: context)
+        guard let mutation = current.pendingFavorites.first(where: { $0.operationID == id }),
+              manualRetry || !mutation.retryRequired, current.markFavoriteAttempt(operationID: id) else { return nil }
+        try commit(current)
+        return mutation
+    }
+
+    private func beginProgressAttempt(_ id: UUID, manualRetry: Bool, scope context: LibraryScope) throws -> ProgressMutation? {
+        var current = try state(for: context)
+        guard let mutation = current.pendingProgress.first(where: { $0.operationID == id && !$0.isDeletion }),
+              manualRetry || !mutation.retryRequired, current.markProgressAttempt(operationID: id) else { return nil }
+        try commit(current)
+        return mutation
     }
 
     private func makeSnapshot(history remoteHistory: AccountLibrarySnapshot?, favorites remoteFavorites: AccountLibrarySnapshot?,
