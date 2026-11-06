@@ -11,7 +11,8 @@ fi
 case "${1:-simulator}" in
   simulator)
     xcodebuild -project iOS/Hongguo.xcodeproj -scheme Hongguo -configuration Debug \
-      -destination 'generic/platform=iOS Simulator' -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO build
+      -destination 'generic/platform=iOS Simulator' -derivedDataPath build/DerivedData \
+      CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= build
     ;;
   device)
     xcodebuild -project iOS/Hongguo.xcodeproj -scheme Hongguo -configuration Release \
