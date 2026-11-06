@@ -9,7 +9,7 @@ struct RootView: View {
     @State private var selectedTab: MainTab = .home
 
     private enum MainTab: String, Hashable {
-        case home = "首頁", theater = "劇場", library = "我的"
+        case home = "首頁", preview = "試看", theater = "劇場", library = "我的"
     }
 
     private var tabBarVisibility: Visibility { model.isImmersivePlayback ? .hidden : .visible }
@@ -24,6 +24,14 @@ struct RootView: View {
             .toolbar(tabBarVisibility, for: .tabBar)
             .tabItem { Label(MainTab.home.rawValue, systemImage: "house.fill") }
             .tag(MainTab.home)
+
+            NavigationStack {
+                RecommendationPreviewView(isActive: selectedTab == .preview)
+                    .toolbar(tabBarVisibility, for: .tabBar)
+            }
+            .toolbar(tabBarVisibility, for: .tabBar)
+            .tabItem { Label(MainTab.preview.rawValue, systemImage: "play.rectangle.fill") }
+            .tag(MainTab.preview)
 
             NavigationStack {
                 ExploreView()
