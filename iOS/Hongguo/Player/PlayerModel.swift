@@ -15,6 +15,9 @@ final class PlayerModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isPlaying = false
     @Published private(set) var isBuffering = false
+    // The requested transport remains pausable while AVPlayer changes between
+    // waiting and playing; clock observations alone can briefly report neither.
+    var canPausePlayback: Bool { playbackSpeed.wantsPlayback || isPlaying || isBuffering }
     @Published private(set) var errorMessage: String?
     @Published private(set) var elapsed: Double = 0
     @Published private(set) var duration: Double = 0
@@ -23,14 +26,17 @@ final class PlayerModel: ObservableObject {
     var isSpeedBoosting: Bool { playbackSpeed.isPressing }
     var isSpeedBoostLocked: Bool { playbackSpeed.isLocked }
     @Published var autoNext = true
-    @Published var speed: Float = 1 {
-        didSet {
-            playbackSpeed.selectRate(speed)
-            applyPlaybackRate()
-        }
+    var speed: Float {
+        get { playbackSpeed.normalRate }
+        set { selectSpeed(newValue) }
     }
 
     var effectiveSpeed: Float { playbackSpeed.effectiveRate }
+
+    func selectSpeed(_ rate: Float) {
+        playbackSpeed.selectRate(rate)
+        applyPlaybackRate()
+    }
 
     func beginSpeedBoost() {
         guard hasStarted, !isLoading, errorMessage == nil else { return }
@@ -55,7 +61,25 @@ final class PlayerModel: ObservableObject {
     }
 
     private func applyPlaybackRate() {
-        if player.timeControlStatus == .playing { player.rate = effectiveSpeed }
+        let rate = effectiveSpeed
+        if abs(player.defaultRate - rate) > 0.0001 { player.defaultRate = rate }
+        let transport: PlaybackSpeedState.Transport
+        switch player.timeControlStatus {
+        case .playing: transport = .playing
+        case .waitingToPlayAtSpecifiedRate: transport = .waiting
+        default: transport = .paused
+        }
+        if let adjustment = playbackSpeed.rateAdjustment(transport: transport, currentRate: player.rate,
+                                                        isReady: hasStarted, sceneActive: sceneActive) {
+            player.rate = adjustment
+        }
+    }
+
+    private func resumePlayback() {
+        guard hasStarted, sceneActive, !isLoading, errorMessage == nil else { return }
+        playbackSpeed.requestPlayback()
+        applyPlaybackRate()
+        player.playImmediately(atRate: effectiveSpeed)
     }
 
     private let service: any CatalogService
@@ -72,6 +96,7 @@ final class PlayerModel: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var stalledObserver: NSObjectProtocol?
     private var hasStarted = false
+    private var preparingGeneration: UUID?
     private var didStart = false
     private var sceneActive = true
     private var retryCount = 0
@@ -105,7 +130,6 @@ final class PlayerModel: ObservableObject {
                 self.isPlaying = self.player.timeControlStatus == .playing
                 self.isBuffering = self.hasStarted && self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 if self.isPlaying {
-                    self.applyPlaybackRate()
                     if self.hasStarted, !self.loggedPlaybackStart {
                         self.loggedPlaybackStart = true
                         #if DEBUG
@@ -156,8 +180,8 @@ final class PlayerModel: ObservableObject {
 
     func togglePlayback() {
         guard hasStarted, !isLoading, errorMessage == nil else { return }
-        if player.timeControlStatus == .playing { pauseAndSave() }
-        else if sceneActive { player.playImmediately(atRate: effectiveSpeed) }
+        if canPausePlayback { pauseAndSave() }
+        else { resumePlayback() }
     }
 
     var nextEpisode: Episode? {
@@ -171,7 +195,11 @@ final class PlayerModel: ObservableObject {
     }
 
     func pauseAndSave() {
+        playbackSpeed.pause()
         player.pause()
+        isPlaying = false
+        isBuffering = false
+        applyPlaybackRate()
         saveProgress()
     }
 
@@ -243,7 +271,7 @@ final class PlayerModel: ObservableObject {
         item.preferredForwardBufferDuration = 5
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
-                guard let self, self.generation == requestGeneration else { return }
+                guard let self, self.generation == requestGeneration, self.player.currentItem === item else { return }
                 switch item.status {
                 case .readyToPlay: self.ready(generation: requestGeneration)
                 case .failed: self.handleFailure(generation: requestGeneration, error: self.mediaFailure(item.error))
@@ -257,6 +285,9 @@ final class PlayerModel: ObservableObject {
                 self.updateDuration()
                 self.elapsed = self.duration
                 self.saveProgress(completed: true)
+                self.playbackSpeed.pause()
+                self.isPlaying = false
+                self.isBuffering = false
                 if self.autoNext { self.playNext() }
             }
         }
@@ -279,17 +310,23 @@ final class PlayerModel: ObservableObject {
     }
 
     private func ready(generation requestGeneration: UUID) {
-        guard !hasStarted else { return }
+        guard generation == requestGeneration, !hasStarted, preparingGeneration != requestGeneration else { return }
+        preparingGeneration = requestGeneration
         updateDuration()
         let completed = duration > 0 && pendingResume >= duration - 1 && pendingResume / duration >= 0.98
         let target = completed ? 0 : (duration > 0 ? min(pendingResume, max(0, duration - 0.5)) : pendingResume)
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
-                guard let self, self.generation == requestGeneration, finished else { return }
+                guard let self, self.generation == requestGeneration else { return }
+                guard finished else {
+                    self.preparingGeneration = nil
+                    self.handleFailure(generation: requestGeneration)
+                    return
+                }
                 self.elapsed = target
                 self.hasStarted = true
                 self.isLoading = false
-                if self.sceneActive { self.player.playImmediately(atRate: self.effectiveSpeed) }
+                if self.sceneActive { self.resumePlayback() }
             }
         }
     }
@@ -303,7 +340,7 @@ final class PlayerModel: ObservableObject {
             default:
                 isLoading = false
                 errorMessage = error.localizedDescription
-                player.pause()
+                pauseAndSave()
                 return
             }
         }
@@ -313,7 +350,7 @@ final class PlayerModel: ObservableObject {
         } else {
             isLoading = false
             errorMessage = error?.localizedDescription ?? "目前無法播放這一集。請重新取源，或選擇其他集數。"
-            player.pause()
+            pauseAndSave()
         }
     }
 
@@ -357,9 +394,10 @@ final class PlayerModel: ObservableObject {
 
     private func clearItem() {
         hasStarted = false
+        preparingGeneration = nil
         isPlaying = false
         isBuffering = false
-        playbackSpeed.endHold()
+        playbackSpeed.prepareForItem()
         if let progressObserver { player.removeTimeObserver(progressObserver) }
         progressObserver = nil
         statusObservation?.invalidate()

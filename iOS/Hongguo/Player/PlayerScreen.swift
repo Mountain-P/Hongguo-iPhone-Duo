@@ -12,6 +12,8 @@ struct PlayerScreen: View {
     @StateObject private var model: PlayerModel
     private let onClose: (() -> Void)?
     private let onSeriesSwipe: ((Int) -> Void)?
+    private let isPreview: Bool
+    private let onOpenSeries: (() -> Void)?
     @State private var showingEpisodes = false
     @State private var controlsVisible = true
     // A new preference version applies the fill-first default once to existing
@@ -24,16 +26,19 @@ struct PlayerScreen: View {
     @State private var boostStarted = false
     @State private var boostCommitted = false
     @State private var boostStartedLocked = false
+    @State private var suppressBoostUntilRelease = false
     @State private var lastBoostEndAt = Date.distantPast
     @State private var lastHoverRevealAt = Date.distantPast
     @State private var lastHoverLocation: CGPoint?
-    @State private var lastIntentionalHideAt = Date.distantPast
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
-         onClose: (() -> Void)? = nil, onSeriesSwipe: ((Int) -> Void)? = nil) {
+         onClose: (() -> Void)? = nil, onSeriesSwipe: ((Int) -> Void)? = nil,
+         isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil) {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
+        self.isPreview = isPreview
+        self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: episodes,
             initialEpisodeID: initialEpisodeID, resumeSeconds: resumeSeconds, service: service,
             onProgress: onProgress))
@@ -75,6 +80,8 @@ struct PlayerScreen: View {
                         statusOverlay
                             .frame(width: region.width, height: region.height)
                             .position(x: region.midX, y: region.midY)
+                        centralPlaybackControl
+                            .position(x: region.midX, y: region.midY)
                         VStack {
                             speedBoostHint.padding(.top, 12)
                             Spacer(minLength: 0)
@@ -101,6 +108,7 @@ struct PlayerScreen: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task {
+            if isPreview { model.autoNext = false }
             model.setSceneActive(scenePhase == .active)
             model.start()
         }
@@ -111,16 +119,22 @@ struct PlayerScreen: View {
         }
         .onChange(of: scenePhase) { _, phase in
             model.setSceneActive(phase == .active)
-            if phase != .active { endBoostGesture(); showControls() }
+            if phase != .active { cancelBoostGesture(); showControls() }
         }
         .onChange(of: model.isPlaying) { _, _ in showControls() }
-        .onChange(of: model.isLoading) { _, _ in showControls() }
+        .onChange(of: model.isLoading) { _, loading in
+            if loading { cancelBoostGesture() }
+            showControls()
+        }
         .onChange(of: model.isBuffering) { _, _ in showControls() }
         .onChange(of: model.errorMessage) { _, _ in showControls() }
         .onChange(of: showingEpisodes) { _, _ in showControls() }
         .onChange(of: voiceOverEnabled) { _, _ in showControls() }
         .onChange(of: holdingBoost) { _, holding in
-            if !holding, boostStarted { endBoostGesture() }
+            if !holding {
+                if boostStarted { endBoostGesture() }
+                suppressBoostUntilRelease = false
+            }
         }
         .sheet(isPresented: $showingEpisodes) { episodePicker }
     }
@@ -136,11 +150,20 @@ struct PlayerScreen: View {
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
-                model.togglePlayback()
-                showControls()
-            } label: { Label(model.isPlaying ? "暫停" : "播放", systemImage: model.isPlaying ? "pause.fill" : "play.fill") }
+                togglePlaybackFromUser()
+            } label: { Label(model.canPausePlayback ? "暫停" : "播放", systemImage: model.canPausePlayback ? "pause.fill" : "play.fill") }
                 .disabled(model.isLoading || model.duration <= 0)
                 .accessibilityIdentifier("player.playPause")
+        }
+        if isPreview, let onOpenSeries {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    cancelBoostGesture()
+                    model.pauseAndSave()
+                    onOpenSeries()
+                } label: { Label("看整部", systemImage: "play.rectangle") }
+                    .accessibilityIdentifier("player.openSeries")
+            }
         }
         ToolbarItemGroup(placement: .bottomBar) {
             Button { model.skip(-10); showControls() } label: { Label("後退十秒", systemImage: "gobackward.10") }
@@ -156,18 +179,21 @@ struct PlayerScreen: View {
                       systemImage: fillsScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
             .accessibilityValue(fillsScreen ? "等比填滿" : "完整比例")
-            moreMenu
+            if !isPreview { moreMenu }
         }
     }
 
     private var speedMenu: some View {
         Menu {
-            Picker("播放速度", selection: Binding(get: { model.speed }, set: {
-                model.speed = $0
-                showControls()
-            })) {
-                ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
-                    Text(String(format: "%g×", Double(rate))).tag(rate)
+            ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
+                Button {
+                    cancelBoostGesture()
+                    model.selectSpeed(rate)
+                    showControls()
+                } label: {
+                    if model.effectiveSpeed == rate {
+                        Label(String(format: "%g×", Double(rate)), systemImage: "checkmark")
+                    } else { Text(String(format: "%g×", Double(rate))) }
                 }
             }
         } label: { Label("播放速度", systemImage: "speedometer") }
@@ -280,6 +306,10 @@ struct PlayerScreen: View {
             }
             .font(.caption.monospacedDigit())
             .frame(minHeight: 44)
+            if isPreview, onSeriesSwipe != nil {
+                Text("上滑看下一部").font(.caption2).foregroundStyle(.white.opacity(0.7))
+                    .frame(maxWidth: .infinity).padding(.bottom, 5)
+            }
         }
     }
 
@@ -289,18 +319,18 @@ struct PlayerScreen: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 guard !boostStarted, Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
-                toggleControls()
+                togglePlaybackFromUser()
             }
             .simultaneousGesture(speedBoostGesture)
             .simultaneousGesture(seriesSwipeGesture)
             .accessibilityLabel("影片")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction(named: Text("顯示播放控制")) { showControls() }
-            .accessibilityAction(named: Text(model.isPlaying ? "暫停" : "播放")) {
-                model.togglePlayback()
-                showControls()
+            .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放")) {
+                togglePlaybackFromUser()
             }
             .accessibilityAction(named: Text(model.isSpeedBoostLocked ? "解除 2 倍速鎖定" : "鎖定 2 倍速")) {
+                cancelBoostGesture()
                 if model.isSpeedBoostLocked { model.unlockSpeedBoost() }
                 else { model.lockSpeedBoost() }
                 showControls()
@@ -326,7 +356,7 @@ struct PlayerScreen: View {
         switch phase {
         case .active(let location):
             // Global coordinates stay stable as native bars resize the safe
-            // viewport. A layout-only hover event must not undo a click to hide.
+            // viewport. Only actual pointer movement reveals the controls.
             if let previous = lastHoverLocation {
                 let dx = location.x - previous.x, dy = location.y - previous.y
                 guard dx * dx + dy * dy >= 9 else { return }
@@ -335,7 +365,6 @@ struct PlayerScreen: View {
             guard now.timeIntervalSince(lastHoverRevealAt) >= 0.15 else { return }
             lastHoverLocation = location
             lastHoverRevealAt = now
-            guard now.timeIntervalSince(lastIntentionalHideAt) >= 0.35 else { return }
             showControls()
         case .ended:
             scheduleAutoHide()
@@ -348,6 +377,7 @@ struct PlayerScreen: View {
             ProgressView(model.isLoading ? "正在準備影片…" : "影片緩衝中…")
                 .padding(20)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 16))
+                .offset(y: model.isBuffering && !model.isLoading ? -80 : 0)
                 .allowsHitTesting(false)
         }
         if let message = model.errorMessage {
@@ -360,7 +390,9 @@ struct PlayerScreen: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
-                Button("選擇其他集數") { showingEpisodes = true }.buttonStyle(.bordered)
+                if !isPreview {
+                    Button("選擇其他集數") { showingEpisodes = true }.buttonStyle(.bordered)
+                }
             }
             .padding(24)
             .frame(maxWidth: 340)
@@ -369,12 +401,33 @@ struct PlayerScreen: View {
         }
     }
 
-    private func toggleControls() {
-        if controlsVisible, !voiceOverEnabled, !model.isLoading, !model.isBuffering, model.errorMessage == nil {
-            hideTask?.cancel()
-            lastIntentionalHideAt = Date()
-            withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
-        } else { showControls() }
+    private func togglePlaybackFromUser() {
+        cancelBoostGesture()
+        model.togglePlayback()
+        showControls()
+    }
+
+    @ViewBuilder
+    private var centralPlaybackControl: some View {
+        if !model.isLoading, model.errorMessage == nil, model.duration > 0,
+           controlsVisible || !model.canPausePlayback {
+            let button = Button(action: togglePlaybackFromUser) {
+                Image(systemName: model.canPausePlayback ? "pause.fill" : "play.fill")
+                    .font(.system(size: 25, weight: .semibold))
+                    .frame(width: 68, height: 68)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(model.canPausePlayback ? "暫停" : "播放")
+            .accessibilityIdentifier("player.centerPlayPause")
+            if reduceTransparency {
+                button.background(Color(white: 0.12), in: Circle())
+            } else if #available(iOS 26.0, *) {
+                button.glassEffect(.regular.interactive(), in: Circle())
+            } else {
+                button.background(.ultraThinMaterial, in: Circle())
+            }
+        }
     }
 
     private func showControls() {
@@ -403,6 +456,7 @@ struct PlayerScreen: View {
             }
             .onChanged { value in
                 guard case .second(true, let drag) = value,
+                      !suppressBoostUntilRelease,
                       !model.isLoading, model.errorMessage == nil, model.duration > 0 else { return }
                 if !boostStarted {
                     boostStarted = true
@@ -421,7 +475,12 @@ struct PlayerScreen: View {
                     boostCommitted = true
                 }
             }
-            .onEnded { _ in endBoostGesture() }
+            .onEnded { _ in endBoostGesture(); suppressBoostUntilRelease = false }
+    }
+
+    private func cancelBoostGesture() {
+        if holdingBoost || boostStarted { suppressBoostUntilRelease = true }
+        endBoostGesture()
     }
 
     private func endBoostGesture() {
@@ -436,8 +495,8 @@ struct PlayerScreen: View {
     private var speedBoostHint: some View {
         if model.isSpeedBoostLocked {
             Button {
+                cancelBoostGesture()
                 model.unlockSpeedBoost()
-                endBoostGesture()
                 showControls()
             } label: {
                 Label("2 倍速已鎖定 · 長按下滑解除", systemImage: "lock.fill")
