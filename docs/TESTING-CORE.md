@@ -2,7 +2,9 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。核心測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.4.2／build 12。已執行完整核心回歸：162 項、20 個 suites，161 項通過、1 項可選 `currentWebsiteSnapshot` 略過，記錄於 `build/core-0.4.2-tests.log`。AccountSession 11、NativePhoneAuth 12、NativePhoneRuntime 4、UserLibrary 19、AccountLibrary 9 均參與並通過這次完整執行；裝置與 Release 結果集中記於 [TESTING.md](TESTING.md)。
+當前程式版本為 0.4.3／build 13。已執行最終完整核心回歸：**190 項、22 個 suites，189 項通過、1 項可選 `currentWebsiteSnapshot` 略過**，記錄於 `build/core-0.4.3-tests-final.log`。UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 7 均參與並通過；簽署裝置建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以核心測試替代實機帳號驗證。
+
+歷史 0.4.2／build 12 完整核心回歸為 162 項、20 個 suites，161 項通過、1 項可選快照略過，記錄於 `build/core-0.4.2-tests.log`。該版 AccountSession 11、NativePhoneAuth 12、NativePhoneRuntime 4、UserLibrary 19、AccountLibrary 9 均通過；其真人登入、會話還原與片庫讀寫證據屬該次歷史實機紀錄，不能視為 0.4.3 已重新驗證帳號網路或硬體。
 
 歷史 0.3.0／build 9 完整核心驗證共 107 項、15 個 suites：**106 項通過、1 項可選 `currentWebsiteSnapshot` 略過**。已以 `swift test --disable-sandbox --disable-xctest` 執行，記錄：`build/core-0.3.0-tests.log`。該輪新增 Discovery 9 項、NewRelease 7 項、Artist 7 項，全部參與該次完整驗證。
 
@@ -14,7 +16,9 @@ Discovery 測試涵蓋公開分類與動態題材、四榜單 alias、inline／d
 
 播放核心既有測試確認只抓前綴即可準備、補足較大 moov 與外部 auxiliary 小範圍、按需分段結果與完整 CENC 解密相同、LRU 淘汰、檔長／ETag 變更拒絕、200 忽略 Range 時停止、403 保留、最多兩筆 URLSession 下載、取消一筆不影響另一筆，以及 120 秒／16 筆來源快取與 fresh、取消隔離。
 
-倍速測試涵蓋選定 1.5 倍速後暫時長按 2 倍速、放開恢復、鎖定後放開保持、再次長按解鎖、背景取消保留既有鎖定、手動選速解除鎖定、無效速度保留狀態與重複提交。手勢辨識門檻、畫布縮放及控制浮層仍由獨立的 Duo UI 驗收確認，結果見 [TESTING.md](TESTING.md)。
+PlaybackSpeed 共 15 項，涵蓋選定速度、暫時長按／放開、鎖定／解除、背景取消、手動選速、無效輸入、等待中的速率更新與等速回饋抑制，以及暫停／換集／錯誤重載的播放意圖。暫停時改速不應啟播，自動重載不能把先前的暫停改成播放。手勢命中、AVPlayer 的實際等待與 seek 時序仍由獨立 UI 驗收確認，結果見 [TESTING.md](TESTING.md)。
+
+PlaybackContinuation 共 7 項，驗證續播目標與進度判斷；RecommendationPreviewQueue 共 7 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源，以及只能選可播放的第 1 集。Core 不取代「試看不寫歷史」、中央播放按鈕命中、關閉試看後才進入整劇詳情等畫面整合驗收。
 
 0.2.0 的實網基準以 `swift run NativePlaybackCheck 7701935931787316286 4` 驗證 progressive 路徑：完整解碼第 4 集全部 89.79 秒、2,244 影片影格、825 個音訊 buffer；首幀約 1.98 秒、全流程約 7.9 秒，記錄於 `build/native-progressive-full-decode.log`。獨立 startup 檢查為準備 2.82 秒、首幀 3.10 秒；直接 seek 至 70% 為準備 1.66 秒、首幀 2.09 秒。均未使用播放服務。這些是分次 macOS 核心／解碼量測；版本對應的 Duo、真機與最新點播入口驗收見 [TESTING.md](TESTING.md)。
 
@@ -40,7 +44,9 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryTests
 
 `NativePhoneAuthTests` 與 `NativePhoneRuntimeTests` 檢查手機與國碼正規化、驗證碼及 challenge 綁定、同一註冊身分、重發限制、送達不確定但不自動重發、明確拒絕、人工上行簡訊 MFA、取消、UID／憑證驗證，以及會話序列化與網域隔離。Runtime 使用合成 transport 核對實際表單、路徑、簽章模式及轉址／拒絕停止；沒有向電信業者發送簡訊。
 
-`UserLibraryTests` 共 19 項，檢查舊版遷移、按來源／帳號隔離、各集觀看進度與完成狀態、較新時間的合併、明確匯入訪客副本、收藏及進度待同步操作、特定回覆確認與刪除記號。0.4.2 新增 3 項 metadata 補齊測試，驗證 snapshot、逐集紀錄、完成證據與 pending 中同 ID 資料一起更新，觀看時間／位置、收藏狀態、操作 UUID 與其他劇集保持原狀；未知 ID／無效標題原子拒絕，也不建立新的待同步操作。空或不完整遠端資料不能直接抹去本機片庫。
+`UserLibraryTests` 共 25 項，檢查舊版遷移、按來源／帳號隔離、各集觀看進度與完成狀態、較新時間的合併、明確匯入訪客副本、收藏及進度待同步操作、特定回覆確認與刪除記號。0.4.2 的 3 項 metadata 測試保留，確認補資料不改進度、時間、收藏狀態、操作 UUID 或其他作品；未知 ID／無效標題原子拒絕。空或不完整遠端資料不能直接抹去本機片庫。
+
+0.4.3 新增 6 項持久重試測試：寫入前將 `retryRequired` 標記保存的快照經 JSON roundtrip 後仍禁止自動重送；舊檔缺欄位預設 false；已被擋住的前 25 筆不占自動批次名額，新的獨立操作仍可提交；舊 ACK 不清除較新 UUID；metadata 與遠端合併不默默解除限制；本機刪除意圖不會變成官方寫入。Controller 在等待寫入前先保存標記，只有明確手動重試才重設服務的失敗快取；自動同步跳過已標記操作，不因首筆失敗阻擋後續，也不為只有手動重試項目的佇列持續排程。保存／畫面整合仍依 App 驗收確認。
 
 `AccountLibraryTests` 檢查分頁覆蓋、欄位／大整數與毫秒單位、精確路由及 Cookie 範圍、待同步操作的重複與失敗處理、兩段進度寫入的部分成功，以及帳號切換／取消。它們確認程式按契約處理合成回應，不能證明真人 App 會話已獲官方收藏／進度寫入授權。
 
