@@ -1,0 +1,16 @@
+{
+  "_provenance": {
+    "repository": "https://github.com/aston314/hongguo-tv",
+    "commit": "36508246eeca2cf5ef1f29f7f17f8e985d50ae2e",
+    "path": "cmd/hongguotv/testdata/passport-vectors.json",
+    "note": "Minimal synthetic input/output facts retained from the verified Quest source for cross-language parity. No account credentials or source URLs; this project licenses its newly authored test code separately."
+  },
+  "query": "aid=8662&device_id=7000000000000000001&version_name=7.3.5.32&os_version=16&device_type=25053RT47C&device_brand=Redmi&_rticket=1791290000000",
+  "body": "test=fixture",
+  "ts": 1791290000,
+  "f13": "f65fc6c74adc5bd9a5b357c433ba7fbbfc96af21",
+  "helios": "eFY0EuAiWoJZ9zoF6zNu1pS6xaNl2JqeXVHnmakVf60TcY/S",
+  "gorgon": "84046745400140e3038fc2389e409bedaaf351850243fe0a406e",
+  "heliosNonce": 305419896,
+  "gorgonNonce": 17767
+}

@@ -1,0 +1,17 @@
+{
+  "name": "hongguo-iphone-optional-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "setup": "npm ci --prefix server --no-audit --no-fund",
+    "start": "node server/modern-index.mjs",
+    "start:lan": "node server/modern-index.mjs --lan",
+    "start:legacy": "node server/index.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "probe": "node scripts/probe.mjs",
+    "fixture": "node fixtures/server.mjs"
+  }
+}

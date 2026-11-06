@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-3.0-only
+import Testing
+import Foundation
+@testable import HongguoCore
+
+struct NativeRuntimeTests {
+    @Test func nativeCryptoKnownVectors() throws {
+        let key = data("2b7e151628aed2a6abf7158809cf4f3c")
+        let plain = data("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        let ctr = try NativeCrypto.cipher(plain, key: key, iv: data("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"), algorithm: "aes-128-ctr", decrypt: false, padding: false)
+        #expect(ctr == data("874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff"))
+        let cbc = try NativeCrypto.cipher(plain, key: key, iv: data("000102030405060708090a0b0c0d0e0f"), algorithm: "aes-128-cbc", decrypt: false, padding: false)
+        #expect(cbc == data("7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2"))
+        #expect(try NativeCrypto.cipher(cbc, key: key, iv: data("000102030405060708090a0b0c0d0e0f"), algorithm: "aes-128-cbc", decrypt: true, padding: false) == plain)
+        let payload = Data("匿名註冊 gzip fixture".utf8)
+        #expect(try NativeCrypto.gunzip(NativeCrypto.gzip(payload)) == payload)
+        #expect(try NativeCrypto.perform("random", ["count": 0]) as? String == "")
+        #expect(try NativeCrypto.perform("hash", ["algorithm": "md5", "data": Data("abc".utf8).base64EncodedString()]) as? String == "kAFQmDzST7DWlj99KOF/cg==")
+    }
+
+    @Test func javascriptCoreMatchesFixedAuthoritativeSigningVectors() async throws {
+        // Synthetic vector facts from Backend/tests/fixtures/signing-vectors.json.
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (() => {
+          Math.random = () => 305419896 / 0x100000000;
+          const a = require('app-source').audit, ts = 1791290000;
+          const query = 'aid=8662&device_id=7000000000000000001&version_name=7.3.5.32&os_version=16&device_type=25053RT47C&device_brand=Redmi&_rticket=1791290000000';
+          const body = Buffer.from('test=fixture'), time = Buffer.alloc(4); time.writeUInt32LE(ts);
+          return { f13: a.hashF13(a.sm3(query), require('node:crypto').createHash('md5').update(body).digest(), time, ts).toString('hex'),
+            helios: a.helios(ts), gorgon: a.xGorgon(query, body, ts, 17767) };
+        })()
+        """#)
+        let object = try dictionary(Data(result.utf8))
+        #expect(object["f13"] as? String == "f65fc6c74adc5bd9a5b357c433ba7fbbfc96af21")
+        #expect(object["helios"] as? String == "eFY0EuAiWoJZ9zoF6zNu1pS6xaNl2JqeXVHnmakVf60TcY/S")
+        #expect(object["gorgon"] as? String == "84046745400140e3038fc2389e409bedaaf351850243fe0a406e")
+    }
+
+    @Test func javascriptCoreSignsExactWireBytesAndKeepsProfilesIsolated() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (() => {
+          Date.now = () => 1800000000999;
+          const a = require('app-source'), crypto = require('node:crypto');
+          const body = '{"biz_param":{"device_level":3},"mixed_video_id_map":{"1004":["7000000000000000001"]},"label":"測試 & bytes"}\n';
+          const identity = {device_id:'7000000000000000001',iid:'7000000000000000002',cdid:'00000000-0000-4000-8000-000000000001',cookie:'sessionid=DO_NOT_USE',version_name:'9.9.9'};
+          const p = a.audit.playbackRequest(body, identity), u = new URL(p.url);
+          const headers = ['x-argus','x-gorgon','x-medusa','x-khronos','x-ladon','x-helios'];
+          return { exact: p.body.equals(Buffer.from(body)), stub: p.headers['x-ss-stub'] === crypto.createHash('md5').update(Buffer.from(body)).digest('hex').toUpperCase(),
+            six: headers.every(h=>typeof p.headers[h]==='string' && p.headers[h]), branch: a.audit.branchOf(p.url,p.body,Number(p.headers['x-khronos'])),
+            profile:u.searchParams.get('version_name'), noCookie:!u.searchParams.has('cookie') && !p.headers.Cookie,
+            search:new URL(a.signedSearchRequest({keyword:'fixture',identity}).url).searchParams.get('version_name') };
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        for key in ["exact", "stub", "six", "noCookie"] { #expect(value[key] as? Bool == true) }
+        #expect(value["branch"] as? Int == 2)
+        #expect(value["profile"] as? String == "7.1.3.32")
+        #expect(value["search"] as? String == "7.2.2.32")
+    }
+
+    @Test func registrationEnvelopeDecryptsAndCookiesAreAccountFree() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (async () => {
+          const crypto = require('node:crypto'), device = require('playback-device');
+          let record;
+          const identity = await device.registerPlaybackDevice(async (url, options) => {
+            const bytes = options.data, random = bytes.subarray(6,38);
+            const salt = Buffer.from('4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58','hex');
+            const derived = crypto.createHash('sha512').update(Buffer.concat([crypto.createHash('sha512').update(random).digest(),salt])).digest();
+            const decipher = crypto.createDecipheriv('aes-128-cbc',derived.subarray(0,16),derived.subarray(16,32));
+            const plaintext = Buffer.concat([decipher.update(bytes.subarray(38)),decipher.final()]), compressed=plaintext.subarray(64);
+            const unzipped = JSON.parse(_nativeInvoke('gunzip',JSON.stringify({data:compressed.toString('base64')})));
+            record = JSON.parse(Buffer.from(unzipped.value,'base64').toString('utf8'));
+            record.hashMatches = crypto.createHash('sha512').update(compressed).digest().equals(plaintext.subarray(0,64));
+            record.wireMagic = bytes.subarray(0,6).toString('hex');
+            record.stubMatches = options.headers['x-ss-stub'] === crypto.createHash('md5').update(bytes).digest('hex').toUpperCase();
+            options.onResponseHeaders({'set-cookie':['install_id=7000000000000000002; Secure','ttreq=anonymous','sessionid=DO_NOT_USE']});
+            return {device_id_str:'7000000000000000001',install_id_str:'7000000000000000002'};
+          }, {isolated:true,captureCookies:true});
+          return {magic:record.magic_tag,wireMagic:record.wireMagic,hashMatches:record.hashMatches,stubMatches:record.stubMatches,
+            version:record.header.app_version,identity:identity.device_id,cookie:identity.cookie};
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["magic"] as? String == "ss_app_log")
+        #expect(value["wireMagic"] as? String == "746305100000")
+        #expect(value["hashMatches"] as? Bool == true)
+        #expect(value["stubMatches"] as? Bool == true)
+        #expect(value["version"] as? String == "7.3.9.32")
+        #expect(value["identity"] as? String == "7000000000000000001")
+        #expect(value["cookie"] as? String == "install_id=7000000000000000002; ttreq=anonymous")
+    }
+
+    @Test func nativeHTTPAllowlistAndWireBody() throws {
+        for value in ["http://api5-normal-hl.fqnovel.com/", "https://fqnovel.com.attacker.test/", "https://evilfqnovel.com/", "https://user:secret@fqnovel.com/", "https://fqnovel.com:8443/", "file:///etc/passwd", "https://127.0.0.1/"] {
+            #expect(!NativeHTTPPolicy.allowed(URL(string: value)!))
+            #expect(throws: (any Error).self) { try NativeHTTPPolicy.request(["url": value]) }
+        }
+        for value in ["https://api5-normal-hl.fqnovel.com/", "https://api5-normal-sinfonlineb.fqnovel.com/", "https://log5-applog-lf.fqnovel.com/", "https://novel.snssdk.com/"] {
+            #expect(NativeHTTPPolicy.allowed(URL(string: value)!))
+        }
+        let bytes = Data("{\"label\":\"測試 & bytes\"}\n".utf8)
+        let request = try NativeHTTPPolicy.request(["url": "https://api5-normal-hl.fqnovel.com/", "method": "POST", "body": bytes.base64EncodedString(), "headers": ["Content-Type": "application/json; charset=UTF-8"]])
+        #expect(request.httpBody == bytes)
+        #expect(!NativeJSRuntime.allowedMediaURL(URL(string: "https://fqnovelvod.com.attacker.test/a.mp4")!))
+        #expect(NativeJSRuntime.allowedMediaURL(URL(string: "https://v.example.fqnovelvod.com/a.mp4")!))
+    }
+
+    @Test func cancellingAnAwaitedJavaScriptPromiseReturnsCancellation() async throws {
+        let task = Task { try await NativeJSRuntime().evaluateForTesting("new Promise(() => {})") }
+        try await Task.sleep(for: .milliseconds(30))
+        task.cancel()
+        do { _ = try await task.value; Issue.record("Cancelled runtime unexpectedly succeeded") }
+        catch { #expect(error is CancellationError) }
+    }
+
+    @Test func completedRuntimeCannotBeReusedAndTimeoutSignalWorks() async throws {
+        let runtime = NativeJSRuntime()
+        let result = try await runtime.evaluateForTesting(#"new Promise(resolve => { const signal=AbortSignal.timeout(5); signal.addEventListener('abort',()=>resolve(signal.reason.name)); })"#)
+        #expect(result == #""TimeoutError""#)
+        do { _ = try await runtime.evaluateForTesting("1"); Issue.record("A completed runtime was reused") }
+        catch { #expect((error as? NativeSourceError)?.code == "RUNTIME_REUSE") }
+    }
+
+    @Test func authorizationStatusSurvivesOversizeOrNonUTF8ErrorBodies() throws {
+        for status in [401, 403, 429, 500] {
+            let response = HTTPURLResponse(url: URL(string: "https://api5-normal-hl.fqnovel.com/")!, statusCode: status, httpVersion: nil, headerFields: ["Content-Length": "99999999"])!
+            let raw = try NativeHTTP.responseJSON(Data(repeating: 0xff, count: 2 * 1024 * 1024 + 1), response: response)
+            let value = try dictionary(Data(raw.utf8))
+            #expect(value["status"] as? Int == status)
+            #expect(value["data"] as? String == "")
+        }
+    }
+
+    @Test func javascriptRecoveryHonorsBoundsAndTerminalDenials() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (async () => {
+          const {createPlaybackRecovery,LEGACY_HOSTS}=require('playback-recovery');
+          const empty=()=>Object.assign(new Error('empty'),{code:'EMPTY_RESPONSE',status:200});
+          let registered=[],hosts=[],identities=[];
+          const resolve=createPlaybackRecovery({register:async({scope})=>{const i={id:registered.length};registered.push(scope);return i},
+            getModel:async()=>{throw empty()},postModel:async(vid,type,i,host)=>{hosts.push(host);identities.push(i.id);throw empty()},consume:async()=>({})});
+          try {await resolve('100')}catch(_){}
+          let deniedPosts=0;
+          const denied=createPlaybackRecovery({register:async()=>({}),getModel:async()=>{throw Object.assign(new Error('denied'),{status:403})},
+            postModel:async()=>{deniedPosts++},consume:async()=>({})});
+          try {await denied('100')}catch(_){}
+          return {registered,hosts,identities,deniedPosts,expected:LEGACY_HOSTS};
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["registered"] as? [String] == ["tab", "legacy", "legacy"])
+        #expect(value["identities"] as? [Int] == [1, 1, 2, 2])
+        let hosts = try #require(value["expected"] as? [String])
+        #expect(value["hosts"] as? [String] == hosts + hosts)
+        #expect(value["deniedPosts"] as? Int == 0)
+    }
+
+    private func data(_ hex: String) -> Data {
+        Data(stride(from: 0, to: hex.count, by: 2).map { offset in
+            let start = hex.index(hex.startIndex, offsetBy: offset)
+            return UInt8(hex[start..<hex.index(start, offsetBy: 2)], radix: 16)!
+        })
+    }
+}
