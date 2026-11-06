@@ -224,4 +224,41 @@ struct PlaybackSpeedTests {
         #expect(state.rateAdjustment(transport: .waiting, currentRate: 0,
                                      isReady: true, sceneActive: true) == 2)
     }
+
+    @Test func automaticRecoveryPreservesPauseWhileExplicitRetryCanRequestPlayback() {
+        var state = PlaybackSpeedState()
+        state.selectRate(1.5)
+        state.requestPlayback()
+        state.beginHold()
+        state.pause()
+        let recoveryIntent = state.wantsPlayback
+        state.prepareForItem(autoplay: recoveryIntent)
+        #expect(!state.wantsPlayback)
+        #expect(!state.isPressing)
+        #expect(state.effectiveRate == 1.5)
+        // Even a late ready/waiting observation after recovery cannot restart it.
+        #expect(state.rateAdjustment(transport: .waiting, currentRate: 0,
+                                     isReady: true, sceneActive: true) == nil)
+        state.prepareForItem(autoplay: true)
+        #expect(state.wantsPlayback)
+        #expect(state.rateAdjustment(transport: .waiting, currentRate: 0,
+                                     isReady: true, sceneActive: true) == 1.5)
+    }
+
+    @Test func backgroundPauseDuringRecoveryCancelsThePendingAutoplayIntent() {
+        var state = PlaybackSpeedState()
+        state.requestPlayback()
+        state.lock()
+        let recoveryIntent = state.wantsPlayback
+        state.prepareForItem(autoplay: recoveryIntent)
+        #expect(state.wantsPlayback)
+        #expect(state.rateAdjustment(transport: .waiting, currentRate: 0,
+                                     isReady: false, sceneActive: true) == nil)
+        state.pause()
+        #expect(state.isLocked)
+        #expect(!state.wantsPlayback)
+        // Returning to the foreground and finishing the old load does not undo pause.
+        #expect(state.rateAdjustment(transport: .waiting, currentRate: 0,
+                                     isReady: true, sceneActive: true) == nil)
+    }
 }

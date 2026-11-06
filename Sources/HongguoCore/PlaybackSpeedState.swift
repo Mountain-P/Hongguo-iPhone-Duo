@@ -38,7 +38,10 @@ public struct PlaybackSpeedState: Sendable, Equatable {
 
     /// Pausing or replacing an item cancels a temporary hold, retaining an explicit lock.
     public mutating func pause() { wantsPlayback = false; isPressing = false }
-    public mutating func prepareForItem() { pause() }
+    public mutating func prepareForItem(autoplay: Bool = false) {
+        pause()
+        wantsPlayback = autoplay
+    }
 
     /// Rate changes may update an already requested waiting transport, but never start a paused one.
     /// An equal-rate KVO callback must not issue another playback command.

@@ -155,13 +155,13 @@ final class PlayerModel: ObservableObject {
     func select(_ episode: Episode, position: Double = 0) {
         guard episode.isAvailable else { return }
         retryCount = 0
-        beginLoad(episode, position: position, fresh: false)
+        beginLoad(episode, position: position, fresh: false, autoplay: true)
     }
 
     func retry() {
         guard let episode = currentEpisode else { return }
         retryCount = 0
-        beginLoad(episode, position: resumePosition, fresh: true)
+        beginLoad(episode, position: resumePosition, fresh: true, autoplay: true)
     }
 
     func skip(_ seconds: Double) {
@@ -222,13 +222,13 @@ final class PlayerModel: ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    private func beginLoad(_ episode: Episode, position: Double, fresh: Bool) {
+    private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool) {
         saveProgress()
         loadTask?.cancel()
         let requestGeneration = UUID()
         generation = requestGeneration
         player.pause()
-        clearItem()
+        clearItem(autoplay: autoplay && sceneActive)
         currentEpisode = episode
         pendingResume = position.isFinite ? max(0, position) : 0
         elapsed = pendingResume
@@ -326,7 +326,7 @@ final class PlayerModel: ObservableObject {
                 self.elapsed = target
                 self.hasStarted = true
                 self.isLoading = false
-                if self.sceneActive { self.resumePlayback() }
+                if self.sceneActive, self.playbackSpeed.wantsPlayback { self.resumePlayback() }
             }
         }
     }
@@ -345,8 +345,9 @@ final class PlayerModel: ObservableObject {
             }
         }
         if retryCount == 0 {
+            let resumeAfterRecovery = playbackSpeed.wantsPlayback
             retryCount = 1
-            beginLoad(episode, position: resumePosition, fresh: true)
+            beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery)
         } else {
             isLoading = false
             errorMessage = error?.localizedDescription ?? "目前無法播放這一集。請重新取源，或選擇其他集數。"
@@ -392,12 +393,12 @@ final class PlayerModel: ObservableObject {
         lastSavedAt = Date()
     }
 
-    private func clearItem() {
+    private func clearItem(autoplay: Bool = false) {
         hasStarted = false
         preparingGeneration = nil
         isPlaying = false
         isBuffering = false
-        playbackSpeed.prepareForItem()
+        playbackSpeed.prepareForItem(autoplay: autoplay)
         if let progressObserver { player.removeTimeObserver(progressObserver) }
         progressObserver = nil
         statusObservation?.invalidate()
