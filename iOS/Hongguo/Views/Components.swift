@@ -136,5 +136,7 @@ final class CatalogModel: ObservableObject {
         }
     }
 
+    func cancel() { generation = UUID(); isLoading = false }
+
     func fail(_ error: Error) { generation = UUID(); items = []; isLoading = false; self.error = error.localizedDescription }
 }

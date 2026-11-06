@@ -7,9 +7,20 @@ struct SearchView: View {
     @StateObject private var catalog = CatalogModel()
     @State private var text = ""
     @State private var submitted = ""
+    @State private var loadedContext: SearchContext?
+    @State private var loadID = UUID()
+    @State private var loadTask: Task<Void, Never>?
+
+    private struct SearchContext: Hashable {
+        let revision: UUID
+        let query: String
+    }
+
+    private var searchContext: SearchContext { .init(revision: model.revision, query: submitted) }
 
     var body: some View {
-        ScrollView {
+        let context = searchContext
+        return ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 if submitted.isEmpty {
                     VStack(alignment: .leading, spacing: 12) {
@@ -31,11 +42,11 @@ struct SearchView: View {
                     if catalog.isLoading { ProgressView().frame(maxWidth: .infinity).padding() }
                     else if let error = catalog.error {
                         StatusCard(icon: "exclamationmark.magnifyingglass", title: "搜尋暫時無法使用", message: error,
-                                   actionTitle: "重試", action: { Task { await load(reset: true) } })
+                                   actionTitle: "重試", action: { beginLoad() })
                     } else if catalog.items.isEmpty {
                         StatusCard(icon: "magnifyingglass", title: "沒有找到這部劇", message: "試試完整劇名或較短的關鍵字。")
                     } else if catalog.hasMore {
-                        Button("載入更多") { Task { await load() } }.buttonStyle(.bordered).frame(maxWidth: .infinity)
+                        Button("載入更多") { beginLoad() }.buttonStyle(.bordered).frame(maxWidth: .infinity)
                     }
                 }
             }.padding(20)
@@ -46,19 +57,55 @@ struct SearchView: View {
         .onChange(of: text) { _, value in
             if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { submitted = "" }
         }
-        .task(id: "\(model.revision.uuidString):\(submitted)") { if !submitted.isEmpty { await load(reset: true) } }
+        .task(id: context) { await activate(context) }
+        .onDisappear { cancelLoading() }
     }
 
     private func submit() {
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { submitted = ""; return }
         model.rememberSearch(query)
-        if query == submitted { Task { await load(reset: true) } }
+        if query == submitted { beginLoad(reset: true) }
         else { submitted = query }
     }
 
-    private func load(reset: Bool = false) async {
-        do { await catalog.load(service: try model.catalogService(), query: submitted, reset: reset) }
-        catch { catalog.fail(error) }
+    private func activate(_ context: SearchContext) async {
+        guard context == searchContext, !Task.isCancelled else { return }
+        cancelLoading()
+        guard !context.query.isEmpty else { loadedContext = nil; return }
+        guard loadedContext != context else { return }
+        await load(context: context, reset: true)
+    }
+
+    private func beginLoad(reset: Bool = false) {
+        let context = searchContext
+        guard !context.query.isEmpty, reset || !catalog.isLoading else { return }
+        cancelLoading()
+        let request = loadID
+        loadTask = Task {
+            await load(context: context, reset: reset || loadedContext != context)
+            if request == loadID { loadTask = nil }
+        }
+    }
+
+    private func load(context: SearchContext, reset: Bool) async {
+        guard context == searchContext, !Task.isCancelled else { return }
+        let request = loadID
+        if reset { loadedContext = nil }
+        do {
+            let service = try model.catalogService()
+            await catalog.load(service: service, query: context.query, reset: reset)
+            guard request == loadID, context == searchContext, !Task.isCancelled else { return }
+            if catalog.error == nil { loadedContext = context }
+        } catch {
+            guard request == loadID, context == searchContext, !Task.isCancelled else { return }
+            catalog.fail(error)
+        }
+    }
+
+    private func cancelLoading() {
+        loadID = UUID()
+        loadTask?.cancel(); loadTask = nil
+        catalog.cancel()
     }
 }
