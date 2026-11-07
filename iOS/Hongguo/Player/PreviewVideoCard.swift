@@ -19,6 +19,7 @@ struct RecommendationPreviewMediaCard: View {
     var onPreviewQualified: (() -> Void)? = nil
     var recommendationTitle: String? = nil
     var recommendationReason: String? = nil
+    var discoverySourceLabel: String? = nil
     var bottomControlInset: CGFloat = 0
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
@@ -32,6 +33,7 @@ struct RecommendationPreviewMediaCard: View {
                             onToggleFavorite: onToggleFavorite, onPlaybackStarted: onPlaybackStarted,
                             onPreviewQualified: onPreviewQualified,
                             recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
+                            discoverySourceLabel: discoverySourceLabel,
                             bottomControlInset: bottomControlInset,
                             onShowPreferences: onShowPreferences,
                             onNotInterested: onNotInterested, onViewDetails: onViewDetails, onOpenSeries: onOpenSeries)
@@ -59,6 +61,7 @@ private struct PreviewVideoContent: View {
     let onPreviewQualified: (() -> Void)?
     let recommendationTitle: String?
     let recommendationReason: String?
+    let discoverySourceLabel: String?
     let bottomControlInset: CGFloat
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
@@ -80,7 +83,7 @@ private struct PreviewVideoContent: View {
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
          onToggleFavorite: (() -> Void)?, onPlaybackStarted: (() -> Void)?, onPreviewQualified: (() -> Void)?,
-         recommendationTitle: String?, recommendationReason: String?,
+         recommendationTitle: String?, recommendationReason: String?, discoverySourceLabel: String?,
          bottomControlInset: CGFloat,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
          onOpenSeries: @escaping (PreviewPlaybackSnapshot) -> Void) {
@@ -93,6 +96,7 @@ private struct PreviewVideoContent: View {
         self.onPreviewQualified = onPreviewQualified
         self.recommendationTitle = recommendationTitle
         self.recommendationReason = recommendationReason
+        self.discoverySourceLabel = discoverySourceLabel
         self.bottomControlInset = bottomControlInset
         self.onShowPreferences = onShowPreferences
         self.onNotInterested = onNotInterested
@@ -235,6 +239,11 @@ private struct PreviewVideoContent: View {
         VStack(spacing: 14) {
             HStack(alignment: .bottom, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
+                    if let discoverySourceLabel {
+                        Text(discoverySourceLabel).font(.caption2.weight(.semibold)).lineLimit(1)
+                            .foregroundStyle(Theme.accent)
+                            .accessibilityLabel("推薦來源：\(discoverySourceLabel)")
+                    }
                     if let recommendationReason {
                         Text(recommendationReason).font(.caption2).lineLimit(2)
                             .foregroundStyle(.white.opacity(0.8))

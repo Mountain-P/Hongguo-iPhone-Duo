@@ -7,6 +7,27 @@ struct CatalogDiscoveryCheck {
     static func main() async {
         do {
             let args = Array(CommandLine.arguments.dropFirst())
+            if args.first == "preview", (2...3).contains(args.count),
+               let category = DirectWebService.Category(rawValue: args[1]) {
+                let limit = args.count == 3 ? Int(args[2]) ?? 0 : 3
+                guard (1...5).contains(limit) else { throw ProbeError.usage }
+                let service = RecommendationDiscoveryService(base: NativeCatalogService(category: category), category: category)
+                var pages: [[String: Any]] = []
+                for page in 1...limit {
+                    let result = try await service.home(page: page)
+                    let origins = await service.provenance(for: result.items.map(\.id))
+                    var counts: [String: Int] = [:]
+                    for item in result.items { counts[origins[item.id]?.label ?? "未標示來源", default: 0] += 1 }
+                    pages.append(["page": result.page, "count": result.items.count, "hasMore": result.hasMore,
+                                  "sources": counts, "sample": result.items.prefix(3).map(\.title)])
+                    if !result.hasMore { break }
+                    // This explicit metadata probe gives the background side pool its full
+                    // bounded preparation window; production page one never waits here.
+                    if page == 1 { try await Task.sleep(for: .milliseconds(8_200)) }
+                }
+                try output(["category": category.rawValue, "pages": pages])
+                return
+            }
             if args.first == "artist", args.count == 2 {
                 let profile = try await ArtistDiscoveryService().artist(id: args[1])
                 try output(["artist": profile.artist.name, "hasBiography": !profile.biography.isEmpty,
@@ -64,7 +85,7 @@ struct CatalogDiscoveryCheck {
             try output(summary)
         } catch {
             // Do not print upstream responses, identities, signed URLs or headers.
-            let message = error is ProbeError ? "Usage: CatalogDiscoveryCheck category <real-drama|comic-drama|ai-drama> [page] [genre] | rank <all|real-drama|comic-drama|ai-drama> [page] | new <real-drama|ai-drama> | artist <id> | detail <id>" : error.localizedDescription
+            let message = error is ProbeError ? "Usage: CatalogDiscoveryCheck preview <real-drama|comic-drama|ai-drama> [pages:1...5] | category <real-drama|comic-drama|ai-drama> [page] [genre] | rank <all|real-drama|comic-drama|ai-drama> [page] | new <real-drama|ai-drama> | artist <id> | detail <id>" : error.localizedDescription
             FileHandle.standardError.write(Data((message + "\n").utf8))
             exit(1)
         }

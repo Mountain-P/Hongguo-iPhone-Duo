@@ -266,6 +266,7 @@ struct RecommendationPreviewView: View {
                     },
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
                     recommendationReason: recommendationReason(for: series.id),
+                    discoverySourceLabel: preview.sourceLabelByID[series.id],
                     bottomControlInset: bottomControlInset,
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { hide(series) },
@@ -316,6 +317,10 @@ struct RecommendationPreviewView: View {
                 Button("重試第一集") { preview.retry(seriesID: series.id) }.buttonStyle(.bordered)
             }
             Text(series.title).font(.title3.weight(.semibold)).lineLimit(3)
+            if let source = preview.sourceLabelByID[series.id] {
+                Text(source).font(.caption.weight(.medium)).foregroundStyle(Theme.accent)
+                    .accessibilityLabel("推薦來源：\(source)")
+            }
             if let reason = recommendationReason(for: series.id) {
                 Text(reason).font(.caption).foregroundStyle(.white.opacity(0.8)).lineLimit(2)
             }

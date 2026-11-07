@@ -15,6 +15,7 @@ final class RecommendationPreviewModel: ObservableObject {
     @Published private(set) var queue = RecommendationPreviewQueue()
     @Published private(set) var media: [String: RecommendationFeedMedia] = [:]
     @Published private(set) var reasonByID: [String: String] = [:]
+    @Published private(set) var sourceLabelByID: [String: String] = [:]
     private(set) var rankingScope: LibraryScope?
     private var rankingProfile: PersonalizedRecommendationProfile?
     @Published private(set) var lease: RecommendationFeedActivation.Lease?
@@ -96,7 +97,7 @@ final class RecommendationPreviewModel: ObservableObject {
     func invalidateSource() {
         suspend(); queue.reset(); media = [:]; recentMediaIDs = []; detailErrors = [:]; startedPreviewIDs = []
         revision = nil; filterRevision = nil; catalogue = nil; playback = nil; pageError = nil
-        rankingScope = nil; rankingProfile = nil; reasonByID = [:]
+        rankingScope = nil; rankingProfile = nil; reasonByID = [:]; sourceLabelByID = [:]
     }
 
     func suspend() {
@@ -169,9 +170,17 @@ final class RecommendationPreviewModel: ObservableObject {
                     let result = try await catalogue.home(page: pageRequest.page)
                     try Task.checkCancellation()
                     guard self.catalogueGeneration == request else { return }
+                    let origins = await (catalogue as? any RecommendationProvenanceProviding)?.provenance(for: result.items.map(\.id)) ?? [:]
+                    try Task.checkCancellation()
+                    guard self.catalogueGeneration == request else { return }
                     guard try self.queue.receive(result, for: pageRequest, preferences: self.preferences, ranking: {
                         PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
                     }) else { throw CancellationError() }
+                    for item in result.items {
+                        if let origin = origins[item.id], origin.source != .category {
+                            self.sourceLabelByID[item.id] = origin.label
+                        }
+                    }
                     self.refreshReasons()
                     self.pruneMedia()
                     if self.queue.items.last?.id != previousTail || !self.queue.hasMore { return }
@@ -237,6 +246,7 @@ final class RecommendationPreviewModel: ObservableObject {
         recentMediaIDs.removeAll { !retained.contains($0) }
         detailErrors = detailErrors.filter { retained.contains($0.key) }
         startedPreviewIDs.formIntersection(retained)
+        sourceLabelByID = sourceLabelByID.filter { retained.contains($0.key) }
     }
 
     func setPrefetchAllowed(_ allowed: Bool) {

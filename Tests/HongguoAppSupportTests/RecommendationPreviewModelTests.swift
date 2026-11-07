@@ -7,6 +7,50 @@ import HongguoCore
 struct RecommendationPreviewModelTests {
     private let scope = LibraryScope(owner: .guest, sourceID: "test-source")
 
+    @Test func sourceLabelsRemainSeparateFromRankingAndArePrunedWithExcludedCards() async throws {
+        let source = PreviewCatalogueGate()
+        await source.setOrigins([
+            "10": .init(source: .category, category: .realDrama),
+            "20": .init(source: .ranking, category: .realDrama),
+            "30": .init(source: .newRelease, category: .realDrama),
+            "99": .init(source: .ranking, category: .aiDrama)
+        ])
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        #expect(model.items.map(\.id) == ["10", "20", "30"])
+        #expect(model.sourceLabelByID == ["20": "真人熱播榜", "30": "真人近 7 天上新"])
+        #expect(model.reasonByID.isEmpty)
+        model.excludeNotInterested(try hidden(["20"]))
+        #expect(model.sourceLabelByID == ["30": "真人近 7 天上新"])
+        #expect(model.current?.id == "10")
+        model.invalidateSource()
+        #expect(model.sourceLabelByID.isEmpty)
+    }
+
+    @Test func lateSourceLabelsCannotPopulateAReplacementSource() async throws {
+        let oldSource = PreviewCatalogueGate(), replacement = PreviewCatalogueGate()
+        await oldSource.setOrigins(["10": .init(source: .ranking, category: .realDrama)], hold: true)
+        await replacement.setOrigins(["20": .init(source: .newRelease, category: .aiDrama)])
+        let model = configured(oldSource)
+        defer { cleanUp(model, oldSource); Task { await replacement.finishAll() } }
+        model.loadInitial()
+        try await wait { await oldSource.hasHome(1) }
+        let stale = try #require(model.catalogueTask)
+        await oldSource.releaseHome(1, ids: ["10"])
+        try await wait { await oldSource.hasProvenance() }
+        let other = LibraryScope(owner: .guest, sourceID: "replacement")
+        model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(category: .aiDrama),
+                        profile: .init(scope: other, favorites: [], history: []), scope: other,
+                        catalogue: replacement, playback: replacement)
+        try await loadFirst(model, replacement, ids: ["20"])
+        await oldSource.releaseProvenance()
+        await stale.value
+        #expect(model.items.map(\.id) == ["20"])
+        #expect(model.sourceLabelByID == ["20": "AI近 7 天上新"])
+        #expect(model.rankingScope == other)
+    }
+
     @Test func hidingCurrentRejectsItsLateDetailAndPreservesOtherCachedCards() async throws {
         let source = PreviewCatalogueGate()
         let model = configured(source)
@@ -191,12 +235,25 @@ struct RecommendationPreviewModelTests {
 }
 
 /// Deliberately ignores task cancellation until release, exercising stale-response guards.
-private actor PreviewCatalogueGate: CatalogService {
+private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProviding {
     private(set) var homeRequests: [Int] = []
     private(set) var playbackRequests: [String] = []
     private var homes: [Int: CheckedContinuation<SeriesPage, any Error>] = [:]
     private var details: [String: CheckedContinuation<SeriesDetail, any Error>] = [:]
     private var playbacks: [String: CheckedContinuation<PlaybackSource, any Error>] = [:]
+    private var origins: [String: RecommendationProvenance] = [:]
+    private var holdProvenance = false
+    private var provenanceWaiter: CheckedContinuation<Void, Never>?
+
+    func setOrigins(_ origins: [String: RecommendationProvenance], hold: Bool = false) {
+        self.origins = origins; holdProvenance = hold
+    }
+    func provenance(for seriesIDs: [String]) async -> [String: RecommendationProvenance] {
+        if holdProvenance { await withCheckedContinuation { provenanceWaiter = $0 } }
+        return origins.filter { seriesIDs.contains($0.key) }
+    }
+    func hasProvenance() -> Bool { provenanceWaiter != nil }
+    func releaseProvenance() { holdProvenance = false; provenanceWaiter?.resume(); provenanceWaiter = nil }
 
     func home(page: Int) async throws -> SeriesPage {
         homeRequests.append(page)
@@ -224,6 +281,7 @@ private actor PreviewCatalogueGate: CatalogService {
         playbacks.removeValue(forKey: id)?.resume(returning: .init(url: URL(string: "https://example.invalid/test.mp4")!))
     }
     func finishAll() {
+        releaseProvenance()
         let home = Array(homes.values), detail = Array(details.values), playback = Array(playbacks.values)
         homes = [:]; details = [:]; playbacks = [:]
         for continuation in home { continuation.resume(throwing: CancellationError()) }

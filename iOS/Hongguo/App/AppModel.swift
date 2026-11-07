@@ -96,7 +96,10 @@ final class AppModel: ObservableObject {
     }
 
     func previewCatalogService() throws -> any CatalogService {
-        if catalogSource == .website { return NativeCatalogService(category: recommendationPreferences.category, quality: nativePlaybackQuality) }
+        if catalogSource == .website {
+            let category = recommendationPreferences.category
+            return RecommendationDiscoveryService(base: NativeCatalogService(category: category, quality: nativePlaybackQuality), category: category)
+        }
         return try playbackService()
     }
 
