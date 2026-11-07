@@ -158,7 +158,10 @@ private struct PreviewVideoContent: View {
         .foregroundStyle(.white)
         .accessibilityHidden(!allowsInteraction)
         .task { synchronizeActivation(); updatePreviewQualification() }
-        .onChange(of: isActive) { _, _ in synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: isActive) { _, active in
+            if !active { reportedPlaybackStarted = false }
+            synchronizeActivation(); updatePreviewQualification()
+        }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
         .onChange(of: allowsInteraction) { _, _ in updatePreviewQualification() }
         .onChange(of: scenePhase) { _, _ in synchronizeActivation(); updatePreviewQualification() }
@@ -413,6 +416,7 @@ private struct PreviewVideoContent: View {
     }
 
     private func deactivate() {
+        reportedPlaybackStarted = false
         stopPreviewQualification()
         hideTask?.cancel()
         cancelBoost(reveal: false)

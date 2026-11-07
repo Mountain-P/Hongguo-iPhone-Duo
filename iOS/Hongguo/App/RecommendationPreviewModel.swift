@@ -2,7 +2,7 @@ import Foundation
 import Combine
 import HongguoCore
 
-struct RecommendationFeedMedia: Identifiable {
+struct RecommendationFeedMedia: Identifiable, Sendable {
     let id = UUID()
     let series: Series
     let episode: Episode
@@ -40,6 +40,29 @@ final class RecommendationPreviewModel: ObservableObject {
     private var prefetchGeneration = UUID()
     private var prefetchAllowed = false
     private var startedPreviewIDs: Set<String> = []
+    private var workGeneration = UUID()
+    private var metadataFlights: [String: MetadataFlight] = [:]
+    private var activeMetadataOwner: MetadataOwner?
+    private var adjacentMetadataOwner: MetadataOwner?
+
+    private struct MetadataFlight {
+        let id: UUID
+        let task: Task<RecommendationFeedMedia, any Error>
+        var owners: Set<UUID>
+    }
+    private struct MetadataOwner: Equatable {
+        let seriesID: String
+        let flightID: UUID
+        let ownerID: UUID
+        let generation: UUID
+        let task: Task<RecommendationFeedMedia, any Error>
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.ownerID == rhs.ownerID && lhs.flightID == rhs.flightID && lhs.generation == rhs.generation
+        }
+    }
+
+    var metadataFlightCount: Int { metadataFlights.count }
+    func metadataConsumerCount(seriesID: String) -> Int { metadataFlights[seriesID]?.owners.count ?? 0 }
 
     var items: [Series] { queue.items }
     var current: Series? { queue.current }
@@ -64,7 +87,7 @@ final class RecommendationPreviewModel: ObservableObject {
         if let lease, preferences.isNotInterested(seriesID: lease.seriesID)
             || (change.currentChanged && lease.seriesID != change.currentID) {
             activation.invalidate(); self.lease = nil
-            detailGeneration = UUID(); detailTask?.cancel(); detailTask = nil; loadingID = nil
+            cancelActivePreparation()
         }
         if change.currentChanged || prefetchSeriesID.map({ preferences.isNotInterested(seriesID: $0) }) == true {
             cancelAdjacentPrefetch()
@@ -103,20 +126,39 @@ final class RecommendationPreviewModel: ObservableObject {
     func suspend() {
         cancelAdjacentPrefetch()
         activation.invalidate(); lease = nil
-        detailGeneration = UUID()
-        detailTask?.cancel(); detailTask = nil; loadingID = nil
+        cancelActivePreparation()
+        workGeneration = UUID()
+        for flight in metadataFlights.values { flight.task.cancel() }
+        metadataFlights = [:]
         catalogueGeneration = UUID(); catalogueTask?.cancel(); catalogueTask = nil
         queue.cancelPageRequest(); isLoadingPage = false
     }
 
+    /// Paging pauses the old card without discarding useful work for the next card.
+    /// Actual tab/scene/detail/source departures continue to use `suspend()`.
+    func beginPaging(toward seriesID: String? = nil) {
+        if let seriesID {
+            if prefetchSeriesID != seriesID { cancelAdjacentPrefetch() }
+        }
+        activation.invalidate(); lease = nil
+        cancelActivePreparation()
+    }
+
     func update(selectedID: String?, isIdle: Bool, isActive: Bool, isSceneActive: Bool, isDetailPresented: Bool) {
+        guard isActive, isSceneActive, !isDetailPresented else {
+            cancelAdjacentPrefetch(); activation.invalidate(); lease = nil
+            cancelActivePreparation()
+            return
+        }
         let validID = selectedID.flatMap { id in queue.items.contains(where: { $0.id == id }) ? id : nil }
+        guard isIdle, let validID else { beginPaging(); return }
         let next = activation.update(selectedID: validID, isIdle: isIdle, isActive: isActive,
                                      isSceneActive: isSceneActive, isDetailPresented: isDetailPresented)
         guard next != lease else { return }
-        cancelAdjacentPrefetch()
-        detailGeneration = UUID()
-        detailTask?.cancel(); detailTask = nil; loadingID = nil
+        // Keep a prefetch of B while B becomes foreground. Its metadata owner
+        // stays alive until the foreground owner has attached and playback starts.
+        if prefetchSeriesID != validID { cancelAdjacentPrefetch() }
+        cancelActivePreparation()
         lease = next
         guard let next else { return }
         queue.select(seriesID: next.seriesID)
@@ -126,7 +168,7 @@ final class RecommendationPreviewModel: ObservableObject {
 
     func retry(seriesID: String) {
         guard let lease, lease.seriesID == seriesID else { return }
-        detailTask?.cancel(); detailTask = nil
+        cancelActivePreparation()
         media.removeValue(forKey: seriesID); detailErrors.removeValue(forKey: seriesID)
         prepare(lease)
     }
@@ -205,9 +247,21 @@ final class RecommendationPreviewModel: ObservableObject {
         detailGeneration = UUID()
         let request = detailGeneration
         loadingID = lease.seriesID; detailErrors.removeValue(forKey: lease.seriesID)
+        let joined: MetadataOwner
+        do {
+            // Attach synchronously before a policy change can release the adjacent
+            // owner. Merely scheduling a future foreground task leaves a cancel gap.
+            joined = try acquireMetadata(seriesID: lease.seriesID, service: playback, priority: .userInitiated)
+            activeMetadataOwner = joined
+        } catch {
+            loadingID = nil; detailErrors[lease.seriesID] = error.localizedDescription
+            return
+        }
         detailTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self else { joined.task.cancel(); return }
             defer {
+                self.releaseMetadata(joined)
+                if self.activeMetadataOwner == joined { self.activeMetadataOwner = nil }
                 if self.activation.accepts(lease), self.detailGeneration == request {
                     self.loadingID = nil; self.detailTask = nil
                 }
@@ -216,14 +270,11 @@ final class RecommendationPreviewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard self.activation.accepts(lease), self.detailGeneration == request,
                       self.isRetained(seriesID: lease.seriesID) else { return }
-                let detail: SeriesDetail
-                if let bridge = playback as? BridgeService { detail = try await bridge.verifiedDetail(id: lease.seriesID) }
-                else { detail = try await playback.detail(id: lease.seriesID) }
+                let prepared = try await joined.task.value
                 try Task.checkCancellation()
                 guard self.activation.accepts(lease), self.detailGeneration == request,
                       self.isRetained(seriesID: lease.seriesID) else { return }
-                let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: lease.seriesID)
-                self.media[lease.seriesID] = RecommendationFeedMedia(series: detail.series, episode: episode, service: playback)
+                self.media[lease.seriesID] = prepared
                 self.touch(lease.seriesID)
             } catch is CancellationError { return }
             catch {
@@ -247,6 +298,9 @@ final class RecommendationPreviewModel: ObservableObject {
         detailErrors = detailErrors.filter { retained.contains($0.key) }
         startedPreviewIDs.formIntersection(retained)
         sourceLabelByID = sourceLabelByID.filter { retained.contains($0.key) }
+        for id in Array(metadataFlights.keys) where !retained.contains(id) {
+            metadataFlights.removeValue(forKey: id)?.task.cancel()
+        }
     }
 
     func setPrefetchAllowed(_ allowed: Bool) {
@@ -257,9 +311,9 @@ final class RecommendationPreviewModel: ObservableObject {
     }
 
     func didStartPreview(seriesID: String) {
-        guard isRetained(seriesID: seriesID) else { return }
+        guard isRetained(seriesID: seriesID), let lease, lease.seriesID == seriesID else { return }
         startedPreviewIDs.insert(seriesID)
-        guard let lease, lease.seriesID == seriesID else { return }
+        if prefetchSeriesID == seriesID { cancelAdjacentPrefetch() }
         prepareAdjacent(to: lease)
     }
 
@@ -271,7 +325,50 @@ final class RecommendationPreviewModel: ObservableObject {
 
     private func cancelAdjacentPrefetch() {
         prefetchGeneration = UUID()
+        if let owner = adjacentMetadataOwner { releaseMetadata(owner); adjacentMetadataOwner = nil }
         prefetchTask?.cancel(); prefetchTask = nil; prefetchSeriesID = nil
+    }
+
+    private func cancelActivePreparation() {
+        detailGeneration = UUID()
+        // Eligibility belongs to this activation, not a historical visit to the card.
+        startedPreviewIDs.removeAll()
+        if let owner = activeMetadataOwner { releaseMetadata(owner); activeMetadataOwner = nil }
+        detailTask?.cancel(); detailTask = nil; loadingID = nil
+    }
+
+    private func acquireMetadata(seriesID: String, service: any CatalogService,
+                                 priority: TaskPriority) throws -> MetadataOwner {
+        let ownerID = UUID()
+        if var flight = metadataFlights[seriesID] {
+            flight.owners.insert(ownerID); metadataFlights[seriesID] = flight
+            return .init(seriesID: seriesID, flightID: flight.id, ownerID: ownerID, generation: workGeneration, task: flight.task)
+        }
+        guard metadataFlights.count < 2 else { throw CatalogError.network }
+        let id = UUID()
+        let task = Task(priority: priority) {
+            try Task.checkCancellation()
+            let detail: SeriesDetail
+            if let bridge = service as? BridgeService { detail = try await bridge.verifiedDetail(id: seriesID) }
+            else { detail = try await service.detail(id: seriesID) }
+            try Task.checkCancellation()
+            let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: seriesID)
+            return RecommendationFeedMedia(series: detail.series, episode: episode, service: service)
+        }
+        metadataFlights[seriesID] = MetadataFlight(id: id, task: task, owners: [ownerID])
+        return .init(seriesID: seriesID, flightID: id, ownerID: ownerID, generation: workGeneration, task: task)
+    }
+
+    private func releaseMetadata(_ owner: MetadataOwner) {
+        guard owner.generation == workGeneration, var flight = metadataFlights[owner.seriesID], flight.id == owner.flightID else { return }
+        flight.owners.remove(owner.ownerID)
+        if flight.owners.isEmpty { metadataFlights.removeValue(forKey: owner.seriesID); flight.task.cancel() }
+        else { metadataFlights[owner.seriesID] = flight }
+    }
+
+    private func acceptsPrefetch(_ request: UUID, seriesID: String, generation: UUID) -> Bool {
+        prefetchAllowed && prefetchGeneration == request && workGeneration == generation
+            && prefetchSeriesID == seriesID && isRetained(seriesID: seriesID)
     }
 
     private func isRetained(seriesID: String) -> Bool {
@@ -279,34 +376,39 @@ final class RecommendationPreviewModel: ObservableObject {
     }
 
     private func prepareAdjacent(to lease: RecommendationFeedActivation.Lease) {
-        guard prefetchAllowed, prefetchTask == nil, let playback,
+        guard prefetchAllowed, startedPreviewIDs.contains(lease.seriesID), prefetchTask == nil, let playback,
               let current = items.firstIndex(where: { $0.id == lease.seriesID }), items.indices.contains(current + 1) else { return }
         let next = items[current + 1]
         guard preferences.allows(seriesID: next.id) else { return }
         let request = UUID(); prefetchGeneration = request
+        let generation = workGeneration
         prefetchSeriesID = next.id
         prefetchTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
-            defer { if self.prefetchGeneration == request { self.prefetchTask = nil; self.prefetchSeriesID = nil } }
+            var owner: MetadataOwner?
+            defer {
+                if let owner {
+                    self.releaseMetadata(owner)
+                    if self.adjacentMetadataOwner == owner { self.adjacentMetadataOwner = nil }
+                }
+                if self.prefetchGeneration == request { self.prefetchTask = nil; self.prefetchSeriesID = nil }
+            }
             do {
                 // Give active playback first use of the connection and ignore quick flicks.
                 try await Task.sleep(for: .milliseconds(400))
-                guard self.prefetchAllowed, self.prefetchGeneration == request, self.activation.accepts(lease),
-                      self.isRetained(seriesID: next.id) else { return }
+                guard self.acceptsPrefetch(request, seriesID: next.id, generation: generation) else { return }
                 let media: RecommendationFeedMedia
                 if let cached = self.media[next.id] { media = cached }
                 else {
-                    let detail = try await playback.detail(id: next.id)
+                    let joined = try self.acquireMetadata(seriesID: next.id, service: playback, priority: .utility)
+                    owner = joined; self.adjacentMetadataOwner = joined
+                    media = try await joined.task.value
                     try Task.checkCancellation()
-                    guard self.prefetchGeneration == request, self.activation.accepts(lease),
-                          self.isRetained(seriesID: next.id) else { return }
-                    let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: next.id)
-                    media = RecommendationFeedMedia(series: detail.series, episode: episode, service: playback)
+                    guard self.acceptsPrefetch(request, seriesID: next.id, generation: generation) else { return }
                     self.media[next.id] = media; self.touch(next.id)
                 }
                 try Task.checkCancellation()
-                guard self.prefetchAllowed, self.prefetchGeneration == request, self.activation.accepts(lease),
-                      self.isRetained(seriesID: next.id) else { return }
+                guard self.acceptsPrefetch(request, seriesID: next.id, generation: generation) else { return }
                 _ = try await self.prefetcher.prepare(seriesID: next.id, episodeID: media.episode.id, service: playback)
             } catch { /* Speculative work never becomes a visible playback error. */ }
         }

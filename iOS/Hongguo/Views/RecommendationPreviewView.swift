@@ -495,7 +495,7 @@ struct RecommendationPreviewView: View {
         // Geometry alignment and the system's scroll phase gate activation.
         // A binding-driven accessibility scroll does not always emit a phase
         // transition, so do not leave it waiting for an idle callback forever.
-        preview.suspend()
+        preview.beginPaging(toward: preview.items[index + offset].id)
         withAnimation { scrollID = preview.items[index + offset].id }
     }
 

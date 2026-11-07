@@ -188,6 +188,183 @@ struct RecommendationPreviewModelTests {
         #expect(model.items.map(\.id) == ["20"])
     }
 
+    @Test func pagingPromotesPendingNeighborMetadataAndPreservesAnInFlightCataloguePage() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"], more: true)
+        try await prepare("10", model, source)
+        try await wait { await source.hasHome(2) }
+        let page = try #require(model.catalogueTask)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        let adjacent = try #require(model.prefetchTask)
+        model.beginPaging(toward: "20")
+        model.update(selectedID: nil, isIdle: false, isActive: true, isSceneActive: true, isDetailPresented: false)
+        #expect(model.lease == nil && model.catalogueTask != nil)
+        activate("20", model)
+        try await wait { model.metadataConsumerCount(seriesID: "20") == 2 }
+        let foreground = try #require(model.detailTask)
+        #expect(await source.detailRequests.filter { $0 == "20" }.count == 1)
+        // Revoking speculative permission releases that owner, never the foreground owner.
+        model.setPrefetchAllowed(false)
+        #expect(model.metadataConsumerCount(seriesID: "20") == 1)
+        #expect(source.detailCancellations.count(for: "20") == 0)
+        await source.releaseDetail("20")
+        await foreground.value; await adjacent.value
+        await source.releaseHome(2, ids: ["40"])
+        await page.value
+        #expect(model.media["20"] != nil && model.detailErrors["20"] == nil)
+        #expect(model.current?.id == "20" && model.queue.page == 2)
+        #expect(await source.homeRequests == [1, 2])
+        #expect(model.metadataFlightCount == 0)
+    }
+
+    @Test func releasingForegroundDuringPagingKeepsTheAdjacentMetadataOwnerAlive() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        activate("20", model)
+        try await wait { model.metadataConsumerCount(seriesID: "20") == 2 }
+        let oldForeground = try #require(model.detailTask)
+        model.beginPaging()
+        #expect(model.metadataConsumerCount(seriesID: "20") == 1)
+        #expect(source.detailCancellations.count(for: "20") == 0)
+        await source.releaseDetail("20")
+        await oldForeground.value
+        try await wait { await source.hasPlayback("20") }
+        #expect(model.media["20"] != nil && model.lease == nil)
+        activate("20", model)
+        #expect(model.loadingID == nil && model.detailTask == nil)
+        #expect(await source.detailRequests.filter { $0 == "20" }.count == 1)
+    }
+
+    @Test func theLastSettledCardWinsAndOldSharedMetadataCannotPopulateItsUI() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        let oldAdjacent = try #require(model.prefetchTask)
+        activate("20", model)
+        try await wait { model.metadataConsumerCount(seriesID: "20") == 2 }
+        let oldForeground = try #require(model.detailTask)
+        model.beginPaging(toward: "30")
+        #expect(model.metadataFlightCount == 0)
+        activate("30", model)
+        try await wait { await source.hasDetail("30") }
+        #expect(model.metadataFlightCount == 1)
+        let final = try #require(model.detailTask)
+        await source.releaseDetail("30")
+        await final.value
+        let identity = try #require(model.media["30"]?.id)
+        await source.releaseDetail("20")
+        await oldForeground.value; await oldAdjacent.value
+        #expect(model.lease?.seriesID == "30" && model.media["30"]?.id == identity)
+        #expect(model.media["20"] == nil && model.detailErrors["20"] == nil)
+        #expect(source.detailCancellations.count(for: "20") == 1)
+        #expect(await source.detailRequests == ["10", "20", "30"])
+    }
+
+    @Test func matchingHeaderPrefetchSurvivesPromotionUntilForegroundPlaybackActuallyStarts() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        await source.releaseDetail("20")
+        try await wait { await source.hasPlayback("20") }
+        let header = try #require(model.prefetchTask)
+        let identity = try #require(model.media["20"]?.id)
+        model.beginPaging(toward: "20")
+        activate("20", model)
+        #expect(model.prefetchTask != nil && model.media["20"]?.id == identity)
+        #expect(await source.playbackRequests == ["20"])
+        model.didStartPreview(seriesID: "20")
+        try await wait { await source.hasDetail("30") }
+        await source.releasePlayback("20")
+        await header.value
+        #expect(model.prefetchTask != nil)
+        #expect(await source.detailRequests == ["10", "20", "30"])
+    }
+
+    @Test func fullSuspensionCancelsBothSharedOwnersAndRejectsTheLateMetadata() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        let oldAdjacent = try #require(model.prefetchTask)
+        activate("20", model)
+        try await wait { model.metadataConsumerCount(seriesID: "20") == 2 }
+        let oldForeground = try #require(model.detailTask)
+        model.suspend()
+        #expect(model.lease == nil && model.metadataFlightCount == 0)
+        await source.releaseDetail("20")
+        await oldForeground.value; await oldAdjacent.value
+        #expect(model.media["20"] == nil && model.loadingID == nil)
+        #expect(source.detailCancellations.count(for: "20") == 1)
+    }
+
+    @Test func disallowedSpeculationDoesNotStartAdjacentMetadataOrMedia() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(false); model.didStartPreview(seriesID: "10")
+        #expect(model.prefetchTask == nil && model.metadataFlightCount == 0)
+        #expect(await source.detailRequests == ["10"])
+        #expect(await source.playbackRequests.isEmpty)
+    }
+
+    @Test func aCachedCardWaitsForThisActivationsPlaybackCallbackBeforePrefetchingAnotherCard() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("20", model, source)
+        model.didStartPreview(seriesID: "20")
+        try await prepare("10", model, source)
+        model.didStartPreview(seriesID: "10"); model.setPrefetchAllowed(true)
+        try await wait { await source.hasPlayback("20") }
+        let header = try #require(model.prefetchTask)
+        await source.releasePlayback("20")
+        await header.value
+        model.beginPaging(toward: "20"); activate("20", model)
+        #expect(model.media["20"] != nil && model.prefetchTask == nil)
+        model.setPrefetchAllowed(false); model.setPrefetchAllowed(true)
+        #expect(model.prefetchTask == nil)
+        #expect(await source.detailRequests == ["20", "10"])
+        model.didStartPreview(seriesID: "20")
+        #expect(model.prefetchTask != nil)
+        try await wait { await source.hasDetail("30") }
+    }
+
+    @Test func anImmediatePolicyChangeCannotCancelThePromotedForegroundBeforeItsTaskStarts() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20"])
+        try await prepare("10", model, source)
+        model.setPrefetchAllowed(true); model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasDetail("20") }
+        let adjacent = try #require(model.prefetchTask)
+        model.beginPaging(toward: "20")
+        activate("20", model)
+        // Do not yield between promotion and policy revocation.
+        model.setPrefetchAllowed(false)
+        #expect(model.metadataConsumerCount(seriesID: "20") == 1)
+        #expect(source.detailCancellations.count(for: "20") == 0)
+        let foreground = try #require(model.detailTask)
+        await source.releaseDetail("20")
+        await foreground.value; await adjacent.value
+        #expect(model.media["20"] != nil)
+        #expect(await source.detailRequests == ["10", "20"])
+    }
+
     private func configured(_ source: PreviewCatalogueGate) -> RecommendationPreviewModel {
         let model = RecommendationPreviewModel()
         model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
@@ -236,7 +413,9 @@ struct RecommendationPreviewModelTests {
 
 /// Deliberately ignores task cancellation until release, exercising stale-response guards.
 private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProviding {
+    nonisolated let detailCancellations = PreviewDetailCancellations()
     private(set) var homeRequests: [Int] = []
+    private(set) var detailRequests: [String] = []
     private(set) var playbackRequests: [String] = []
     private var homes: [Int: CheckedContinuation<SeriesPage, any Error>] = [:]
     private var details: [String: CheckedContinuation<SeriesDetail, any Error>] = [:]
@@ -260,7 +439,10 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
         return try await withCheckedThrowingContinuation { homes[page] = $0 }
     }
     func detail(id: String) async throws -> SeriesDetail {
-        try await withCheckedThrowingContinuation { details[id] = $0 }
+        detailRequests.append(id)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { details[id] = $0 }
+        } onCancel: { self.detailCancellations.record(id) }
     }
     func search(query: String, page: Int) async throws -> SeriesPage { throw CatalogError.network }
     func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
@@ -288,4 +470,11 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
         for continuation in detail { continuation.resume(throwing: CancellationError()) }
         for continuation in playback { continuation.resume(throwing: CancellationError()) }
     }
+}
+
+private final class PreviewDetailCancellations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+    func record(_ id: String) { lock.lock(); counts[id, default: 0] += 1; lock.unlock() }
+    func count(for id: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[id, default: 0] }
 }
