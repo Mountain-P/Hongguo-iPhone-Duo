@@ -197,6 +197,9 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
 
     private static func sanitized(_ error: any Error) -> NSError {
         if error is CancellationError { return failure(code: -999, message: "影片載入已取消。") }
+        if PlaybackRecovery.shouldRetry(error, attempt: 0) {
+            return failure(code: PlaybackRecovery.transientAssetErrorCode, message: "影片連線暫時中斷，請重試。")
+        }
         if let media = error as? NativeMediaError {
             if case .httpStatus(let status) = media { return failure(code: status, message: media.localizedDescription) }
             return failure(code: 2, message: media.localizedDescription)

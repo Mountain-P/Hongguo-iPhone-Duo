@@ -3,16 +3,58 @@ import Foundation
 
 public actor NativeProgressiveMedia {
     public static let shared = NativeProgressiveMedia()
-    public init() {}
+    public static let reusableTimeToLive: TimeInterval = 30
+    public static let maximumReusableEntries = 2
+    public static let maximumReusablePreparationBytes = 2 * 1024 * 1024
+    private struct Key: Hashable {
+        let episodeID: String
+        let url: URL
+        let key: Data?
+        let codec: String
+        let userAgent: String
+        let quality: String
+    }
+    private struct Cached {
+        let stream: NativeMediaStream
+        let expires: Date
+        var access: UInt64
+    }
+    private var reusable: [Key: Cached] = [:]
+    private var requests: [Key: UUID] = [:]
+    private var access: UInt64 = 0
+    private let now: @Sendable () -> Date
+    private let makeFetcher: @Sendable (NativeMediaSource) throws -> any NativeRangeFetching
+
+    public init() {
+        now = Date.init
+        makeFetcher = { try NativeRangeHTTP(source: $0) }
+    }
+
+    init(now: @escaping @Sendable () -> Date = Date.init,
+         makeFetcher: @escaping @Sendable (NativeMediaSource) throws -> any NativeRangeFetching) {
+        self.now = now; self.makeFetcher = makeFetcher
+    }
 
     public func prepare(source: NativeMediaSource, episodeID: String, fresh: Bool = false) async throws -> NativeMediaStream {
         try validateID(episodeID)
         try NativeMediaPolicy.validate(source)
         try Task.checkCancellation()
-        let fetcher = try NativeRangeHTTP(source: source)
+        let key = Key(episodeID: episodeID, url: source.url, key: source.contentKey,
+                      codec: source.codec, userAgent: source.userAgent, quality: source.quality)
+        reusable = reusable.filter { $0.value.expires > now() }
+        if !fresh, var cached = reusable[key], await cached.stream.isReusable,
+           cached.expires > now(), reusable[key]?.stream.id == cached.stream.id {
+            try Task.checkCancellation()
+            access &+= 1; cached.access = access; reusable[key] = cached
+            return cached.stream
+        }
+        reusable.removeValue(forKey: key)
+        let request = UUID(); requests[key] = request
+        let fetcher = try makeFetcher(source)
+        let byteLimit = NativePrefetchContext.maximumBytes
         do {
-            return try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
-                group.addTask { try await self.prepare(source: source, fetcher: fetcher) }
+            let stream = try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
+                group.addTask { try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit) }
                 group.addTask {
                     try await Task.sleep(for: .seconds(30))
                     throw NativeSourceError(code: "ETIMEDOUT")
@@ -21,20 +63,47 @@ public actor NativeProgressiveMedia {
                 guard let stream = try await group.next() else { throw NativeProgressiveError.invalidRange }
                 return stream
             }
+            try Task.checkCancellation()
+            if requests[key] == request {
+                requests.removeValue(forKey: key)
+                if stream.preparationByteCount <= Self.maximumReusablePreparationBytes {
+                    access &+= 1
+                    reusable[key] = Cached(stream: stream, expires: now().addingTimeInterval(Self.reusableTimeToLive), access: access)
+                    while reusable.count > Self.maximumReusableEntries || reusable.values.reduce(0, { $0 + $1.stream.preparationByteCount }) > Self.maximumReusablePreparationBytes {
+                        guard let victim = reusable.min(by: { $0.value.access < $1.value.access }) else { break }
+                        reusable.removeValue(forKey: victim.key)
+                    }
+                }
+            }
+            return stream
         }
-        catch { fetcher.close(); throw error }
+        catch {
+            if requests[key] == request { requests.removeValue(forKey: key) }
+            (fetcher as? NativeRangeHTTP)?.close()
+            throw error
+        }
     }
 
+    public func clearReusableCache() async {
+        let streams = reusable.values.map(\.stream)
+        reusable.removeAll()
+        requests.removeAll()
+        for stream in streams { await stream.trimCachedChunks() }
+    }
+
+    var reusableEntryCount: Int { reusable.count }
+
     // Injectable byte source allows deterministic header, aux, LRU and cancellation tests.
-    func prepare(source: NativeMediaSource, fetcher: any NativeRangeFetching) async throws -> NativeMediaStream {
-        let first = try await fetcher.fetch(range: 0..<(256 * 1024))
+    func prepare(source: NativeMediaSource, fetcher: any NativeRangeFetching, byteLimit: Int? = nil) async throws -> NativeMediaStream {
+        let reader = PreparationReader(fetcher: fetcher, byteLimit: byteLimit)
+        let first = try await reader.fetch(range: 0..<(256 * 1024))
         try Self.validate(first, requested: 0..<(256 * 1024), total: nil, validators: nil)
         var prefix = first.data
         let moovEnd = try Self.headerEnd(prefix, total: first.totalLength)
         let requiredPrefix = min(first.totalLength, moovEnd + min(16, first.totalLength - moovEnd))
         if prefix.count < requiredPrefix {
             let remaining = prefix.count..<requiredPrefix
-            let next = try await fetcher.fetch(range: remaining)
+            let next = try await reader.fetch(range: remaining)
             try Self.validate(next, requested: remaining, total: first.totalLength, validators: first.validators)
             prefix.append(next.data)
         }
@@ -46,13 +115,14 @@ public actor NativeProgressiveMedia {
                 let plan = try NativeMP4.prepareStream(prefix: prefix, totalLength: first.totalLength, contentKey: source.contentKey, codec: source.codec, auxiliary: auxiliary)
                 try Task.checkCancellation()
                 let clearPrefix = try plan.decrypt(data: prefix, offset: 0)
-                return NativeMediaStream(totalLength: first.totalLength, fetcher: fetcher, plan: plan, validators: first.validators, prefix: clearPrefix)
+                return NativeMediaStream(totalLength: first.totalLength, fetcher: fetcher, plan: plan,
+                    validators: first.validators, prefix: clearPrefix, preparationByteCount: clearPrefix.count + auxiliaryBytes)
             } catch let requirements as NativeMP4StreamRequirements {
                 guard round < 3, !requirements.ranges.isEmpty, requirements.ranges.count <= 512 else { throw NativeProgressiveError.auxiliaryLimit }
                 for range in requirements.ranges {
                     guard range.lowerBound >= 0, range.upperBound <= first.totalLength, !range.isEmpty,
                           range.count <= 8 * 1024 * 1024 - auxiliaryBytes else { throw NativeProgressiveError.auxiliaryLimit }
-                    let response = try await fetcher.fetch(range: range)
+                    let response = try await reader.fetch(range: range)
                     try Self.validate(response, requested: range, total: first.totalLength, validators: first.validators)
                     auxiliaryBytes += response.data.count
                     auxiliary.append(NativeMP4ByteRegion(offset: range.lowerBound, data: response.data))
@@ -60,6 +130,21 @@ public actor NativeProgressiveMedia {
             }
         }
         throw NativeProgressiveError.auxiliaryLimit
+    }
+
+    private actor PreparationReader {
+        let fetcher: any NativeRangeFetching
+        let byteLimit: Int?
+        var requestedBytes = 0
+        init(fetcher: any NativeRangeFetching, byteLimit: Int?) {
+            self.fetcher = fetcher; self.byteLimit = byteLimit
+        }
+        func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
+            try Task.checkCancellation()
+            if let byteLimit, range.count > byteLimit - requestedBytes { throw PlaybackPrefetchError.budgetExceeded }
+            requestedBytes += range.count
+            return try await fetcher.fetch(range: range)
+        }
     }
 
     static func validate(_ response: NativeRangeResponse, requested: Range<Int>, total: Int?, validators: NativeRangeValidators?) throws {
@@ -90,6 +175,7 @@ public actor NativeProgressiveMedia {
 public actor NativeMediaStream: Hashable {
     public nonisolated let id: UUID
     public nonisolated let totalLength: Int
+    public nonisolated let preparationByteCount: Int
     public nonisolated var assetURL: URL { URL(string: "hongguo-native://\(id.uuidString.lowercased())/video.mp4")! }
     private let fetcher: any NativeRangeFetching
     private let plan: NativeMP4StreamPlan
@@ -100,14 +186,25 @@ public actor NativeMediaStream: Hashable {
     private var cacheBytes = 0
     private var access: UInt64 = 0
     private var permanentFailure: (any Error)?
+    private struct Flight {
+        let id: UUID
+        var task: Task<Void, Never>?
+        var waiters: [UUID: CheckedContinuation<Data, any Error>]
+    }
+    private var flights: [Int: Flight] = [:]
     private let chunkSize = 512 * 1024
     private let cacheLimit = 8 * 1024 * 1024
 
-    init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data) {
+    init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
+        self.preparationByteCount = preparationByteCount ?? prefix.count
     }
 
     deinit { (fetcher as? NativeRangeHTTP)?.close() }
+
+    var isReusable: Bool { permanentFailure == nil }
+    var pendingReaderCount: Int { flights.values.reduce(0) { $0 + $1.waiters.count } }
+    public func trimCachedChunks() { cache.removeAll(); cacheBytes = 0 }
 
     public func read(range: Range<Int>) async throws -> Data {
         try Task.checkCancellation()
@@ -130,26 +227,10 @@ public actor NativeMediaStream: Hashable {
             if var cached = cache[index] {
                 access &+= 1; cached.access = access; cache[index] = cached; chunk = cached.data
             } else {
-                do {
-                    let response = try await fetcher.fetch(range: start..<end)
-                    try Task.checkCancellation()
-                    try NativeProgressiveMedia.validate(response, requested: start..<end, total: totalLength, validators: validators)
-                    if validators.etag == nil { validators.etag = response.validators.etag }
-                    if validators.lastModified == nil { validators.lastModified = response.validators.lastModified }
-                    chunk = try plan.decrypt(data: response.data, offset: start)
-                    guard chunk.count == end - start else { throw NativeProgressiveError.invalidRange }
-                    try Task.checkCancellation()
-                    access &+= 1
-                    if let old = cache[index] { cacheBytes -= old.data.count }
-                    cache[index] = Chunk(data: chunk, access: access); cacheBytes += chunk.count
-                    while cacheBytes > cacheLimit, let victim = cache.min(by: { $0.value.access < $1.value.access }) {
-                        cacheBytes -= victim.value.data.count; cache.removeValue(forKey: victim.key)
-                    }
-                } catch {
-                    if Self.terminal(error) { permanentFailure = error; cache.removeAll(); cacheBytes = 0 }
-                    throw error
-                }
+                chunk = try await sharedChunk(index: index, range: start..<end)
             }
+            try Task.checkCancellation()
+            if let permanentFailure { throw permanentFailure }
             let upper = min(range.upperBound, end)
             output.append(chunk[(offset - start)..<(upper - start)])
             offset = upper
@@ -158,10 +239,85 @@ public actor NativeMediaStream: Hashable {
         return output
     }
 
+    private func sharedChunk(index: Int, range: Range<Int>) async throws -> Data {
+        if let permanentFailure { throw permanentFailure }
+        let waiter = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                if var flight = flights[index] {
+                    flight.waiters[waiter] = continuation; flights[index] = flight
+                } else {
+                    let id = UUID()
+                    flights[index] = Flight(id: id, task: nil, waiters: [waiter: continuation])
+                    let task = Task { [weak self] in
+                        guard let self else { return }
+                        await self.fetchChunk(index: index, range: range, id: id)
+                    }
+                    flights[index]?.task = task
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(index: index, waiter: waiter) }
+        }
+    }
+
+    private func cancelWaiter(index: Int, waiter: UUID) {
+        guard var flight = flights[index], let continuation = flight.waiters.removeValue(forKey: waiter) else { return }
+        continuation.resume(throwing: CancellationError())
+        if flight.waiters.isEmpty {
+            flights.removeValue(forKey: index); flight.task?.cancel()
+        } else { flights[index] = flight }
+    }
+
+    private func fetchChunk(index: Int, range: Range<Int>, id: UUID) async {
+        do {
+            let response = try await fetcher.fetch(range: range)
+            try Task.checkCancellation()
+            guard flights[index]?.id == id else { return }
+            try NativeProgressiveMedia.validate(response, requested: range, total: totalLength, validators: validators)
+            if validators.etag == nil { validators.etag = response.validators.etag }
+            if validators.lastModified == nil { validators.lastModified = response.validators.lastModified }
+            let data = try plan.decrypt(data: response.data, offset: range.lowerBound)
+            guard data.count == range.count else { throw NativeProgressiveError.invalidRange }
+            access &+= 1
+            if let old = cache[index] { cacheBytes -= old.data.count }
+            cache[index] = Chunk(data: data, access: access); cacheBytes += data.count
+            while cacheBytes > cacheLimit, let victim = cache.min(by: { $0.value.access < $1.value.access }) {
+                cacheBytes -= victim.value.data.count; cache.removeValue(forKey: victim.key)
+            }
+            let completed = flights.removeValue(forKey: index)
+            completed?.waiters.values.forEach { $0.resume(returning: data) }
+        } catch {
+            guard flights[index]?.id == id else { return }
+            if Self.terminal(error) {
+                permanentFailure = error; trimCachedChunks()
+                let abandoned = flights.values; flights.removeAll()
+                for flight in abandoned {
+                    flight.task?.cancel()
+                    flight.waiters.values.forEach { $0.resume(throwing: error) }
+                }
+            } else {
+                let completed = flights.removeValue(forKey: index)
+                completed?.waiters.values.forEach { $0.resume(throwing: error) }
+            }
+        }
+    }
+
     private static func terminal(_ error: any Error) -> Bool {
         if case CatalogError.unauthorized = error { return true }
+        if case CatalogError.httpStatus(401) = error { return true }
         if case CatalogError.httpStatus(403) = error { return true }
-        if case NativeProgressiveError.changedSource = error { return true }
+        if case NativeMediaError.httpStatus(401) = error { return true }
+        if case NativeMediaError.httpStatus(403) = error { return true }
+        if error is NativeProgressiveError { return true }
+        if let media = error as? NativeMediaError {
+            switch media {
+            case .network, .busy: return false
+            case .httpStatus(let status): return !(500...599).contains(status)
+            default: return true
+            }
+        }
         return false
     }
 
