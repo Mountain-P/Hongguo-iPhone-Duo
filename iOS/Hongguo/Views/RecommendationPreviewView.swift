@@ -99,6 +99,7 @@ struct RecommendationPreviewView: View {
         .clipped().background(Color.black).foregroundStyle(.white)
         .navigationTitle("推薦試看").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
+        .persistentSystemOverlays(model.isImmersivePreview ? .hidden : .automatic)
         .toolbarBackground(isActive && detailSeries == nil ? .hidden : .automatic, for: .tabBar)
         .task(id: activation) {
             guard !Task.isCancelled, activation.revision == model.revision,
@@ -124,11 +125,11 @@ struct RecommendationPreviewView: View {
         .onChange(of: isActive) { _, active in
             tabIsActive = active
             if active { activateSource() }
-            else { cancelResize(); preview.suspend(); playback.dismiss(); clearPendingHandoff(); Task { await preview.saveSession() } }
+            else { model.isImmersivePreview = false; cancelResize(); preview.suspend(); playback.dismiss(); clearPendingHandoff(); Task { await preview.saveSession() } }
             refreshEligibility()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { cancelResize(); preview.suspend(); clearPendingHandoff(); Task { await preview.saveSession() } }
+            if phase != .active { model.isImmersivePreview = false; cancelResize(); preview.suspend(); clearPendingHandoff(); Task { await preview.saveSession() } }
             else if tabIsActive, isVisible { preview.loadInitial() }
             refreshEligibility()
         }
@@ -161,11 +162,11 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onChange(of: detailSeries) { _, detail in
-            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
+            if detail != nil { model.isImmersivePreview = false; cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
             refreshEligibility()
         }
         .onChange(of: showingPreferences) { _, presented in
-            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
+            if presented { model.isImmersivePreview = false; cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
             refreshEligibility()
         }
         .sheet(isPresented: $showingPreferences) {
@@ -205,12 +206,25 @@ struct RecommendationPreviewView: View {
         }
     }
 
+    private var canReanchorFeed: Bool {
+        tabIsActive && isVisible && scenePhase == .active && detailSeries == nil
+            && !showingPreferences && playback.route == nil
+    }
+
     private func resizeAwareFeed(size: CGSize) -> some View {
         ScrollViewReader { proxy in
             feedContents(size: size)
                 .onAppear { viewportSize = size; viewportHeight = max(size.height, 1) }
                 .onChange(of: size) { _, newSize in
                     reanchorAfterResize(size: newSize, proxy: proxy)
+                }
+                .onChange(of: canReanchorFeed) { _, canAnchor in
+                    // Covers, sheets and backgrounding can change the Duo viewport
+                    // while the feed is suspended. Restore the original card when
+                    // it becomes visible again, even without another size change.
+                    if canAnchor, let currentID = preview.current?.id, !resizeFrameAligned(currentID) {
+                        reanchorAfterResize(size: size, proxy: proxy, preferredTarget: preview.current?.id)
+                    }
                 }
         }
     }
@@ -345,7 +359,9 @@ struct RecommendationPreviewView: View {
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
                     recommendationReason: recommendationReason(for: series.id),
                     discoverySourceLabel: preview.sourceLabelByID[series.id],
-                    bottomControlInset: bottomControlInset,
+                    bottomControlInset: model.isImmersivePreview ? 0 : bottomControlInset,
+                    isExpanded: model.isImmersivePreview,
+                    onToggleExpanded: { model.isImmersivePreview.toggle() },
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { hide(series) },
                     onViewDetails: { openEntireSeries(media.series) },
@@ -468,6 +484,7 @@ struct RecommendationPreviewView: View {
     }
 
     private func resetFeed() {
+        model.isImmersivePreview = false
         cancelResize(); lastSettledID = nil
         previewResumeSnapshot = nil
         playback.dismiss()
@@ -522,7 +539,9 @@ struct RecommendationPreviewView: View {
         }
         #endif
         if commandHasArrived, resizeTargetID == nil { pendingScrollTarget = nil }
-        if resizeTargetID == nil, commandHasArrived, phaseIsIdle, tabIsActive, isVisible, let aligned,
+        if resizeTargetID == nil, commandHasArrived, phaseIsIdle, tabIsActive, isVisible, sourceMatches,
+           playback.route == nil, playback.pendingChoice == nil, playback.preparingSeriesID == nil,
+           detailSeries == nil, !showingPreferences, let aligned,
            resizeFrameAligned(aligned) {
             lastSettledID = aligned
         }
@@ -585,12 +604,11 @@ struct RecommendationPreviewView: View {
         }
     }
 
-    private func reanchorAfterResize(size: CGSize, proxy: ScrollViewProxy) {
+    private func reanchorAfterResize(size: CGSize, proxy: ScrollViewProxy, preferredTarget: String? = nil) {
         viewportSize = size; viewportHeight = max(size.height, 1)
         let ids = Set(preview.items.map(\.id))
-        guard tabIsActive, isVisible, scenePhase == .active, detailSeries == nil, !showingPreferences,
-              playback.route == nil,
-              let target = [resizeTargetID, lastSettledID, preview.current?.id, scrollID].compactMap({ $0 }).first(where: ids.contains) else {
+        guard canReanchorFeed,
+              let target = [preferredTarget, resizeTargetID, lastSettledID, preview.current?.id, scrollID].compactMap({ $0 }).first(where: ids.contains) else {
             refreshEligibility(); return
         }
         resizeTask?.cancel(); fallbackSettle?.cancel(); fallbackSettle = nil
@@ -670,6 +688,7 @@ struct RecommendationPreviewView: View {
         guard playbackContext.permitsStart, alignedID == series.id, phaseIsIdle,
               snapshot.seriesID == series.id, playback.route == nil,
               playback.preparingSeriesID == nil, playback.pendingChoice == nil else { handoff?.dispose(); return }
+        model.isImmersivePreview = false
         pendingHandoff?.dispose()
         let app = model
         handoff?.bindCurrentContext {
@@ -859,7 +878,7 @@ struct RecommendationPreferencesView: View {
                 .disabled(model.topicPreferencesLoading || model.topicPreferences.isEmpty)
         } header: { Text("多看／少看題材") }
           footer: {
-            Text("最多 32 個題材，只調整後續新增候選的本機排序，不直接隱藏作品；不感興趣仍只排除該部劇。偏好依片庫、來源及內容類型分開保存，不上傳官方帳號。")
+            Text("最多可設定 32 個題材，套用於接下來的推薦；目前這部劇會留在原位。想隱藏單部作品，請選「不感興趣」。偏好依片庫、來源及內容類型分開保存，不會上傳官方帳號。")
         }
     }
 }

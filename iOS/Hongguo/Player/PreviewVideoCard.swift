@@ -27,6 +27,8 @@ struct RecommendationPreviewMediaCard: View {
     var recommendationReason: String? = nil
     var discoverySourceLabel: String? = nil
     var bottomControlInset: CGFloat = 0
+    var isExpanded = false
+    var onToggleExpanded: (() -> Void)? = nil
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
     var onViewDetails: (() -> Void)? = nil
@@ -44,6 +46,7 @@ struct RecommendationPreviewMediaCard: View {
                             recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
                             discoverySourceLabel: discoverySourceLabel,
                             bottomControlInset: bottomControlInset,
+                            isExpanded: isExpanded, onToggleExpanded: onToggleExpanded,
                             onShowPreferences: onShowPreferences,
                             onNotInterested: onNotInterested, onViewDetails: onViewDetails, onOpenSeries: onOpenSeries)
             .id(Identity(seriesID: series.id, episodeID: episode.id))
@@ -78,6 +81,8 @@ private struct PreviewVideoContent: View {
     let recommendationReason: String?
     let discoverySourceLabel: String?
     let bottomControlInset: CGFloat
+    let isExpanded: Bool
+    let onToggleExpanded: (() -> Void)?
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
     let onViewDetails: (() -> Void)?
@@ -95,6 +100,8 @@ private struct PreviewVideoContent: View {
     @State private var watchQualification = PreviewWatchQualification()
     @State private var qualificationTask: Task<Void, Never>?
     @State private var handoffFrame: PlaybackTransitionFrame?
+    @State private var zoom = PreviewZoomState()
+    @State private var fillsScreen = true
 
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, resumeSeconds: Double, handoffContext: PlaybackHandoffEligibility.Context?,
@@ -104,7 +111,7 @@ private struct PreviewVideoContent: View {
          onToggleFavorite: (() -> Void)?, onPlaybackStarted: (() -> Void)?, onPreviewQualified: (() -> Void)?,
          onPositionSnapshot: @escaping (PreviewPlaybackSnapshot) -> Void,
          recommendationTitle: String?, recommendationReason: String?, discoverySourceLabel: String?,
-         bottomControlInset: CGFloat,
+         bottomControlInset: CGFloat, isExpanded: Bool, onToggleExpanded: (() -> Void)?,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
          onOpenSeries: @escaping (PreviewPlaybackSnapshot, PlaybackTransitionFrame?, PreviewPlaybackHandoff?) -> Void) {
         self.isActive = isActive
@@ -124,6 +131,9 @@ private struct PreviewVideoContent: View {
         self.recommendationReason = recommendationReason
         self.discoverySourceLabel = discoverySourceLabel
         self.bottomControlInset = bottomControlInset
+        self.isExpanded = isExpanded
+        self.onToggleExpanded = onToggleExpanded
+        _controlsVisible = State(initialValue: !isExpanded || UIAccessibility.isVoiceOverRunning)
         self.onShowPreferences = onShowPreferences
         self.onNotInterested = onNotInterested
         self.onViewDetails = onViewDetails
@@ -141,20 +151,24 @@ private struct PreviewVideoContent: View {
                 ZStack {
                     Poster(series: model.series, contentMode: .fill)
                         .allowsHitTesting(false).accessibilityHidden(true)
-                    NativePlayerSurface(player: model.player, fillsScreen: true, onReadyForDisplayChange: { ready in
+                    NativePlayerSurface(player: model.player, fillsScreen: fillsScreen, onReadyForDisplayChange: { ready in
                         if ready { model.recordFirstFrame() }
                         firstFrameReady = ready
                         if ready { reportPositionSnapshot() }
                         updatePreviewQualification()
                     })
+                        .frame(width: region.width, height: region.height)
+                        .scaleEffect(CGFloat(zoom.scale))
                         .opacity(firstFrameReady && model.player.currentItem != nil && !model.isLoading && model.errorMessage == nil ? 1 : 0)
                     if let handoffFrame {
-                        Image(uiImage: handoffFrame.image).resizable().scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+                        Image(uiImage: handoffFrame.image).resizable()
+                            .aspectRatio(contentMode: fillsScreen ? .fill : .fit)
+                            .frame(width: region.width, height: region.height)
+                            .scaleEffect(CGFloat(zoom.scale))
                             .allowsHitTesting(false).accessibilityHidden(true)
                     }
                     touchSurface
-                    if isActive, controlsVisible || !model.canPausePlayback {
+                    if isActive, controlsVisible || (!isExpanded && !model.canPausePlayback) {
                         centerControl
                     }
                     status.accessibilityHidden(!isActive)
@@ -162,16 +176,20 @@ private struct PreviewVideoContent: View {
                         HStack {
                             preferenceMenu
                             Spacer(minLength: 0)
-                            speedMenu.accessibilityHidden(!isActive)
+                            HStack(spacing: 8) {
+                                speedMenu.accessibilityHidden(!isActive)
+                                zoomMenu
+                                expandedButton
+                            }
                         }
                         Spacer(minLength: 12)
                         footer
                     }
                     .padding(region.height < 400 ? 12 : 20)
                     .padding(.bottom, max(bottomControlInset, 0))
-                    .opacity(controlsVisible || !isActive ? 1 : 0)
-                    .allowsHitTesting(controlsVisible || !isActive)
-                    .accessibilityHidden(!controlsVisible && isActive)
+                    .opacity(informationVisible ? 1 : 0)
+                    .allowsHitTesting(informationVisible)
+                    .accessibilityHidden(!informationVisible)
                 }
                 .frame(width: region.width, height: region.height)
                 .overlay(alignment: .top) {
@@ -202,12 +220,13 @@ private struct PreviewVideoContent: View {
         }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
         .onChange(of: allowsInteraction) { _, allowed in
+            if !allowed { zoom.cancelPinch() }
             if allowed { clearHandoffFrame(reason: "interaction") }
             else if let handoffFrame { traceTransition("retained_preparing", frame: handoffFrame) }
             updatePreviewQualification()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { clearHandoffFrame(reason: "scene") }
+            if phase != .active { zoom.cancelPinch(); clearHandoffFrame(reason: "scene") }
             synchronizeActivation(); updatePreviewQualification()
         }
         .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
@@ -220,18 +239,26 @@ private struct PreviewVideoContent: View {
         .onChange(of: model.duration) { _, _ in updatePreviewQualification() }
         .onChange(of: model.elapsed) { _, _ in reportPositionSnapshot() }
         .onChange(of: model.errorMessage) { _, _ in revealControls(); updatePreviewQualification() }
-        .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
-        .onDisappear { clearHandoffFrame(reason: "disappear"); deactivate() }
+        .onChange(of: voiceOverEnabled) { _, enabled in
+            if isExpanded, !enabled { hideControls() } else { revealControls() }
+        }
+        .onChange(of: isExpanded) { _, expanded in
+            zoom.cancelPinch()
+            if expanded, !voiceOverEnabled { hideControls() } else { revealControls() }
+        }
+        .onDisappear { zoom.cancelPinch(); clearHandoffFrame(reason: "disappear"); deactivate() }
     }
+
+    private var informationVisible: Bool { controlsVisible || (!isExpanded && !isActive) }
 
     private var touchSurface: some View {
         PreviewGestureSurface(isEnabled: allowsInteraction && isActive && scenePhase == .active,
             onTap: {
-                guard allowsInteraction, isActive, !boostStarted,
+                guard allowsInteraction, isActive, !boostStarted, !zoom.isPinching,
                       Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
                 toggleControlsVisibility()
             }, onHoldBegan: {
-                guard allowsInteraction, isActive, !boostStarted,
+                guard allowsInteraction, isActive, !boostStarted, !zoom.isPinching,
                       scenePhase == .active, !model.isLoading,
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
@@ -243,6 +270,17 @@ private struct PreviewVideoContent: View {
                 if wasBoosting, !cancelled, controlsVisible, isActive, scenePhase == .active {
                     scheduleAutoHide()
                 }
+            }, onPinchBegan: {
+                guard allowsInteraction, isActive, scenePhase == .active else { return }
+                cancelBoost(reveal: false)
+                hideTask?.cancel()
+                zoom.beginPinch()
+            }, onPinchChanged: { magnification in
+                guard allowsInteraction, isActive, scenePhase == .active else { return }
+                zoom.updatePinch(magnification: Double(magnification))
+            }, onPinchEnded: { cancelled in
+                if cancelled { zoom.cancelPinch() } else { zoom.endPinch() }
+                scheduleAutoHide()
             })
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("第 1 集試看影片")
@@ -251,6 +289,10 @@ private struct PreviewVideoContent: View {
             .accessibilityAction(named: Text("顯示播放控制"), revealControls)
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放"), togglePlayback)
             .accessibilityAction(named: Text("追這部"), openSeries)
+            .accessibilityAction(named: Text("放大影片")) { changeZoom { $0.zoomIn() } }
+            .accessibilityAction(named: Text("縮小影片")) { changeZoom { $0.zoomOut() } }
+            .accessibilityAction(named: Text("還原縮放")) { changeZoom { $0.reset() } }
+            .accessibilityAction(named: Text(isExpanded ? "退出滿版" : "進入滿版"), toggleExpanded)
             .accessibilityHidden(!isActive)
     }
 
@@ -289,6 +331,68 @@ private struct PreviewVideoContent: View {
         .accessibilityValue(String(format: "%g 倍速", Double(model.effectiveSpeed)))
         .simultaneousGesture(TapGesture().onEnded { revealControls() })
         .disabled(!isActive), in: Capsule())
+    }
+
+    private var zoomMenu: some View {
+        glass(Menu {
+            Text("縮放 \(zoomPercentage)%")
+            Button { selectFill(false) } label: {
+                Label("完整比例", systemImage: fillsScreen ? "rectangle" : "checkmark")
+            }
+            Button { selectFill(true) } label: {
+                Label("填滿畫面", systemImage: fillsScreen ? "checkmark" : "rectangle.fill")
+            }
+            Divider()
+            Button("放大", systemImage: "plus.magnifyingglass") { changeZoom { $0.zoomIn() } }
+                .disabled(zoom.scale >= PreviewZoomState.maximumScale)
+            Button("縮小", systemImage: "minus.magnifyingglass") { changeZoom { $0.zoomOut() } }
+                .disabled(zoom.scale <= PreviewZoomState.minimumScale)
+            Button("還原縮放", systemImage: "arrow.counterclockwise") { changeZoom { $0.reset() } }
+        } label: {
+            Image(systemName: "magnifyingglass").frame(width: 44, height: 44)
+        }
+        .accessibilityLabel("影片比例與縮放")
+        .accessibilityValue("\(fillsScreen ? "填滿畫面" : "完整比例")，\(zoomPercentage)%")
+        .accessibilityIdentifier("preview.zoom")
+        .simultaneousGesture(TapGesture().onEnded { revealControls() })
+        .disabled(!allowsInteraction || !isActive), in: Circle())
+    }
+
+    @ViewBuilder
+    private var expandedButton: some View {
+        if onToggleExpanded != nil {
+            glass(Button(action: toggleExpanded) {
+                Image(systemName: isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    .frame(width: 44, height: 44)
+            }.buttonStyle(.plain)
+                .accessibilityLabel(isExpanded ? "退出滿版" : "進入滿版")
+                .accessibilityIdentifier("preview.expand")
+                .disabled(!allowsInteraction || !isActive), in: Circle())
+        }
+    }
+
+    private var zoomPercentage: Int { Int((zoom.scale * 100).rounded()) }
+
+    private func changeZoom(_ change: (inout PreviewZoomState) -> Void) {
+        guard allowsInteraction, isActive, scenePhase == .active else { return }
+        cancelBoost(reveal: false)
+        change(&zoom)
+        revealControls()
+    }
+
+    private func selectFill(_ fills: Bool) {
+        guard allowsInteraction, isActive, scenePhase == .active else { return }
+        fillsScreen = fills
+        zoom.reset()
+        revealControls()
+    }
+
+    private func toggleExpanded() {
+        guard allowsInteraction, isActive, scenePhase == .active else { return }
+        zoom.cancelPinch()
+        cancelBoost(reveal: false)
+        if !isExpanded, !voiceOverEnabled { hideControls() }
+        onToggleExpanded?()
     }
 
     private var footer: some View {
@@ -482,7 +586,7 @@ private struct PreviewVideoContent: View {
         model.setSceneActive(true)
         model.start()
         if shouldResume, !model.canPausePlayback { model.togglePlayback() }
-        revealControls()
+        if !isExpanded { revealControls() }
     }
 
     private func pauseRetainingFrame() {
@@ -501,6 +605,7 @@ private struct PreviewVideoContent: View {
     }
 
     private func deactivate() {
+        zoom.cancelPinch()
         if PreviewPlaybackOwner.isOwner(ownerID) { reportPositionSnapshot(allowLeaving: true) }
         reportedPlaybackStarted = false
         stopPreviewQualification()
@@ -583,6 +688,11 @@ private struct PreviewVideoContent: View {
         scheduleAutoHide()
     }
 
+    private func hideControls() {
+        hideTask?.cancel()
+        controlsVisible = false
+    }
+
     private func toggleControlsVisibility() {
         hideTask?.cancel()
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
@@ -593,7 +703,7 @@ private struct PreviewVideoContent: View {
         hideTask?.cancel()
         guard controlsVisible, isActive, scenePhase == .active, model.isPlaying,
               !model.isBuffering, model.errorMessage == nil,
-              !boostStarted, !voiceOverEnabled else { return }
+              !boostStarted, !zoom.isPinching, !voiceOverEnabled else { return }
         hideTask = Task { @MainActor in
             do { try await Task.sleep(for: .seconds(3)) } catch { return }
             guard !Task.isCancelled else { return }
@@ -613,6 +723,7 @@ private struct PreviewVideoContent: View {
 
     private func viewingRegion(_ geometry: GeometryProxy) -> CGRect {
         let bounds = CGRect(origin: .zero, size: geometry.size)
+        if isExpanded { return bounds }
         guard #available(iOS 27.1, *) else { return bounds }
         let obstacles = geometry.reservedRegions(kind: .division).filter(\.isActive)
             + geometry.reservedRegions(kind: .occlusion).filter(\.isActive)
@@ -635,19 +746,30 @@ private struct PreviewGestureSurface: UIViewRepresentable {
     let onTap: () -> Void
     let onHoldBegan: () -> Void
     let onHoldEnded: (_ cancelled: Bool) -> Void
+    let onPinchBegan: () -> Void
+    let onPinchChanged: (CGFloat) -> Void
+    let onPinchEnded: (_ cancelled: Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
+    func makeUIView(context: Context) -> PreviewTouchSurfaceView {
+        let view = PreviewTouchSurfaceView()
         view.backgroundColor = .clear
         view.isOpaque = false
         view.isAccessibilityElement = false
+        view.isMultipleTouchEnabled = true
+        context.coordinator.view = view
+        view.onMultipleTouchesBegan = { [weak coordinator = context.coordinator] in coordinator?.multipleTouchesBegan() }
+        view.onAllTouchesEnded = { [weak coordinator = context.coordinator] cancelled in coordinator?.allTouchesEnded(cancelled: cancelled) }
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
         let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinched(_:)))
+        tap.numberOfTouchesRequired = 1
+        hold.numberOfTouchesRequired = 1
         hold.minimumPressDuration = 0.35
         hold.allowableMovement = 18
-        for recognizer in [tap, hold] {
+        context.coordinator.holdRecognizer = hold
+        for recognizer in [tap, hold, pinch] {
             recognizer.delegate = context.coordinator
             recognizer.cancelsTouchesInView = false
             recognizer.delaysTouchesBegan = false
@@ -655,26 +777,37 @@ private struct PreviewGestureSurface: UIViewRepresentable {
             view.addGestureRecognizer(recognizer)
         }
         tap.require(toFail: hold)
+        tap.require(toFail: pinch)
         return view
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
+    func updateUIView(_ uiView: PreviewTouchSurfaceView, context: Context) {
         context.coordinator.parent = self
     }
 
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
-        coordinator.finishHold()
+    static func dismantleUIView(_ uiView: PreviewTouchSurfaceView, coordinator: Coordinator) {
+        uiView.onMultipleTouchesBegan = nil; uiView.onAllTouchesEnded = nil
+        coordinator.cancelInteractions()
     }
 
     @MainActor
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: PreviewGestureSurface
+        weak var view: UIView?
+        weak var holdRecognizer: UILongPressGestureRecognizer?
         private var isHolding = false
+        private var isPinching = false
+        private var hasMultipleTouches = false
+        private var lastMultipleTouchEnd: TimeInterval = -.infinity
+        private weak var suspendedPan: UIPanGestureRecognizer?
+        private var originalPanEnabled: Bool?
 
         init(_ parent: PreviewGestureSurface) { self.parent = parent }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            parent.isEnabled
+            guard parent.isEnabled else { return false }
+            if gestureRecognizer is UIPinchGestureRecognizer { return true }
+            return !hasMultipleTouches && !isPinching
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
@@ -683,14 +816,15 @@ private struct PreviewGestureSurface: UIViewRepresentable {
         }
 
         @objc func tapped(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended, parent.isEnabled, !isHolding else { return }
+            guard recognizer.state == .ended, parent.isEnabled, !isHolding, !isPinching, !hasMultipleTouches,
+                  ProcessInfo.processInfo.systemUptime - lastMultipleTouchEnd > 0.25 else { return }
             parent.onTap()
         }
 
         @objc func held(_ recognizer: UILongPressGestureRecognizer) {
             switch recognizer.state {
             case .began:
-                guard parent.isEnabled else { return }
+                guard parent.isEnabled, !hasMultipleTouches, !isPinching else { return }
                 isHolding = true
                 parent.onHoldBegan()
             case .ended:
@@ -706,6 +840,102 @@ private struct PreviewGestureSurface: UIViewRepresentable {
             isHolding = false
             parent.onHoldEnded(cancelled)
         }
+
+        /// Reserve two-finger interaction before movement can start the ancestor pager.
+        func multipleTouchesBegan() {
+            guard parent.isEnabled, !hasMultipleTouches else { return }
+            hasMultipleTouches = true
+            finishHold()
+            holdRecognizer?.isEnabled = false
+            suspendPaging()
+        }
+
+        func allTouchesEnded(cancelled: Bool) {
+            finishPinch(cancelled: cancelled)
+            if hasMultipleTouches { lastMultipleTouchEnd = ProcessInfo.processInfo.systemUptime }
+            hasMultipleTouches = false
+            holdRecognizer?.isEnabled = true
+            restorePaging()
+        }
+
+        @objc func pinched(_ recognizer: UIPinchGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                guard parent.isEnabled else { return }
+                multipleTouchesBegan()
+                isPinching = true
+                parent.onPinchBegan()
+                parent.onPinchChanged(recognizer.scale)
+            case .changed:
+                guard isPinching else { return }
+                guard parent.isEnabled else { finishPinch(cancelled: true); return }
+                parent.onPinchChanged(recognizer.scale)
+            case .ended: finishPinch(cancelled: false)
+            case .failed, .cancelled: finishPinch(cancelled: true)
+            default: break
+            }
+        }
+
+        private func finishPinch(cancelled: Bool) {
+            guard isPinching else { return }
+            isPinching = false
+            lastMultipleTouchEnd = ProcessInfo.processInfo.systemUptime
+            parent.onPinchEnded(cancelled)
+            restorePaging()
+        }
+
+        func cancelInteractions() {
+            finishHold()
+            finishPinch(cancelled: true)
+            hasMultipleTouches = false
+            holdRecognizer?.isEnabled = true
+            restorePaging()
+        }
+
+        private func suspendPaging() {
+            guard originalPanEnabled == nil else { return }
+            var ancestor = view?.superview
+            while let candidate = ancestor {
+                if let scroll = candidate as? UIScrollView {
+                    let pan = scroll.panGestureRecognizer
+                    suspendedPan = pan; originalPanEnabled = pan.isEnabled
+                    if pan.isEnabled { pan.isEnabled = false }
+                    return
+                }
+                ancestor = candidate.superview
+            }
+        }
+
+        private func restorePaging() {
+            if let originalPanEnabled { suspendedPan?.isEnabled = originalPanEnabled }
+            suspendedPan = nil; originalPanEnabled = nil
+        }
+    }
+}
+
+/// Touch counting covers a stationary second finger before a pinch is recognized.
+@MainActor
+private final class PreviewTouchSurfaceView: UIView {
+    var onMultipleTouchesBegan: (() -> Void)?
+    var onAllTouchesEnded: ((_ cancelled: Bool) -> Void)?
+    private var touchesInView: Set<ObjectIdentifier> = []
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        touchesInView.formUnion(touches.map { ObjectIdentifier($0) })
+        if touchesInView.count > 1 { onMultipleTouchesBegan?() }
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        touchesInView.subtract(touches.map { ObjectIdentifier($0) })
+        if touchesInView.isEmpty { onAllTouchesEnded?(false) }
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        touchesInView.subtract(touches.map { ObjectIdentifier($0) })
+        if touchesInView.isEmpty { onAllTouchesEnded?(true) }
+        super.touchesCancelled(touches, with: event)
     }
 }
 

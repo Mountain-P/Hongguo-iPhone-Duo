@@ -32,6 +32,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var topicPreferencesError: String?
     @Published private(set) var topicPreferenceContextID = UUID()
     @Published var isImmersivePlayback = false
+    @Published var isImmersivePreview = false
     private let defaults = UserDefaults.standard
     private let library = AccountLibraryController()
     private var libraryObservation: AnyCancellable?

@@ -13,7 +13,7 @@ struct RootView: View {
         case home = "首頁", preview = "試看", theater = "劇場", library = "我的"
     }
 
-    private var tabBarVisibility: Visibility { model.isImmersivePlayback ? .hidden : .visible }
+    private var tabBarVisibility: Visibility { (model.isImmersivePlayback || model.isImmersivePreview) ? .hidden : .visible }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -30,7 +30,7 @@ struct RootView: View {
                 GeometryReader { safeGeometry in
                     RecommendationPreviewView(isActive: selectedTab == .preview,
                         bottomControlInset: safeGeometry.safeAreaInsets.bottom)
-                        .ignoresSafeArea(.container, edges: .bottom)
+                        .ignoresSafeArea(.container, edges: model.isImmersivePreview ? .all : .bottom)
                         .toolbar(tabBarVisibility, for: .tabBar)
                 }
             }
@@ -58,8 +58,9 @@ struct RootView: View {
         }
         .toolbar(tabBarVisibility, for: .tabBar)
         .background(Theme.background)
-        .statusBarHidden(model.isImmersivePlayback)
+        .statusBarHidden(model.isImmersivePlayback || model.isImmersivePreview)
         .onChange(of: selectedTab) { _, _ in
+            model.isImmersivePreview = false
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
         .task { _ = PlaybackDiagnostics.shared; model.resumeAccount() }
