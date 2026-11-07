@@ -36,7 +36,7 @@ struct PlayerScreen: View {
     @State private var lastHoverRevealAt = Date.distantPast
     @State private var lastHoverLocation: CGPoint?
     @State private var transitionFrame: PlaybackTransitionFrame?
-    @State private var surfaceReady = false
+    @State private var surfaceReadyItem: UUID?
     @State private var swipe: EpisodeSwipeState?
     @GestureState private var episodeDragging = false
 
@@ -44,7 +44,9 @@ struct PlayerScreen: View {
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
          onClose: (() -> Void)? = nil, onSeriesSwipe: ((Int) -> Void)? = nil,
          isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil,
-         transitionFrame: PlaybackTransitionFrame? = nil, onTransitionFrameConsumed: ((UUID) -> Void)? = nil) {
+         transitionFrame: PlaybackTransitionFrame? = nil, onTransitionFrameConsumed: ((UUID) -> Void)? = nil,
+         handoff: PreviewPlaybackHandoff? = nil, handoffContext: PlaybackHandoffEligibility.Context? = nil,
+         sceneActive: Bool = true) {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
         self.isPreview = isPreview
@@ -52,9 +54,24 @@ struct PlayerScreen: View {
         self.onTransitionFrameConsumed = onTransitionFrameConsumed
         _transitionFrame = State(initialValue: transitionFrame?.matches(seriesID: series.id,
             episodeID: initialEpisodeID, seconds: resumeSeconds) == true ? transitionFrame : nil)
-        _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: episodes,
+        _model = StateObject(wrappedValue: Self.makeModel(series: series, episodes: episodes,
             initialEpisodeID: initialEpisodeID, resumeSeconds: resumeSeconds, service: service,
-            onProgress: onProgress, isPreview: isPreview))
+            onProgress: onProgress, isPreview: isPreview, handoff: handoff,
+            context: handoffContext, sceneActive: sceneActive))
+    }
+
+    private static func makeModel(series: Series, episodes: [Episode], initialEpisodeID: String,
+                                  resumeSeconds: Double, service: any CatalogService,
+                                  onProgress: @escaping (Episode, Double, Double) -> Void, isPreview: Bool,
+                                  handoff: PreviewPlaybackHandoff?, context: PlaybackHandoffEligibility.Context?,
+                                  sceneActive: Bool) -> PlayerModel {
+        if !isPreview, let handoff, let context,
+           let reused = handoff.claim(detail: .init(series: series, episodes: episodes),
+               episodeID: initialEpisodeID, seconds: resumeSeconds, service: service,
+               context: context, sceneActive: sceneActive, onProgress: onProgress) { return reused }
+        handoff?.dispose()
+        return PlayerModel(series: series, episodes: episodes, initialEpisodeID: initialEpisodeID,
+            resumeSeconds: resumeSeconds, service: service, onProgress: onProgress, isPreview: isPreview)
     }
 
     var body: some View {
@@ -68,15 +85,15 @@ struct PlayerScreen: View {
                         Color.black
                         NativePlayerSurface(player: model.player, fillsScreen: fillsScreen,
                             onReadyForDisplayChange: { ready in
-                                surfaceReady = ready
+                                surfaceReadyItem = ready ? model.playbackItemIdentity : nil
                                 if ready { model.recordFirstFrame() }
                                 finishTransitionIfReady()
                             })
                             .frame(width: region.width, height: region.height)
                             .clipped()
                             .position(x: region.midX, y: region.midY)
-                        if let transitionFrame {
-                            Image(uiImage: transitionFrame.image).resizable()
+                        if let displayFrame = transitionFrame ?? model.episodeTransitionFrame {
+                            Image(uiImage: displayFrame.image).resizable()
                                 .aspectRatio(contentMode: fillsScreen ? .fill : .fit)
                                 .frame(width: region.width, height: region.height).clipped()
                                 .position(x: region.midX, y: region.midY)
@@ -175,7 +192,7 @@ struct PlayerScreen: View {
             if !canPause { Task { await appModel.flushLibrary() } }
         }
         .onChange(of: model.isLoading) { _, loading in
-            if loading { cancelBoostGesture(); cancelEpisodeSwipe(); surfaceReady = false }
+            if loading { cancelBoostGesture(); cancelEpisodeSwipe(); surfaceReadyItem = nil }
             finishTransitionIfReady()
             scheduleAutoHide()
         }
@@ -492,7 +509,16 @@ struct PlayerScreen: View {
     }
 
     private func finishTransitionIfReady() {
-        guard transitionFrame != nil, surfaceReady, model.isInitialSeekComplete else { return }
+        guard surfaceReadyItem == model.playbackItemIdentity, model.isInitialSeekComplete else { return }
+        if model.episodeTransitionFrame != nil {
+            model.finishVisualTransition()
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {
+                NSLog("EpisodeTransition ready=1 released=1")
+            }
+            #endif
+        }
+        guard transitionFrame != nil else { return }
         // Native surface readiness and the completed initial seek must both belong to this route.
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {

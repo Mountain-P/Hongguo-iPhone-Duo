@@ -256,6 +256,9 @@ struct HomeFeedView: View {
         guard reasonScope == model.recommendationScope, let reason = recommendationReasons[series.id] else { return nil }
         // A removed favorite must stop being presented as current evidence.
         switch reason.kind {
+        case .topicPreference:
+            guard category == model.recommendationPreferences.category,
+                  model.topicPreferences.preference(for: reason.tag) == .more else { return nil }
         case .favorite:
             guard model.favorites.contains(where: { $0.id == reason.sourceSeriesID }) else { return nil }
         case .recentlyWatched:
@@ -268,7 +271,7 @@ struct HomeFeedView: View {
         guard !Task.isCancelled else { return }
         let key = loadKey
         let scope = model.recommendationScope
-        var profile = model.recommendationProfile
+        var profile = model.recommendationProfile(for: key.category)
         let previousIDs = reset ? Set<String>() : Set(catalogue.items.map(\.id))
         if reset { recommendationReasons = [:]; reasonScope = scope }
         do {
@@ -279,8 +282,9 @@ struct HomeFeedView: View {
                 // Initial library loading can finish while the catalogue is on
                 // the network. Use that current snapshot before publishing the
                 // new cards, without moving any existing cards later.
-                profile = model.recommendationProfile
-                return PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
+                profile = model.recommendationProfile(for: key.category)
+                return PersonalizedRecommendation.rank($0, using: profile, scope: scope,
+                    recentSeries: reset ? [] : Array(catalogue.items.suffix(2))).map(\.series)
             })
             if !Task.isCancelled, key == loadKey {
                 lastLoadKey = key

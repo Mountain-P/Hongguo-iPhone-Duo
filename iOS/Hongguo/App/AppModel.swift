@@ -27,10 +27,27 @@ final class AppModel: ObservableObject {
     @Published var searchHistory: [String]
     @Published private(set) var recommendationPreferences: RecommendationPreferences
     @Published private(set) var recommendationFilterRevision = UUID()
+    @Published private(set) var topicPreferences = RecommendationTopicPreferences()
+    @Published private(set) var topicPreferencesLoading = false
+    @Published private(set) var topicPreferencesError: String?
+    @Published private(set) var topicPreferenceContextID = UUID()
     @Published var isImmersivePlayback = false
     private let defaults = UserDefaults.standard
     private let library = AccountLibraryController()
     private var libraryObservation: AnyCancellable?
+    private var topicOwnerObservation: AnyCancellable?
+    private let topicStore = RecommendationTopicPreferencesStore.shared
+    private var topicLoadTask: Task<Void, Never>?
+    private var topicSaveTail: Task<Void, Never>?
+    private var topicContext: TopicContext?
+    private var topicMutationID = UUID()
+    private struct TopicContext: Equatable, Sendable {
+        let scope: LibraryScope
+        let category: DirectWebService.Category
+    }
+    private var currentTopicContext: TopicContext {
+        .init(scope: recommendationScope, category: recommendationPreferences.category)
+    }
 
     var favorites: [Series] { library.favorites }
     var history: [WatchRecord] { library.history }
@@ -41,10 +58,15 @@ final class AppModel: ObservableObject {
     }
     /// Capture at a new batch/refresh boundary. No progress tick changes a catalogue revision.
     var recommendationProfile: PersonalizedRecommendationProfile {
-        .init(scope: recommendationScope, favorites: favorites, history: history)
+        recommendationProfile(for: recommendationPreferences.category)
     }
-    func rankRecommendations(_ candidates: [Series]) -> [PersonalizedRecommendationItem] {
-        PersonalizedRecommendation.rank(candidates, using: recommendationProfile, scope: recommendationScope)
+    func recommendationProfile(for category: DirectWebService.Category) -> PersonalizedRecommendationProfile {
+        let target = TopicContext(scope: recommendationScope, category: category)
+        let topics = topicContext == target && !topicPreferencesLoading ? topicPreferences : .init()
+        return .init(scope: recommendationScope, favorites: favorites, history: history, topicPreferences: topics)
+    }
+    func rankRecommendations(_ candidates: [Series], category: DirectWebService.Category? = nil) -> [PersonalizedRecommendationItem] {
+        PersonalizedRecommendation.rank(candidates, using: recommendationProfile(for: category ?? recommendationPreferences.category), scope: recommendationScope)
     }
     var persistenceError: String? {
         get { library.persistenceError }
@@ -82,6 +104,11 @@ final class AppModel: ObservableObject {
             return try? JSONDecoder().decode(RecommendationPreferences.self, from: data)
         } ?? .init()
         libraryObservation = library.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
+        // This publisher supplies the incoming owner before the controller updates its property.
+        // Clear the previous owner's choices synchronously, then load the captured new scope.
+        topicOwnerObservation = library.$selectedOwner.removeDuplicates().sink { [weak self] owner in
+            self?.reloadTopicPreferences(owner: owner)
+        }
         restoreLibrary()
     }
 
@@ -225,9 +252,78 @@ final class AppModel: ObservableObject {
         do {
             let data = try JSONEncoder().encode(preferences)
             defaults.set(data, forKey: "recommendationPreferences.v1")
+            let categoryChanged = recommendationPreferences.category != preferences.category
             recommendationPreferences = preferences
+            if categoryChanged { reloadTopicPreferences() }
             if changesFilter { recommendationFilterRevision = UUID() }
         } catch { persistenceError = "無法保存推薦偏好，原有設定已保留。" }
+    }
+
+    func setTopicPreference(tag: String, preference: RecommendationTopicPreferences.Preference, contextID: UUID? = nil) {
+        guard contextID == nil || contextID == topicPreferenceContextID else { return }
+        guard !topicPreferencesLoading, topicContext == currentTopicContext else {
+            persistenceError = "題材偏好正在載入，請稍後再試。"; return
+        }
+        var next = topicPreferences
+        do {
+            try next.set(tag: tag, preference: preference)
+            commitTopicPreferences(next)
+        } catch { topicPreferencesError = error.localizedDescription; persistenceError = error.localizedDescription }
+    }
+
+    func clearTopicPreferences(contextID: UUID? = nil) {
+        guard contextID == nil || contextID == topicPreferenceContextID else { return }
+        guard !topicPreferencesLoading, topicContext == currentTopicContext else {
+            persistenceError = "題材偏好正在載入，請稍後再試。"; return
+        }
+        commitTopicPreferences(.init())
+    }
+
+    func reloadTopicPreferences() { reloadTopicPreferences(owner: selectedLibraryOwner) }
+
+    private func reloadTopicPreferences(owner: LibraryOwner) {
+        let target = TopicContext(scope: .init(owner: owner, sourceID: recommendationScope.sourceID),
+                                  category: recommendationPreferences.category)
+        guard topicContext != target || (topicPreferencesError != nil && topicLoadTask == nil) else { return }
+        topicLoadTask?.cancel()
+        topicPreferenceContextID = UUID(); topicMutationID = UUID()
+        let contextID = topicPreferenceContextID
+        topicContext = target; topicPreferences = .init(); topicPreferencesLoading = true; topicPreferencesError = nil
+        let pendingSave = topicSaveTail, store = topicStore
+        topicLoadTask = Task { @MainActor [weak self] in
+            // Accepted old-scope writes retain their captured destination. A quick return
+            // waits for them, so an earlier disk snapshot cannot replace the user's choice.
+            await pendingSave?.value
+            do {
+                try Task.checkCancellation()
+                let value = try await store.load(scope: target.scope, category: target.category)
+                try Task.checkCancellation()
+                guard let self, self.topicPreferenceContextID == contextID,
+                      self.currentTopicContext == target else { return }
+                self.topicPreferences = value; self.topicPreferencesLoading = false; self.topicLoadTask = nil
+            } catch is CancellationError { return }
+            catch {
+                guard let self, self.topicPreferenceContextID == contextID, self.currentTopicContext == target else { return }
+                self.topicPreferencesLoading = false; self.topicLoadTask = nil
+                self.topicPreferencesError = "題材偏好暫時無法讀取，可稍後重新開啟此片庫。"
+            }
+        }
+    }
+
+    private func commitTopicPreferences(_ preferences: RecommendationTopicPreferences) {
+        guard let target = topicContext, target == currentTopicContext, preferences != topicPreferences else { return }
+        topicPreferences = preferences; topicPreferencesError = nil
+        let mutation = UUID(); topicMutationID = mutation
+        let previous = topicSaveTail, store = topicStore
+        topicSaveTail = Task { @MainActor [weak self] in
+            await previous?.value
+            do { try await store.save(preferences, scope: target.scope, category: target.category) }
+            catch {
+                guard let self, self.currentTopicContext == target, self.topicMutationID == mutation else { return }
+                self.topicPreferencesError = "題材偏好尚未保存，請重新設定。"
+                self.persistenceError = "無法保存題材偏好，請重新設定。"
+            }
+        }
     }
 
     func rememberSearch(_ query: String) {
@@ -251,6 +347,7 @@ final class AppModel: ObservableObject {
 
     private func restoreLibrary() {
         library.selectSource(libraryKey, legacy: defaults.data(forKey: libraryKey), allowsAccount: playbackMode == .native)
+        reloadTopicPreferences()
     }
 }
 

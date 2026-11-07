@@ -64,6 +64,18 @@ struct RecommendationPreviewView: View {
     @State private var detailSeries: Series?
     @State private var showingPreferences = false
     @State private var transitionFrame: PlaybackTransitionFrame?
+    @State private var pendingHandoff: PreviewPlaybackHandoff?
+    @State private var previewPlayerGeneration = UUID()
+    @State private var previewResumeSnapshot: PreviewPlaybackSnapshot?
+
+    private struct PreviewCardIdentity: Hashable {
+        let media: UUID
+        let generation: UUID
+    }
+
+    private var handoffContext: PlaybackHandoffEligibility.Context {
+        .init(scope: model.recommendationScope, revision: model.revision, quality: model.nativePlaybackQuality)
+    }
 
     private struct Activation: Hashable {
         let revision: UUID
@@ -112,11 +124,11 @@ struct RecommendationPreviewView: View {
         .onChange(of: isActive) { _, active in
             tabIsActive = active
             if active { activateSource() }
-            else { cancelResize(); preview.suspend(); playback.dismiss(); transitionFrame = nil; Task { await preview.saveSession() } }
+            else { cancelResize(); preview.suspend(); playback.dismiss(); clearPendingHandoff(); Task { await preview.saveSession() } }
             refreshEligibility()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { cancelResize(); preview.suspend(); transitionFrame = nil; Task { await preview.saveSession() } }
+            if phase != .active { cancelResize(); preview.suspend(); clearPendingHandoff(); Task { await preview.saveSession() } }
             else if tabIsActive, isVisible { preview.loadInitial() }
             refreshEligibility()
         }
@@ -145,15 +157,15 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onChange(of: scrollID) { _, id in
-            if let failed = playback.failedSeriesID, id != failed { playback.cancelPending(); transitionFrame = nil }
+            if let failed = playback.failedSeriesID, id != failed { playback.cancelPending(); clearPendingHandoff() }
             refreshEligibility()
         }
         .onChange(of: detailSeries) { _, detail in
-            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); transitionFrame = nil }
+            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
             refreshEligibility()
         }
         .onChange(of: showingPreferences) { _, presented in
-            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); transitionFrame = nil }
+            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); clearPendingHandoff() }
             refreshEligibility()
         }
         .sheet(isPresented: $showingPreferences) {
@@ -165,13 +177,16 @@ struct RecommendationPreviewView: View {
         .onChange(of: playback.route?.id) { _, routeID in
             if routeID != nil {
                 cancelResize(); requiresManualResume = true; preview.suspend()
+                // The transferred model now belongs to the formal screen. Returning
+                // to preview gets a separate first-episode session and no formal handler.
+                previewPlayerGeneration = UUID()
                 if let frame = transitionFrame, let route = playback.route,
                    !frame.matches(seriesID: route.detail.series.id,
                        episodeID: route.continuation.episode.id, seconds: route.continuation.seconds) {
-                    transitionFrame = nil
+                    clearPendingHandoff()
                 }
             }
-            else if playback.preparingSeriesID == nil && playback.pendingChoice == nil { transitionFrame = nil }
+            else if playback.preparingSeriesID == nil && playback.pendingChoice == nil { clearPendingHandoff() }
             refreshEligibility()
         }
         .onChange(of: playback.preparingSeriesID) { _, _ in discardFinishedTransition() }
@@ -180,8 +195,8 @@ struct RecommendationPreviewView: View {
         .overlay(alignment: .bottom) { followingError }
         .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset, transitionFrame: transitionFrame,
             onTransitionFrameConsumed: { id in
-                if transitionFrame?.id == id { transitionFrame = nil }
-            })
+                if transitionFrame?.id == id { clearPendingHandoff() }
+            }, handoff: pendingHandoff, handoffContext: handoffContext)
     }
 
     private var feedViewport: some View {
@@ -299,12 +314,18 @@ struct RecommendationPreviewView: View {
             && scenePhase == .active && detailSeries == nil && !showingPreferences && phaseIsIdle
             && playback.preparingSeriesID == nil && playback.pendingChoice == nil && playback.route == nil
         let sessionContextID = preview.sessionContextID
+        let topicContextID = model.topicPreferenceContextID
         return ZStack {
             Poster(series: series, contentMode: .fill).allowsHitTesting(false)
             if let media = preview.media[series.id] {
                 RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
                     isActive: !resizing && preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
-                    resumeSeconds: media.resumeSeconds,
+                    resumeSeconds: previewResumeSeconds(for: media),
+                    handoffContext: handoffContext, topicPreferences: model.topicPreferences,
+                    topicPreferencesLoading: model.topicPreferencesLoading,
+                    onTopicPreference: { tag, preference in
+                        model.setTopicPreference(tag: tag, preference: preference, contextID: topicContextID)
+                    },
                     retainsFrame: canRetainFrame, allowsInteraction: allowsInteraction,
                     isFavorite: model.isFavorite(series),
                     onToggleFavorite: { model.toggleFavorite(media.series) },
@@ -328,8 +349,10 @@ struct RecommendationPreviewView: View {
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { hide(series) },
                     onViewDetails: { openEntireSeries(media.series) },
-                    onOpenSeries: { snapshot, frame in startFollowing(media.series, snapshot: snapshot, frame: frame) })
-                    .id(media.id)
+                    onOpenSeries: { snapshot, frame, handoff in
+                        startFollowing(media.series, snapshot: snapshot, frame: frame, handoff: handoff)
+                    })
+                    .id(PreviewCardIdentity(media: media.id, generation: previewPlayerGeneration))
             } else {
                 posterInformation(series)
             }
@@ -446,8 +469,9 @@ struct RecommendationPreviewView: View {
 
     private func resetFeed() {
         cancelResize(); lastSettledID = nil
+        previewResumeSnapshot = nil
         playback.dismiss()
-        transitionFrame = nil
+        clearPendingHandoff()
         fallbackSettle?.cancel(); fallbackSettle = nil
         scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil
         requiresManualResume = showingPreferences
@@ -641,10 +665,19 @@ struct RecommendationPreviewView: View {
         detailSeries = series
     }
 
-    private func startFollowing(_ series: Series, snapshot: PreviewPlaybackSnapshot, frame: PlaybackTransitionFrame?) {
+    private func startFollowing(_ series: Series, snapshot: PreviewPlaybackSnapshot, frame: PlaybackTransitionFrame?,
+                                handoff: PreviewPlaybackHandoff?) {
         guard playbackContext.permitsStart, alignedID == series.id, phaseIsIdle,
               snapshot.seriesID == series.id, playback.route == nil,
-              playback.preparingSeriesID == nil, playback.pendingChoice == nil else { return }
+              playback.preparingSeriesID == nil, playback.pendingChoice == nil else { handoff?.dispose(); return }
+        pendingHandoff?.dispose()
+        let app = model
+        handoff?.bindCurrentContext {
+            guard UIApplication.shared.applicationState == .active else { return nil }
+            return .init(scope: app.recommendationScope, revision: app.revision, quality: app.nativePlaybackQuality)
+        }
+        pendingHandoff = handoff
+        previewResumeSnapshot = snapshot
         transitionFrame = frame
         requiresManualResume = true; preview.suspend()
         Task { await preview.saveSession() }
@@ -653,12 +686,25 @@ struct RecommendationPreviewView: View {
                 service: try model.playbackService(), currentContext: { playbackContext },
                 latestRecord: { model.record(for: series) },
                 progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
-        } catch { transitionFrame = nil; playback.fail(error, seriesID: series.id) }
+        } catch { clearPendingHandoff(); playback.fail(error, seriesID: series.id) }
+    }
+
+    private func previewResumeSeconds(for media: RecommendationFeedMedia) -> Double {
+        guard let snapshot = previewResumeSnapshot, snapshot.seriesID == media.series.id,
+              snapshot.episodeID == media.episode.id, snapshot.position.isFinite, snapshot.position >= 0 else {
+            return media.resumeSeconds
+        }
+        return snapshot.position
+    }
+
+    private func clearPendingHandoff() {
+        transitionFrame = nil
+        pendingHandoff?.dispose(); pendingHandoff = nil
     }
 
     private func discardFinishedTransition() {
         if playback.preparingSeriesID == nil, playback.pendingChoice == nil, playback.route == nil {
-            transitionFrame = nil
+            clearPendingHandoff()
         }
     }
 
@@ -742,7 +788,8 @@ struct RecommendationPreferencesView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        Form {
+        let topicContextID = model.topicPreferenceContextID
+        return Form {
             Section("想看的類型") {
                 Picker("內容類型", selection: Binding(get: { model.recommendationPreferences.category },
                     set: { model.setRecommendationCategory($0) })) {
@@ -756,6 +803,7 @@ struct RecommendationPreferencesView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            topicSection(contextID: topicContextID)
             Section {
                 Toggle("略過已試看的劇", isOn: Binding(get: { model.recommendationPreferences.skipsPreviewed },
                     set: { model.setSkipsPreviewed($0) }))
@@ -777,5 +825,41 @@ struct RecommendationPreferencesView: View {
         }
         .navigationTitle("推薦偏好").navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+    }
+
+    private func topicSection(contextID: UUID) -> some View {
+        Section {
+            Text(model.showingAccountLibrary ? "目前帳號片庫的題材偏好" : "目前本機片庫的題材偏好")
+                .font(.caption).foregroundStyle(.secondary)
+            if model.topicPreferencesLoading {
+                ProgressView("正在載入題材偏好…")
+            } else if model.topicPreferences.entries.isEmpty {
+                Text("尚未設定。可從試看卡片的題材選單選擇多看或少看。")
+                    .font(.subheadline).foregroundStyle(.secondary)
+            }
+            ForEach(model.topicPreferences.entries) { entry in
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.title)
+                        Text(entry.preference == .more ? "多推薦這類" : "少推薦這類")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("恢復") {
+                        model.setTopicPreference(tag: entry.title, preference: .neutral, contextID: contextID)
+                    }
+                    .frame(minHeight: 44).disabled(model.topicPreferencesLoading)
+                    .accessibilityLabel("恢復\(entry.title)的一般推薦")
+                }
+            }
+            if let error = model.topicPreferencesError {
+                Text(error).font(.footnote).foregroundStyle(.secondary)
+            }
+            Button("全部恢復一般推薦") { model.clearTopicPreferences(contextID: contextID) }
+                .disabled(model.topicPreferencesLoading || model.topicPreferences.isEmpty)
+        } header: { Text("多看／少看題材") }
+          footer: {
+            Text("最多 32 個題材，只調整後續新增候選的本機排序，不直接隱藏作品；不感興趣仍只排除該部劇。偏好依片庫、來源及內容類型分開保存，不上傳官方帳號。")
+        }
     }
 }

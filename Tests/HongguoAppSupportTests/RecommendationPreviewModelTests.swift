@@ -499,6 +499,110 @@ struct RecommendationPreviewModelTests {
         #expect(model.current?.id == "20" && model.queue.page == 1)
     }
 
+    @Test func aNewPageContinuesTopicDiversityWithoutMovingThePlayingCard() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        try await loadTopicPage(1, [topic("5", "甜寵"), topic("10", "懸疑"), topic("20", "懸疑")], model, source, more: true)
+        try await prepare("10", model, source)
+        let lease = try #require(model.lease), mediaID = try #require(model.media["10"]?.id)
+        let originalPrefix = model.items
+        try await loadTopicPage(2, [topic("30", "懸疑"), topic("40", "甜寵")], model, source)
+        #expect(model.items.map(\.id) == ["5", "10", "20", "40", "30"])
+        #expect(Array(model.items.prefix(3)) == originalPrefix)
+        #expect(model.current?.id == "10" && model.lease == lease && model.media["10"]?.id == mediaID)
+    }
+
+    @Test func failedPageRetryDoesNotAdvanceOrChangeTheCommittedDiversityTail() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        try await loadTopicPage(1, [topic("10", "懸疑"), topic("20", "懸疑")], model, source, more: true)
+        model.loadMoreIfNeeded(force: true)
+        try await wait { await source.hasHome(2) }
+        let failed = try #require(model.catalogueTask)
+        await source.failHome(2); await failed.value
+        #expect(model.items.map(\.id) == ["10", "20"] && model.queue.page == 1 && model.pageError != nil)
+        try await loadTopicPage(2, [topic("30", "懸疑"), topic("40", "甜寵")], model, source)
+        #expect(model.items.map(\.id) == ["10", "20", "40", "30"])
+        #expect(await source.homeRequests == [1, 2, 2])
+    }
+
+    @Test func anInFlightPageReadsTheTailAfterExclusionRatherThanTheRequestStart() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        try await loadTopicPage(1, [topic("10", "懸疑"), topic("20", "懸疑")], model, source, more: true)
+        model.loadMoreIfNeeded(force: true)
+        try await wait { await source.hasHome(2) }
+        let pending = try #require(model.catalogueTask)
+        model.excludeNotInterested(try hidden(["20"]))
+        await source.releaseHome(2, items: [topic("30", "懸疑"), topic("40", "甜寵")])
+        await pending.value
+        // Only one suspense card survives. The removed card cannot force romance first.
+        #expect(model.items.map(\.id) == ["10", "30", "40"] && model.current?.id == "10")
+    }
+
+    @Test func replacementScopeRejectsALatePageAndStartsWithoutThePreviousTail() async throws {
+        let source = PreviewCatalogueGate(), replacement = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source); Task { await replacement.finishAll() } }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        try await loadTopicPage(1, [topic("10", "懸疑"), topic("20", "懸疑")], model, source, more: true)
+        model.loadMoreIfNeeded(force: true)
+        try await wait { await source.hasHome(2) }
+        let stale = try #require(model.catalogueTask)
+        let nextScope = LibraryScope(owner: .account(id: "next-owner"), sourceID: "next-source")
+        model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
+                        profile: topicProfile(scope: nextScope), scope: nextScope, catalogue: replacement, playback: replacement)
+        await source.releaseHome(2, items: [topic("50", "甜寵")]); await stale.value
+        #expect(model.items.isEmpty)
+        try await loadTopicPage(1, [topic("30", "懸疑"), topic("40", "甜寵")], model, replacement)
+        #expect(model.items.map(\.id) == ["30", "40"] && model.current?.id == "30")
+    }
+
+    @Test func restoredQueueProvidesTheRealTailWithoutReorderingItsCurrentCard() async throws {
+        let fixture = try PreviewSessionFixture(); defer { fixture.clear() }
+        let saved = [topic("10", "懸疑"), topic("20", "懸疑")]
+        try await fixture.store.save(scope: scope, category: .realDrama, items: saved, currentStableID: "20", snapshot: nil)
+        let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, source) }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        let restore = try #require(model.sessionRestoreTask)
+        await restore.value
+        #expect(model.current?.id == "20" && model.queue.page == 0)
+        try await loadTopicPage(1, [topic("30", "懸疑"), topic("40", "甜寵")], model, source)
+        #expect(model.items.map(\.id) == ["10", "20", "40", "30"] && model.current?.id == "20")
+    }
+
+    @Test func aPendingNewBatchUsesTheLatestExplicitTopicChoiceWithoutReorderingExistingCards() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        model.updateRankingProfile(topicProfile(), scope: scope)
+        try await loadTopicPage(1, [topic("10", "懸疑"), topic("20", "懸疑")], model, source, more: true)
+        model.loadMoreIfNeeded(force: true)
+        try await wait { await source.hasHome(2) }
+        let pending = try #require(model.catalogueTask)
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "甜寵", preference: .less)
+        model.updateRankingProfile(topicProfile(topics: topics), scope: scope)
+        #expect(model.items.map(\.id) == ["10", "20"])
+        await source.releaseHome(2, items: [topic("30", "懸疑"), topic("40", "甜寵")]); await pending.value
+        #expect(model.items.map(\.id) == ["10", "20", "30", "40"] && model.current?.id == "10")
+        #expect(model.reasonByID["40"] == nil)
+    }
+
+    private func topic(_ id: String, _ tag: String) -> Series { .init(id: id, title: "劇\(id)", tags: [tag]) }
+    private func topicProfile(scope: LibraryScope? = nil, topics: RecommendationTopicPreferences = .init()) -> PersonalizedRecommendationProfile {
+        .init(scope: scope ?? self.scope, favorites: [topic("1", "懸疑"), topic("2", "甜寵")], history: [], topicPreferences: topics)
+    }
+    private func loadTopicPage(_ page: Int, _ items: [Series], _ model: RecommendationPreviewModel,
+                               _ source: PreviewCatalogueGate, more: Bool = false) async throws {
+        if page == 1 { model.loadInitial() } else { model.loadMoreIfNeeded(force: true) }
+        try await wait { await source.hasHome(page) }
+        let task = try #require(model.catalogueTask)
+        await source.releaseHome(page, items: items, more: more); await task.value
+    }
+
     private func seedSession(_ store: PreviewSessionStore, scope: LibraryScope, ids: [String], current: String, seconds: Double) async throws {
         try await store.save(scope: scope, category: .realDrama, items: ids.map { .init(id: $0, title: "劇\($0)") },
                              currentStableID: current, snapshot: .init(seriesID: current, episodeID: current + "1", position: seconds, duration: 90))
@@ -593,6 +697,9 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
     func hasPlayback(_ id: String) -> Bool { playbacks[id] != nil }
     func releaseHome(_ page: Int, ids: [String], more: Bool = false) {
         homes.removeValue(forKey: page)?.resume(returning: .init(items: ids.map { .init(id: $0, title: "劇\($0)") }, page: page, hasMore: more))
+    }
+    func releaseHome(_ page: Int, items: [Series], more: Bool = false) {
+        homes.removeValue(forKey: page)?.resume(returning: .init(items: items, page: page, hasMore: more))
     }
     func releaseDetail(_ id: String, episodeID: String? = nil) {
         details.removeValue(forKey: id)?.resume(returning: .init(series: .init(id: id, title: "劇\(id)"),

@@ -218,7 +218,7 @@ final class RecommendationPreviewModel: ObservableObject {
     }
 
     private func loadPage() {
-        guard let catalogue, let profile = rankingProfile, let scope = rankingScope,
+        guard let catalogue, rankingProfile != nil, let scope = rankingScope,
               catalogueTask == nil, queue.hasMore else { return }
         let request = catalogueGeneration
         let previousTail = queue.items.last?.id
@@ -240,9 +240,13 @@ final class RecommendationPreviewModel: ObservableObject {
                     guard self.catalogueGeneration == request else { return }
                     let origins = await (catalogue as? any RecommendationProvenanceProviding)?.provenance(for: result.items.map(\.id)) ?? [:]
                     try Task.checkCancellation()
-                    guard self.catalogueGeneration == request else { return }
+                    guard self.catalogueGeneration == request, self.rankingScope == scope,
+                          let profile = self.rankingProfile else { return }
+                    // Read the committed tail after the response and its provenance were validated.
+                    // In-flight exclusions, restore and ranking changes cannot leave a stale seed.
+                    let recentSeries = Array(self.queue.items.suffix(2))
                     guard try self.queue.receive(result, for: pageRequest, preferences: self.preferences, ranking: {
-                        PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
+                        PersonalizedRecommendation.rank($0, using: profile, scope: scope, recentSeries: recentSeries).map(\.series)
                     }) else { throw CancellationError() }
                     for item in result.items {
                         if let origin = origins[item.id], origin.source != .category {

@@ -1,4 +1,5 @@
 import SwiftUI
+import HongguoCore
 
 @MainActor
 struct ContinuePlaybackButton: View {
@@ -32,6 +33,8 @@ private struct ContinuePlaybackPresentation: ViewModifier {
     var bottomOverlayInset: CGFloat = 0
     var transitionFrame: PlaybackTransitionFrame?
     var onTransitionFrameConsumed: ((UUID) -> Void)?
+    var handoff: PreviewPlaybackHandoff?
+    var handoffContext: PlaybackHandoffEligibility.Context?
 
     func body(content: Content) -> some View {
         content
@@ -60,7 +63,8 @@ private struct ContinuePlaybackPresentation: ViewModifier {
                              service: selection.service, onProgress: selection.onProgress,
                              onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe,
                              transitionFrame: matchingFrame(for: selection),
-                             onTransitionFrameConsumed: onTransitionFrameConsumed)
+                             onTransitionFrameConsumed: onTransitionFrameConsumed,
+                             handoff: handoff, handoffContext: handoffContext, sceneActive: context.sceneActive)
                     .id(selection.id)
             }
     }
@@ -79,9 +83,11 @@ extension View {
                                       onSeriesSwipe: ((Int) -> Void)? = nil,
                                       bottomOverlayInset: CGFloat = 0,
                                       transitionFrame: PlaybackTransitionFrame? = nil,
-                                      onTransitionFrameConsumed: ((UUID) -> Void)? = nil) -> some View {
+                                      onTransitionFrameConsumed: ((UUID) -> Void)? = nil,
+                                      handoff: PreviewPlaybackHandoff? = nil,
+                                      handoffContext: PlaybackHandoffEligibility.Context? = nil) -> some View {
         modifier(ContinuePlaybackPresentation(launcher: launcher, context: context,
             onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset, transitionFrame: transitionFrame,
-            onTransitionFrameConsumed: onTransitionFrameConsumed))
+            onTransitionFrameConsumed: onTransitionFrameConsumed, handoff: handoff, handoffContext: handoffContext))
     }
 }

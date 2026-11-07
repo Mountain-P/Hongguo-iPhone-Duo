@@ -12,6 +12,10 @@ struct RecommendationPreviewMediaCard: View {
     let service: any CatalogService
     let isActive: Bool
     var resumeSeconds: Double = 0
+    var handoffContext: PlaybackHandoffEligibility.Context? = nil
+    var topicPreferences = RecommendationTopicPreferences()
+    var topicPreferencesLoading = false
+    var onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)? = nil
     var retainsFrame: Bool = false
     var allowsInteraction: Bool = true
     var isFavorite: Bool = false
@@ -26,11 +30,13 @@ struct RecommendationPreviewMediaCard: View {
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
     var onViewDetails: (() -> Void)? = nil
-    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void
+    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?, PreviewPlaybackHandoff?) -> Void
 
     var body: some View {
         PreviewVideoContent(series: series, episode: episode, service: service,
-                            isActive: isActive, resumeSeconds: resumeSeconds, retainsFrame: retainsFrame,
+                            isActive: isActive, resumeSeconds: resumeSeconds, handoffContext: handoffContext,
+                            topicPreferences: topicPreferences, topicPreferencesLoading: topicPreferencesLoading,
+                            onTopicPreference: onTopicPreference, retainsFrame: retainsFrame,
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
                             onToggleFavorite: onToggleFavorite, onPlaybackStarted: onPlaybackStarted,
                             onPreviewQualified: onPreviewQualified,
@@ -57,6 +63,10 @@ private struct PreviewVideoContent: View {
     @StateObject private var model: PlayerModel
     private let episodeID: String
     let isActive: Bool
+    let topicPreferences: RecommendationTopicPreferences
+    let topicPreferencesLoading: Bool
+    let onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)?
+    @State private var originContext: PlaybackHandoffEligibility.Context?
     let retainsFrame: Bool
     let allowsInteraction: Bool
     let isFavorite: Bool
@@ -71,7 +81,7 @@ private struct PreviewVideoContent: View {
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
     let onViewDetails: (() -> Void)?
-    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void
+    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?, PreviewPlaybackHandoff?) -> Void
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
     @State private var boostStarted = false
@@ -87,14 +97,21 @@ private struct PreviewVideoContent: View {
     @State private var handoffFrame: PlaybackTransitionFrame?
 
     init(series: Series, episode: Episode, service: any CatalogService,
-         isActive: Bool, resumeSeconds: Double, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
+         isActive: Bool, resumeSeconds: Double, handoffContext: PlaybackHandoffEligibility.Context?,
+         topicPreferences: RecommendationTopicPreferences, topicPreferencesLoading: Bool,
+         onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)?,
+         retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
          onToggleFavorite: (() -> Void)?, onPlaybackStarted: (() -> Void)?, onPreviewQualified: (() -> Void)?,
          onPositionSnapshot: @escaping (PreviewPlaybackSnapshot) -> Void,
          recommendationTitle: String?, recommendationReason: String?, discoverySourceLabel: String?,
          bottomControlInset: CGFloat,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
-         onOpenSeries: @escaping (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void) {
+         onOpenSeries: @escaping (PreviewPlaybackSnapshot, PlaybackTransitionFrame?, PreviewPlaybackHandoff?) -> Void) {
         self.isActive = isActive
+        _originContext = State(initialValue: handoffContext)
+        self.topicPreferences = topicPreferences
+        self.topicPreferencesLoading = topicPreferencesLoading
+        self.onTopicPreference = onTopicPreference
         self.episodeID = episode.id
         self.retainsFrame = retainsFrame
         self.allowsInteraction = allowsInteraction
@@ -339,6 +356,7 @@ private struct PreviewVideoContent: View {
                     Button { guard allowsInteraction else { return }; onShowPreferences() }
                         label: { Label("推薦偏好", systemImage: "slider.horizontal.3") }
                 }
+                topicPreferenceMenu
                 if let onNotInterested {
                     Button { guard allowsInteraction else { return }; onNotInterested() }
                         label: { Label("不感興趣", systemImage: "hand.thumbsdown") }
@@ -418,6 +436,36 @@ private struct PreviewVideoContent: View {
         }
     }
 
+    private var availableTopicTags: [String] {
+        var seen: Set<String> = []
+        return Array(model.series.tags.compactMap { tag in
+            guard let value = RecommendationTopicTag.normalized(tag), seen.insert(value.key).inserted else { return nil }
+            return value.title
+        }.prefix(8))
+    }
+
+    @ViewBuilder
+    private var topicPreferenceMenu: some View {
+        if let onTopicPreference, !availableTopicTags.isEmpty {
+            Menu("多推薦這類", systemImage: "hand.thumbsup") {
+                ForEach(availableTopicTags, id: \.self) { tag in
+                    Button { onTopicPreference(tag, .more) } label: {
+                        if topicPreferences.preference(for: tag) == .more { Label(tag, systemImage: "checkmark") }
+                        else { Text(tag) }
+                    }
+                }
+            }.disabled(topicPreferencesLoading)
+            Menu("少推薦這類", systemImage: "line.3.horizontal.decrease") {
+                ForEach(availableTopicTags, id: \.self) { tag in
+                    Button { onTopicPreference(tag, .less) } label: {
+                        if topicPreferences.preference(for: tag) == .less { Label(tag, systemImage: "checkmark") }
+                        else { Text(tag) }
+                    }
+                }
+            }.disabled(topicPreferencesLoading)
+        }
+    }
+
     private func synchronizeActivation() {
         guard !Task.isCancelled else { return }
         guard scenePhase == .active else { deactivate(); return }
@@ -475,14 +523,23 @@ private struct PreviewVideoContent: View {
 
     private func openSeries() {
         guard allowsInteraction, scenePhase == .active, let episode = model.currentEpisode else { return }
+        cancelBoost(reveal: false)
+        if PreviewPlaybackOwner.isOwner(ownerID) { reportPositionSnapshot(); model.pauseAndSave() }
         let frame = firstFrameReady ? model.captureTransitionFrame() : nil
         handoffFrame = frame
         traceTransition(frame == nil ? "capture_fallback" : "capture_success", frame: frame)
         let position = model.player.currentTime().seconds
         let snapshot = PreviewPlaybackSnapshot(seriesID: model.series.id, episodeID: episode.id,
             position: position.isFinite && position >= 0 ? position : model.elapsed, duration: model.duration)
+        var handoff: PreviewPlaybackHandoff?
+        if PreviewPlaybackOwner.isOwner(ownerID), let originContext {
+            handoff = PreviewPlaybackHandoff(model: model, snapshot: snapshot, context: originContext)
+            if handoff != nil, !PreviewPlaybackOwner.detach(ownerID, model: model) {
+                handoff?.dispose(); handoff = nil
+            }
+        }
         deactivate()
-        onOpenSeries(snapshot, frame)
+        onOpenSeries(snapshot, frame, handoff)
     }
 
     private func reportPositionSnapshot(allowLeaving: Bool = false) {
@@ -665,6 +722,12 @@ private enum PreviewPlaybackOwner {
         model?.stop()
         model = newModel
         ownerID = id
+    }
+
+    static func detach(_ id: UUID, model expected: PlayerModel) -> Bool {
+        guard ownerID == id, model === expected else { return false }
+        ownerID = nil; model = nil
+        return true
     }
 
     static func release(_ id: UUID) {

@@ -9,8 +9,8 @@ import os
 @MainActor
 final class PlayerModel: ObservableObject {
     let player = AVPlayer()
-    let series: Series
-    let episodes: [Episode]
+    @Published private(set) var series: Series
+    @Published private(set) var episodes: [Episode]
 
     @Published private(set) var currentEpisode: Episode?
     @Published private(set) var isLoading = false
@@ -68,7 +68,7 @@ final class PlayerModel: ObservableObject {
     }
 
     func captureTransitionFrame() -> PlaybackTransitionFrame? {
-        guard isPreview, isInitialSeekComplete, let episode = currentEpisode,
+        guard isInitialSeekComplete, !isSeeking, let episode = currentEpisode,
               let item = player.currentItem, let output = transitionVideoOutput,
               item.outputs.contains(where: { $0 === output }) else { return nil }
         let time = player.currentTime(), position = time.seconds
@@ -81,6 +81,38 @@ final class PlayerModel: ObservableObject {
         return PlaybackTransitionFrame.make(pixelBuffer: buffer, seriesID: series.id, episodeID: episode.id,
                                             seconds: seconds, presentationSize: item.presentationSize)
     }
+
+    var playbackItemIdentity: UUID { generation }
+
+    var handoffPlayback: PlaybackHandoffEligibility.Playback? {
+        guard let episode = currentEpisode else { return nil }
+        return .init(seriesID: series.id, episodeID: episode.id, position: player.currentTime().seconds,
+                     duration: duration, itemID: generation, isReady: isInitialSeekComplete, isSeeking: isSeeking)
+    }
+
+    /// The caller has just claimed this preview for a freshly validated formal route.
+    /// Neither the player, item, resource loader nor decoder is replaced here.
+    func promoteToFormalPlayback(detail: SeriesDetail, service: any CatalogService,
+                                 onProgress: @escaping (Episode, Double, Double) -> Void) -> Bool {
+        guard isPreview, isInitialSeekComplete, !isSeeking, detail.series.id == series.id,
+              let current = currentEpisode,
+              let resolved = detail.episodes.first(where: { $0.id == current.id && $0.isAvailable }) else { return false }
+        endSpeedBoost(); unlockSpeedBoost()
+        finishDiagnostics(outcome: .cancelled)
+        self.series = detail.series
+        self.episodes = detail.episodes.sorted { $0.number < $1.number }
+        self.service = service
+        self.onProgress = onProgress
+        self.currentEpisode = resolved
+        isPreview = false
+        autoNext = preferences.load().resolved(isPreview: false).autoNext
+        pendingFormalActivation = true
+        diagnosticsID = PlaybackDiagnostics.shared.begin(context: .episode)
+        if let diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: diagnosticsID) }
+        return true
+    }
+
+    func finishVisualTransition() { episodeTransitionFrame = nil }
 
     func beginSpeedBoost() {
         guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
@@ -126,12 +158,12 @@ final class PlayerModel: ObservableObject {
         player.playImmediately(atRate: effectiveSpeed)
     }
 
-    private let service: any CatalogService
-    private let isPreview: Bool
+    private var service: any CatalogService
+    private var isPreview: Bool
     private let preferences = PlaybackPreferencesStore.shared
     private let initialEpisodeID: String
     private let resumeSeconds: Double
-    private let onProgress: (Episode, Double, Double) -> Void
+    private var onProgress: (Episode, Double, Double) -> Void
     private var loadTask: Task<Void, Never>?
     private var generation = UUID()
     private var loader: AuthenticatedMediaLoader?
@@ -158,6 +190,9 @@ final class PlayerModel: ObservableObject {
     private var seekGeneration = UUID()
     private var diagnosticsID: UUID?
     private var transitionVideoOutput: AVPlayerItemVideoOutput?
+    @Published private(set) var episodeTransitionFrame: PlaybackTransitionFrame?
+    private var isSeeking = false
+    private var pendingFormalActivation = false
     private let nextPrefetcher = NativePlaybackPrefetch()
     private var nextPrefetchState = EpisodePrefetchState()
     private var nextPrefetchTask: Task<Void, Never>?
@@ -180,7 +215,13 @@ final class PlayerModel: ObservableObject {
     }
 
     func start() {
-        guard !didStart else { return }
+        if didStart {
+            if pendingFormalActivation {
+                pendingFormalActivation = false
+                if sceneActive { resumePlayback() }
+            }
+            return
+        }
         didStart = true
         observeAudioEvents()
         do {
@@ -247,12 +288,14 @@ final class PlayerModel: ObservableObject {
         let target = min(max(0, seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
         let requestGeneration = generation
         let seekRequest = UUID(); seekGeneration = seekRequest
+        isSeeking = true
         elapsed = target
         reachedEnd = false
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
-                guard let self, finished, self.generation == requestGeneration, self.seekGeneration == seekRequest,
-                      self.playbackSpeed.wantsPlayback, self.sceneActive,
+                guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
+                self.isSeeking = false
+                guard finished, self.playbackSpeed.wantsPlayback, self.sceneActive,
                       self.player.timeControlStatus == .paused else { return }
                 self.resumePlayback()
             }
@@ -276,11 +319,13 @@ final class PlayerModel: ObservableObject {
             diagnosticsID = PlaybackDiagnostics.shared.begin(context: .replay)
         }
         playbackSpeed.requestPlayback()
+        isSeeking = true
         reachedEnd = false
         elapsed = 0
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
+                self.isSeeking = false
                 guard finished else {
                     if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
                     self.finishDiagnostics(outcome: .failed)
@@ -325,10 +370,12 @@ final class PlayerModel: ObservableObject {
 
     func setSceneActive(_ active: Bool) {
         sceneActive = active
-        if !active { endSpeedBoost(); pauseAndSave() }
+        if !active { episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave() }
     }
 
     func stop() {
+        pendingFormalActivation = false
+        episodeTransitionFrame = nil
         removeAudioObservers()
         audioPolicy = PlaybackInterruptionPolicy()
         cancelNextEpisodePrefetch()
@@ -353,6 +400,15 @@ final class PlayerModel: ObservableObject {
         if !continuingDiagnostics || diagnosticsID == nil {
             finishDiagnostics(outcome: .cancelled)
             diagnosticsID = PlaybackDiagnostics.shared.begin(context: isPreview ? .preview : .episode)
+        }
+        // Capture before clearing the old item, including rapid B -> C while B is loading.
+        if let frame = captureTransitionFrame() {
+            episodeTransitionFrame = frame
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {
+                NSLog("EpisodeTransition captured=1")
+            }
+            #endif
         }
         saveProgress()
         loadTask?.cancel()
@@ -400,7 +456,12 @@ final class PlayerModel: ObservableObject {
             asset = resourceLoader.makeAsset()
         }
         let item = AVPlayerItem(asset: asset)
-        if isPreview {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {
+            NSLog("PlayerPipeline configured preview=%d", isPreview ? 1 : 0)
+        }
+        #endif
+        do {
             let output = AVPlayerItemVideoOutput(outputSettings: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferCGImageCompatibilityKey as String: true,
@@ -617,6 +678,7 @@ final class PlayerModel: ObservableObject {
 
     private func clearItem(autoplay: Bool = false) {
         hasStarted = false
+        isSeeking = false
         preparingGeneration = nil
         isPlaying = false
         isBuffering = false

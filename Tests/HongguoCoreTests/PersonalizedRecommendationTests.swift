@@ -177,6 +177,113 @@ struct PersonalizedRecommendationTests {
         }
     }
 
+    @Test func aNewBatchUsesOnlyTheLastTwoCommittedTopics() {
+        let value = profile(favorites: [series("1", tags: ["懸疑"]), series("2", tags: ["甜寵"])])
+        let next = [series("30", tags: ["懸疑"]), series("40", tags: ["甜寵"])]
+        let tail = [series("5", tags: ["甜寵"]), series("10", tags: ["懸疑"]), series("20", tags: ["悬疑"])]
+        let result = PersonalizedRecommendation.rank(next, using: value, scope: scope, recentSeries: tail)
+        #expect(result.map(\.series.id) == ["40", "30"])
+        #expect(tail.map(\.id) == ["5", "10", "20"])
+        #expect(PersonalizedRecommendation.rank(next, using: value, scope: scope, recentSeries: Array(tail.suffix(2))) == result)
+    }
+
+    @Test func diversityUsesRealTopicsEvenWithoutLibrarySignalsButNeverInventsAnAlternative() {
+        let tail = [series("10", tags: ["懸疑"]), series("20", tags: ["懸疑"])]
+        let items = [series("30", tags: ["懸疑"]), series("40", tags: ["校園"]), series("50", tags: ["懸疑"])]
+        let result = PersonalizedRecommendation.rank(items, using: profile(), scope: scope, recentSeries: tail)
+        #expect(result.map(\.series.id) == ["40", "30", "50"])
+        #expect(result.allSatisfy { $0.reason == nil })
+        #expect(PersonalizedRecommendation.rank([items[0], items[2]], using: profile(), scope: scope,
+                                              recentSeries: tail).map(\.series.id) == ["30", "50"])
+    }
+
+    @Test func unknownOrGenericTailMetadataBreaksAConsecutiveTopicRun() {
+        let value = profile(favorites: [series("1", tags: ["懸疑"]), series("2", tags: ["校園"])])
+        let items = [series("30", tags: ["懸疑"]), series("40", tags: ["校園"])]
+        for tail in [[series("10", tags: ["懸疑"]), series("20", tags: ["劇情"])],
+                     [series("10", tags: ["懸疑"]), series("bad", tags: ["懸疑"])]] {
+            #expect(PersonalizedRecommendation.rank(items, using: value, scope: scope,
+                                                   recentSeries: tail).map(\.series.id) == ["30", "40"])
+        }
+    }
+
+    @Test func negativeOnlyTopicsReduceMatchingCandidatesAndNeutralRestoresSourceOrder() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "懸疑", preference: .less)
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: [], history: [], now: now, topicPreferences: topics)
+        #expect(value.hasSignals && value.signalCount == 1)
+        let items = [series("10", tags: ["悬疑"]), series("20", tags: ["校園"]), series("30", tags: ["懸疑"])]
+        #expect(rank(items, value).map(\.series.id) == ["20", "10", "30"])
+        #expect(rank(items, value).allSatisfy { $0.reason == nil })
+        try topics.set(tag: "悬疑", preference: .neutral)
+        let neutral = PersonalizedRecommendationProfile(scope: scope, favorites: [], history: [], now: now, topicPreferences: topics)
+        #expect(neutral.isEmpty)
+        #expect(rank(items, neutral).map(\.series.id) == ["10", "20", "30"])
+    }
+
+    @Test func explicitMoreUsesOnlyActualSharedTagsAndAnHonestReason() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "懸疑", preference: .more)
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: [], history: [], now: now, topicPreferences: topics)
+        let result = rank([series("10", title: "懸疑劇", tags: ["校園"]), series("20", tags: ["悬疑"])], value)
+        #expect(result.map(\.series.id) == ["20", "10"])
+        let reason = try #require(result[0].reason)
+        #expect(reason.kind == .topicPreference && reason.tag == "悬疑")
+        #expect(reason.sourceSeriesID.isEmpty && reason.sourceTitle.isEmpty)
+        #expect(reason.displayText == "你選擇多看「悬疑」")
+        #expect(result[1].reason == nil)
+    }
+
+    @Test func lessIsNotPromotedAsExplorationOrAsTheDiversityAlternative() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "甜寵", preference: .less)
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: [series("1", tags: ["懸疑"])],
+                                                     history: [], now: now, topicPreferences: topics)
+        let items = [series("10", tags: ["甜寵"])] + (20...24).map { series(String($0), tags: ["懸疑"]) }
+            + [series("40", tags: ["校園"])]
+        let result = rank(items, value)
+        #expect(result.last?.series.id == "10")
+        #expect(result.firstIndex(where: { $0.series.id == "40" }) == 3)
+        #expect(result.filter { $0.series.id != "10" }.count == 6)
+        #expect(Set(result.map(\.series.id)).count == items.count)
+    }
+
+    @Test func explicitLessOutweighsTheMaximumInferredWeightOfThatTopic() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "懸疑", preference: .less)
+        let favorites = (1...6).map { series(String($0), tags: ["懸疑"]) }
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: favorites, history: [], now: now, topicPreferences: topics)
+        let result = rank([series("10", tags: ["懸疑"]), series("20", tags: ["校園"])], value)
+        #expect(result.map(\.series.id) == ["20", "10"])
+        #expect(result.allSatisfy { $0.reason == nil })
+    }
+
+    @Test func mixedTopicScoresCancellingToZeroDoNotDisguiseLessAsUnmatchedExploration() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "懸疑", preference: .less)
+        try topics.set(tag: "甜寵", preference: .more)
+        let favorites = (1...3).map { series(String($0), tags: ["懸疑"]) }
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: favorites,
+            history: [record(series("4", tags: ["校園"]))], now: now, topicPreferences: topics)
+        // 18 from favorites + 12 explicit more + 2 from history - 32 explicit less = 0.
+        let items = [series("100", tags: ["懸疑", "甜寵", "校園"])]
+            + (110...112).map { series(String($0), tags: ["甜寵"]) } + [series("140", tags: ["穿越"])]
+        let result = rank(items, value)
+        #expect(result.map(\.series.id) == ["110", "111", "112", "140", "100"])
+        #expect(result[3].reason == nil && result[4].reason == nil)
+    }
+
+    @Test func scopeMismatchIgnoresBothTopicChoicesAndPreviousBatchContext() throws {
+        var topics = RecommendationTopicPreferences()
+        try topics.set(tag: "懸疑", preference: .less)
+        let value = PersonalizedRecommendationProfile(scope: scope, favorites: [], history: [], now: now, topicPreferences: topics)
+        let items = [series("10", tags: ["懸疑"]), series("20", tags: ["校園"])]
+        let other = LibraryScope(owner: .account(id: "other"), sourceID: scope.sourceID)
+        let result = PersonalizedRecommendation.rank(items, using: value, scope: other,
+                                                     recentSeries: [series("30", tags: ["懸疑"]), series("40", tags: ["懸疑"])])
+        #expect(result.map(\.series.id) == ["10", "20"] && result.allSatisfy { $0.reason == nil })
+    }
+
     private func series(_ id: String, title: String? = nil, tags: [String] = []) -> Series {
         .init(id: id, title: title ?? "劇\(id)", tags: tags)
     }
