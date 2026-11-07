@@ -14,6 +14,7 @@ struct PosterImagePipelineTests {
         let probe = PosterProbe(data: data, gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let first = Task { try await pipeline.image(for: url("large"), targetPixelSize: 512) }
+        try await entered(probe, count: 1)
         let second = Task { try await pipeline.image(for: url("large"), targetPixelSize: 512) }
         try await wait { await pipeline.statistics().imageConsumers == 2 }
         await probe.releaseAll()
@@ -31,18 +32,21 @@ struct PosterImagePipelineTests {
         let probe = PosterProbe(data: try png(), gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let first = Task { try await pipeline.image(for: url("sizes"), targetPixelSize: 64) }
+        try await entered(probe, count: 1)
         let second = Task { try await pipeline.image(for: url("sizes"), targetPixelSize: 128) }
         try await wait { await pipeline.statistics().downloadConsumers == 2 }
         #expect(await probe.callCount == 1)
         await probe.releaseAll()
         #expect(try await first.value.image.width == 64)
         #expect(try await second.value.image.width == 128)
+        #expect(await probe.callCount == 1)
     }
 
     @Test func cancellingOneConsumerDoesNotCancelTheOtherConsumer() async throws {
         let probe = PosterProbe(data: try png(), gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let first = Task { try await pipeline.image(for: url("shared"), targetPixelSize: 64) }
+        try await entered(probe, count: 1)
         let second = Task { try await pipeline.image(for: url("shared"), targetPixelSize: 64) }
         try await wait { await pipeline.statistics().imageConsumers == 2 }
         first.cancel()
@@ -57,6 +61,7 @@ struct PosterImagePipelineTests {
         let probe = PosterProbe(data: try png(), gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let first = Task { try await pipeline.image(for: url("sizes-cancel"), targetPixelSize: 64) }
+        try await entered(probe, count: 1)
         let second = Task { try await pipeline.image(for: url("sizes-cancel"), targetPixelSize: 128) }
         try await wait { await pipeline.statistics().downloadConsumers == 2 }
         first.cancel()
@@ -64,13 +69,15 @@ struct PosterImagePipelineTests {
         #expect(await probe.cancelCount == 0)
         await probe.releaseAll()
         #expect(try await second.value.image.width == 128)
+        #expect(await probe.callCount == 1)
+        #expect(await probe.cancelCount == 0)
     }
 
     @Test func cancellingTheLastConsumerStopsDownloadAndAllowsRetry() async throws {
         let probe = PosterProbe(data: try png(), gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let first = Task { try await pipeline.image(for: url("cancel-all"), targetPixelSize: 64) }
-        try await wait { await probe.callCount == 1 }
+        try await entered(probe, count: 1)
         first.cancel()
         await #expect(throws: CancellationError.self) { try await first.value }
         try await wait {
@@ -88,11 +95,14 @@ struct PosterImagePipelineTests {
         let pipeline = PosterImagePipeline(configuration: .init(maximumConcurrentRequests: 2, maximumPendingRequests: 3), transport: probe)
         let tasks = (1...3).map { n in Task { try await pipeline.image(for: url("concurrent\(n)"), targetPixelSize: 64) } }
         try await wait { await pipeline.statistics().queuedRequests == 1 }
+        try await entered(probe, count: 2)
         #expect(await probe.maximumActive == 2)
+        #expect(await probe.callCount == 2)
         await #expect(throws: PosterImageError.busy) { try await pipeline.image(for: url("over-pending"), targetPixelSize: 64) }
         await probe.releaseAll()
         for task in tasks { _ = try await task.value }
-        #expect(await probe.maximumActive <= 2)
+        #expect(await probe.maximumActive == 2)
+        #expect(await probe.callCount == 3)
         #expect(await pipeline.statistics().activeRequests == 0)
     }
 
@@ -100,7 +110,7 @@ struct PosterImagePipelineTests {
         let probe = PosterProbe(data: try png(), gated: true)
         let pipeline = PosterImagePipeline(configuration: .init(maximumConcurrentRequests: 1), transport: probe)
         let first = Task { try await pipeline.image(for: url("active"), targetPixelSize: 64) }
-        try await wait { await probe.callCount == 1 }
+        try await entered(probe, count: 1)
         let queued = Task { try await pipeline.image(for: url("queued"), targetPixelSize: 64) }
         try await wait { await pipeline.statistics().queuedRequests == 1 }
         queued.cancel()
@@ -159,10 +169,10 @@ struct PosterImagePipelineTests {
         let probe = PosterProbe(data: try png(width: 128, height: 64), gated: true)
         let pipeline = PosterImagePipeline(transport: probe)
         let old = Task { try await pipeline.image(for: url("old"), targetPixelSize: 64) }
-        try await wait { await probe.callCount == 1 }
+        try await entered(probe, count: 1)
         await probe.setData(try png(width: 64, height: 128))
         let current = Task { try await pipeline.image(for: url("new"), targetPixelSize: 64) }
-        try await wait { await probe.callCount == 2 }
+        try await entered(probe, count: 2)
         await probe.release(url("new"))
         #expect(try await current.value.image.height == 64)
         await probe.release(url("old"))
@@ -244,13 +254,26 @@ struct PosterImagePipelineTests {
         Issue.record("Poster fixture did not reach the expected state")
         throw PosterImageError.network
     }
+    private func entered(_ probe: PosterProbe, count: Int) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await probe.waitForPending(count) }
+            group.addTask {
+                try await Task.sleep(for: .seconds(5))
+                throw PosterImageError.network
+            }
+            defer { group.cancelAll() }
+            _ = try await group.next()
+        }
+    }
 }
 
 private actor PosterProbe: PosterImageTransport {
     private var payload: Data
     private var gated: Bool
     private struct Pending { let url: URL; let continuation: CheckedContinuation<Void, any Error> }
+    private struct EntryWaiter { let count: Int; let continuation: CheckedContinuation<Void, any Error> }
     private var pending: [UUID: Pending] = [:]
+    private var entryWaiters: [UUID: EntryWaiter] = [:]
     private var counts: [URL: Int] = [:]
     private(set) var callCount = 0
     private(set) var cancelCount = 0
@@ -265,7 +288,10 @@ private actor PosterProbe: PosterImageTransport {
             if gated {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                     if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                    else { pending[id] = Pending(url: url, continuation: continuation) }
+                    else {
+                        pending[id] = Pending(url: url, continuation: continuation)
+                        signalEntries()
+                    }
                 }
             }
             try Task.checkCancellation()
@@ -273,6 +299,19 @@ private actor PosterProbe: PosterImageTransport {
         return data
     }
     func calls(for url: URL) -> Int { counts[url, default: 0] }
+    /// Returns only after the transport has entered and installed its blocking continuation.
+    func waitForPending(_ count: Int) async throws {
+        try Task.checkCancellation()
+        if pending.count >= count { return }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
+                else if pending.count >= count { continuation.resume() }
+                else { entryWaiters[id] = EntryWaiter(count: count, continuation: continuation) }
+            }
+        } onCancel: { Task { await self.cancelEntry(id) } }
+    }
     func setData(_ data: Data) { payload = data }
     func release(_ url: URL) {
         let ids = pending.filter { $0.value.url == url }.map(\.key)
@@ -287,6 +326,11 @@ private actor PosterProbe: PosterImageTransport {
         guard let value = pending.removeValue(forKey: id) else { return }
         cancelCount += 1; value.continuation.resume(throwing: CancellationError())
     }
+    private func signalEntries() {
+        let ready = entryWaiters.filter { pending.count >= $0.value.count }.map(\.key)
+        for id in ready { entryWaiters.removeValue(forKey: id)?.continuation.resume() }
+    }
+    private func cancelEntry(_ id: UUID) { entryWaiters.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError()) }
 }
 
 private final class PosterProtocol: URLProtocol, @unchecked Sendable {
