@@ -219,6 +219,7 @@ final class PlayerModel: ObservableObject {
         playbackObservation?.invalidate()
         playbackObservation = nil
         clearItem()
+        isLoading = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
@@ -333,18 +334,8 @@ final class PlayerModel: ObservableObject {
 
     private func handleFailure(generation requestGeneration: UUID, error: (any Error)? = nil) {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
-        if let error {
-            switch error as? CatalogError {
-            case .some(.network): break
-            case .some(.httpStatus(let status)) where (500...599).contains(status): break
-            default:
-                isLoading = false
-                errorMessage = error.localizedDescription
-                pauseAndSave()
-                return
-            }
-        }
-        if retryCount == 0 {
+        if error is CancellationError { return }
+        if PlaybackRecovery.shouldRetry(error, attempt: retryCount) {
             let resumeAfterRecovery = playbackSpeed.wantsPlayback
             retryCount = 1
             beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery)
@@ -364,7 +355,8 @@ final class PlayerModel: ObservableObject {
             }
             current = value.userInfo[NSUnderlyingErrorKey] as? NSError
         }
-        return nil
+        if PlaybackRecovery.shouldRetry(error, attempt: 0) { return NativeMediaError.network }
+        return CatalogError.unavailablePlayback
     }
 
     private func updateDuration() {

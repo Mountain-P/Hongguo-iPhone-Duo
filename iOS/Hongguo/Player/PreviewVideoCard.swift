@@ -13,12 +13,21 @@ struct RecommendationPreviewMediaCard: View {
     let isActive: Bool
     var retainsFrame: Bool = false
     var allowsInteraction: Bool = true
+    var isFavorite: Bool = false
+    var onToggleFavorite: (() -> Void)? = nil
+    var onPreviewStarted: (() -> Void)? = nil
+    var recommendationTitle: String? = nil
+    var onShowPreferences: (() -> Void)? = nil
+    var onNotInterested: (() -> Void)? = nil
     let onOpenSeries: () -> Void
 
     var body: some View {
         PreviewVideoContent(series: series, episode: episode, service: service,
                             isActive: isActive, retainsFrame: retainsFrame,
-                            allowsInteraction: allowsInteraction, onOpenSeries: onOpenSeries)
+                            allowsInteraction: allowsInteraction, isFavorite: isFavorite,
+                            onToggleFavorite: onToggleFavorite, onPreviewStarted: onPreviewStarted,
+                            recommendationTitle: recommendationTitle, onShowPreferences: onShowPreferences,
+                            onNotInterested: onNotInterested, onOpenSeries: onOpenSeries)
             .id(Identity(seriesID: series.id, episodeID: episode.id))
     }
 
@@ -37,6 +46,12 @@ private struct PreviewVideoContent: View {
     let isActive: Bool
     let retainsFrame: Bool
     let allowsInteraction: Bool
+    let isFavorite: Bool
+    let onToggleFavorite: (() -> Void)?
+    let onPreviewStarted: (() -> Void)?
+    let recommendationTitle: String?
+    let onShowPreferences: (() -> Void)?
+    let onNotInterested: (() -> Void)?
     let onOpenSeries: () -> Void
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
@@ -45,12 +60,22 @@ private struct PreviewVideoContent: View {
     @State private var suspendedForPaging = false
     @State private var resumeAfterPaging = false
     @State private var lastBoostEndAt = Date.distantPast
+    @State private var firstFrameReady = false
+    @State private var reportedPreviewStarted = false
 
     init(series: Series, episode: Episode, service: any CatalogService,
-         isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, onOpenSeries: @escaping () -> Void) {
+         isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
+         onToggleFavorite: (() -> Void)?, onPreviewStarted: (() -> Void)?, recommendationTitle: String?,
+         onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onOpenSeries: @escaping () -> Void) {
         self.isActive = isActive
         self.retainsFrame = retainsFrame
         self.allowsInteraction = allowsInteraction
+        self.isFavorite = isFavorite
+        self.onToggleFavorite = onToggleFavorite
+        self.onPreviewStarted = onPreviewStarted
+        self.recommendationTitle = recommendationTitle
+        self.onShowPreferences = onShowPreferences
+        self.onNotInterested = onNotInterested
         self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: [episode],
             initialEpisodeID: episode.id, resumeSeconds: 0, service: service,
@@ -65,8 +90,11 @@ private struct PreviewVideoContent: View {
                 ZStack {
                     Poster(series: model.series, contentMode: .fill)
                         .allowsHitTesting(false).accessibilityHidden(true)
-                    NativePlayerSurface(player: model.player, fillsScreen: true)
-                        .opacity(model.player.currentItem != nil && !model.isLoading && model.errorMessage == nil ? 1 : 0)
+                    NativePlayerSurface(player: model.player, fillsScreen: true, onReadyForDisplayChange: { ready in
+                        firstFrameReady = ready
+                        reportPreviewStarted()
+                    })
+                        .opacity(firstFrameReady && model.player.currentItem != nil && !model.isLoading && model.errorMessage == nil ? 1 : 0)
                     touchSurface
                     if isActive, controlsVisible || !model.canPausePlayback {
                         centerControl
@@ -74,6 +102,7 @@ private struct PreviewVideoContent: View {
                     status.accessibilityHidden(!isActive)
                     VStack {
                         HStack {
+                            preferenceMenu
                             if model.isSpeedBoosting {
                                 glass(Text("2 倍速").font(.caption.weight(.semibold))
                                     .padding(.horizontal, 14).frame(minHeight: 44), in: Capsule())
@@ -100,7 +129,8 @@ private struct PreviewVideoContent: View {
         .onChange(of: isActive) { _, _ in synchronizeActivation() }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation() }
         .onChange(of: scenePhase) { _, _ in synchronizeActivation() }
-        .onChange(of: model.isPlaying) { _, _ in revealControls() }
+        .onChange(of: model.isPlaying) { _, _ in revealControls(); reportPreviewStarted() }
+        .onChange(of: model.isLoading) { _, loading in if loading { firstFrameReady = false } }
         .onChange(of: model.isBuffering) { _, _ in revealControls() }
         .onChange(of: model.errorMessage) { _, _ in revealControls() }
         .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
@@ -175,6 +205,18 @@ private struct PreviewVideoContent: View {
                 }
                 .shadow(color: .black.opacity(0.8), radius: 3, y: 1)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                if let onToggleFavorite {
+                    glass(Button {
+                        guard allowsInteraction, scenePhase == .active else { return }
+                        onToggleFavorite()
+                    } label: {
+                        Image(systemName: isFavorite ? "heart.fill" : "heart")
+                            .font(.body.weight(.semibold)).frame(width: 46, height: 46)
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel(isFavorite ? "取消收藏" : "收藏這部劇")
+                        .accessibilityValue(isFavorite ? "已收藏" : "未收藏")
+                        .accessibilityIdentifier("preview.favorite"), in: Circle())
+                }
                 glass(Button(action: openSeries) {
                     Label("看整部", systemImage: "play.rectangle")
                         .font(.subheadline.weight(.semibold)).fixedSize()
@@ -187,6 +229,33 @@ private struct PreviewVideoContent: View {
                     .accessibilityLabel("第一集播放進度")
             }
         }
+    }
+
+    @ViewBuilder
+    private var preferenceMenu: some View {
+        if onShowPreferences != nil || onNotInterested != nil {
+            glass(Menu {
+                if let onShowPreferences {
+                    Button { guard allowsInteraction else { return }; onShowPreferences() }
+                        label: { Label("推薦偏好", systemImage: "slider.horizontal.3") }
+                }
+                if let onNotInterested {
+                    Button { guard allowsInteraction else { return }; onNotInterested() }
+                        label: { Label("不感興趣", systemImage: "hand.thumbsdown") }
+                }
+            } label: {
+                Label(recommendationTitle ?? "推薦選項", systemImage: "ellipsis")
+                    .font(.caption.weight(.semibold)).lineLimit(1)
+                    .padding(.horizontal, 12).frame(minHeight: 44)
+            }.disabled(!allowsInteraction), in: Capsule())
+        }
+    }
+
+    private func reportPreviewStarted() {
+        guard !reportedPreviewStarted, firstFrameReady, model.isPlaying,
+              isActive, scenePhase == .active else { return }
+        reportedPreviewStarted = true
+        onPreviewStarted?()
     }
 
     @ViewBuilder

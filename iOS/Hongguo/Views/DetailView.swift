@@ -22,7 +22,15 @@ struct DetailView: View {
     @State private var route: PlaybackRoute?
     @State private var loadedService: (any CatalogService)?
     @State private var showingPlaybackSetup = false
-    @State private var showingAllEpisodes = false
+    @State private var episodeIndex: EpisodeSelection?
+    @State private var selectedEpisodeGroupID: Int?
+    @State private var locatedEpisodeID: String?
+    @State private var episodeJumpText = ""
+    @State private var episodeJumpMessage: String?
+    @State private var locationTask: Task<Void, Never>?
+    @FocusState private var episodeJumpFocused: Bool
+    @ScaledMetric(relativeTo: .body) private var episodeMinimumWidth: CGFloat = 58
+    @ScaledMetric(relativeTo: .body) private var episodeMinimumHeight: CGFloat = 46
     @State private var showingAllRelated = false
     private var current: Series { detail?.series ?? series }
     private var discovery: SeriesDiscoveryMetadata? { detail?.discovery }
@@ -33,6 +41,7 @@ struct DetailView: View {
     }
 
     var body: some View {
+        ScrollViewReader { scroll in
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 hero
@@ -63,7 +72,7 @@ struct DetailView: View {
                         Button("播放設定") { showingPlaybackSetup = true }.buttonStyle(.bordered)
                     }
                 }
-                if let detail, loadedService != nil { episodeSection(detail) }
+                if let detail, loadedService != nil { episodeSection(detail, scroll: scroll) }
                 if !related.isEmpty { relatedSection }
                 if let url = URL(string: "https://hongguoduanju.com/player/\(series.id)") {
                     Link(destination: url) { Label("在紅果官網開啟", systemImage: "arrow.up.right.square").font(.subheadline) }
@@ -74,14 +83,22 @@ struct DetailView: View {
         .clipped()
         .background(Theme.background).navigationTitle("劇集詳情").navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("完成") { episodeJumpFocused = false }
+            }
+        }
         .task(id: loadKey) {
             if detail == nil || lastLoadedKey != loadKey { await load() }
         }
         .refreshable { await load() }
+        .onDisappear { locationTask?.cancel(); locationTask = nil }
         .sheet(isPresented: $showingPlaybackSetup) { NavigationStack { SettingsView(isSetupSheet: true) } }
         .fullScreenCover(item: $route) { item in
             PlayerScreen(series: item.detail.series, episodes: item.detail.episodes, initialEpisodeID: item.episode.id,
                          resumeSeconds: item.seconds, service: item.service, onProgress: item.onProgress)
+        }
         }
     }
 
@@ -156,8 +173,10 @@ struct DetailView: View {
         }
     }
 
-    private func episodeSection(_ detail: SeriesDetail) -> some View {
-        let episodes = showingAllEpisodes ? detail.episodes : Array(detail.episodes.prefix(12))
+    private func episodeSection(_ detail: SeriesDetail, scroll: ScrollViewProxy) -> some View {
+        let index = episodeIndex
+        let selectedGroup = index?.groups.first { $0.id == selectedEpisodeGroupID } ?? index?.groups.first
+        let episodes = selectedGroup?.episodes ?? detail.episodes
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Text("選集").font(.title3.weight(.bold))
@@ -165,32 +184,105 @@ struct DetailView: View {
                 Text("\(detail.episodes.count) 集").font(.caption2).foregroundStyle(Theme.muted)
             }
             if detail.episodes.isEmpty { Text("來源尚未提供分集資料。").font(.subheadline).foregroundStyle(Theme.muted) }
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 58), spacing: 10)], spacing: 10) {
+            if let index, !index.episodes.isEmpty {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        episodeGroupPicker(index)
+                        Spacer(minLength: 8)
+                        locateLastButton(index, scroll: scroll)
+                    }
+                    VStack(alignment: .leading, spacing: 12) {
+                        episodeGroupPicker(index)
+                        locateLastButton(index, scroll: scroll)
+                    }
+                }
+                HStack(spacing: 12) {
+                    TextField("輸入集數", text: $episodeJumpText)
+                        .keyboardType(.numberPad).textFieldStyle(.roundedBorder)
+                        .focused($episodeJumpFocused)
+                        .accessibilityLabel("要定位的集數")
+                        .onSubmit { locateEnteredEpisode(index, scroll: scroll) }
+                    Button("跳至") { locateEnteredEpisode(index, scroll: scroll) }
+                        .buttonStyle(.bordered).controlSize(.large)
+                        .disabled(episodeJumpText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if let episodeJumpMessage {
+                    Text(episodeJumpMessage).font(.caption).foregroundStyle(Theme.muted)
+                        .accessibilityAddTraits(.updatesFrequently)
+                }
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: episodeMinimumWidth), spacing: 10)], spacing: 10) {
                 ForEach(episodes) { episode in
                     Button { play(episode) } label: {
                         VStack(spacing: 4) {
                             Text("\(episode.number)").font(.subheadline.weight(.semibold))
                             if !episode.isAvailable { Image(systemName: "lock.fill").font(.system(size: 8)) }
                         }
-                        .frame(maxWidth: .infinity, minHeight: 46)
+                        .frame(maxWidth: .infinity, minHeight: episodeMinimumHeight)
                         .background(model.record(for: current)?.episode.id == episode.id ? Theme.accent.opacity(0.2) : Theme.surface,
                                     in: RoundedRectangle(cornerRadius: 10))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(locatedEpisodeID == episode.id ? Theme.accent : .clear, lineWidth: 2)
+                        }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain).disabled(!episode.isAvailable)
                     .foregroundStyle(episode.isAvailable ? .white : Theme.muted)
                     .accessibilityLabel("第 \(episode.number) 集\(episode.isAvailable ? "" : "，服務未開放")")
+                    .accessibilityValue(locatedEpisodeID == episode.id ? "已定位" : "")
+                    .id("episode-\(episode.id)")
                 }
             }
-            if detail.episodes.count > 12 {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) { showingAllEpisodes.toggle() }
-                } label: {
-                    Label(showingAllEpisodes ? "收合選集" : "展開全部 \(detail.episodes.count) 集",
-                          systemImage: showingAllEpisodes ? "chevron.up" : "chevron.down")
-                        .font(.subheadline).frame(maxWidth: .infinity, minHeight: 42)
-                }.buttonStyle(.bordered)
+        }
+    }
+
+    private func episodeGroupPicker(_ index: EpisodeSelection) -> some View {
+        Picker("集數範圍", selection: Binding(
+            get: { selectedEpisodeGroupID ?? index.groups.first?.id ?? 1 },
+            set: {
+                locationTask?.cancel(); locationTask = nil
+                selectedEpisodeGroupID = $0; locatedEpisodeID = nil; episodeJumpMessage = nil
             }
+        )) {
+            ForEach(index.groups) { group in
+                Text(group.start == group.end ? "第 \(group.start) 集" : "\(group.start)–\(group.end) 集").tag(group.id)
+            }
+        }
+        .pickerStyle(.menu).tint(Theme.accent)
+        .accessibilityHint("切換顯示的分集範圍，不會開始播放")
+    }
+
+    private func locateLastButton(_ index: EpisodeSelection, scroll: ScrollViewProxy) -> some View {
+        let episode = index.resumeEpisode(record: model.record(for: current))
+        return Button {
+            if let episode { locate(episode, in: index, scroll: scroll) }
+        } label: {
+            Label(episode.map { "上次第 \($0.number) 集" } ?? "定位上次", systemImage: "scope")
+                .font(.subheadline)
+        }
+        .buttonStyle(.bordered).disabled(episode == nil)
+        .accessibilityHint("定位上次觀看的分集，不會開始播放")
+    }
+
+    private func locateEnteredEpisode(_ index: EpisodeSelection, scroll: ScrollViewProxy) {
+        do { locate(try index.resolve(numberText: episodeJumpText), in: index, scroll: scroll) }
+        catch { episodeJumpMessage = error.localizedDescription }
+    }
+
+    private func locate(_ episode: Episode, in index: EpisodeSelection, scroll: ScrollViewProxy) {
+        guard index.seriesID == detail?.series.id, let group = index.group(containing: episode.id) else { return }
+        locationTask?.cancel()
+        selectedEpisodeGroupID = group.id; locatedEpisodeID = episode.id
+        episodeJumpText = "\(episode.number)"; episodeJumpFocused = false
+        episodeJumpMessage = episode.isAvailable ? "已定位第 \(episode.number) 集，點分集即可觀看。" : "第 \(episode.number) 集尚未開放。"
+        let request = loadID
+        locationTask = Task { @MainActor in
+            // Let the newly selected group's cells enter the scroll view first.
+            try? await Task.sleep(for: .milliseconds(60))
+            guard !Task.isCancelled, request == loadID, locatedEpisodeID == episode.id,
+                  detail?.series.id == index.seriesID else { return }
+            withAnimation(.easeInOut(duration: 0.2)) { scroll.scrollTo("episode-\(episode.id)", anchor: .center) }
         }
     }
 
@@ -223,6 +315,9 @@ struct DetailView: View {
         let request = UUID()
         let key = loadKey
         loadID = request
+        locationTask?.cancel(); locationTask = nil
+        episodeIndex = nil; selectedEpisodeGroupID = nil; locatedEpisodeID = nil
+        episodeJumpText = ""; episodeJumpMessage = nil; episodeJumpFocused = false
         route = nil; loadedService = nil; detail = nil
         isLoading = true; error = nil
         defer { if request == loadID { isLoading = false } }
@@ -235,11 +330,13 @@ struct DetailView: View {
                 try Task.checkCancellation()
                 guard request == loadID, key == loadKey else { return }
                 loadedService = service; detail = result; lastLoadedKey = key
+                episodeIndex = try? EpisodeSelection(seriesID: result.series.id, episodes: result.episodes)
             } else {
                 let result = try await DirectWebService().detail(id: series.id)
                 try Task.checkCancellation()
                 guard request == loadID, key == loadKey else { return }
                 detail = result; lastLoadedKey = key
+                episodeIndex = try? EpisodeSelection(seriesID: result.series.id, episodes: result.episodes)
             }
         } catch {
             if request == loadID, !Task.isCancelled { self.error = error.localizedDescription }

@@ -24,6 +24,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var serverURL: String
     @Published private(set) var revision = UUID()
     @Published var searchHistory: [String]
+    @Published private(set) var recommendationPreferences: RecommendationPreferences
+    @Published private(set) var recommendationFilterRevision = UUID()
     @Published var isImmersivePlayback = false
     private let defaults = UserDefaults.standard
     private let library = AccountLibraryController()
@@ -60,6 +62,11 @@ final class AppModel: ObservableObject {
         if initialPlayback == .native { catalogSource = .website }
         serverURL = UserDefaults.standard.string(forKey: "serverURL") ?? ""
         searchHistory = UserDefaults.standard.stringArray(forKey: "searchHistory") ?? []
+        let preferenceData = UserDefaults.standard.data(forKey: "recommendationPreferences.v1")
+        recommendationPreferences = preferenceData.flatMap { data in
+            guard data.count <= 256 * 1024 else { return nil as RecommendationPreferences? }
+            return try? JSONDecoder().decode(RecommendationPreferences.self, from: data)
+        } ?? .init()
         libraryObservation = library.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
         restoreLibrary()
     }
@@ -74,6 +81,11 @@ final class AppModel: ObservableObject {
 
     func catalogService() throws -> any CatalogService {
         if catalogSource == .website { return NativeCatalogService() }
+        return try playbackService()
+    }
+
+    func previewCatalogService() throws -> any CatalogService {
+        if catalogSource == .website { return NativeCatalogService(category: recommendationPreferences.category) }
         return try playbackService()
     }
 
@@ -137,8 +149,57 @@ final class AppModel: ObservableObject {
     func acceptAccountSession(_ session: AccountSession) { library.accept(session) }
     func synchronizeLibrary() async { await library.synchronize(userInitiated: true) }
     func resumeAccount() { library.scheduleSync(immediate: true) }
+    func flushLibrary() async { await library.flush() }
     func signOut() { library.signOut() }
     func importGuestLibrary() { library.importGuest() }
+
+    func setRecommendationCategory(_ category: DirectWebService.Category) {
+        var next = recommendationPreferences; next.category = category
+        saveRecommendationPreferences(next, changesFilter: true)
+    }
+
+    func setSkipsPreviewed(_ enabled: Bool) {
+        var next = recommendationPreferences; next.skipsPreviewed = enabled
+        saveRecommendationPreferences(next, changesFilter: true)
+    }
+
+    func setNotInterested(_ series: Series, value: Bool) {
+        var next = recommendationPreferences
+        do {
+            try next.setNotInterested(seriesID: series.id, value: value)
+            saveRecommendationPreferences(next, changesFilter: true)
+        } catch { persistenceError = "無法更新這部劇的推薦偏好。" }
+    }
+
+    func markPreviewed(_ series: Series) {
+        guard !recommendationPreferences.previewedIDs.contains(series.id) else { return }
+        var next = recommendationPreferences
+        do {
+            try next.markPreviewed(seriesID: series.id)
+            // Watching the current card never removes it from the live feed.
+            saveRecommendationPreferences(next, changesFilter: false)
+        } catch { /* A malformed external ID must not interrupt playback. */ }
+    }
+
+    func resetNotInterested() {
+        var next = recommendationPreferences; next.clearNotInterested()
+        saveRecommendationPreferences(next, changesFilter: true)
+    }
+
+    func resetPreviewed() {
+        var next = recommendationPreferences; next.clearPreviewed()
+        saveRecommendationPreferences(next, changesFilter: true)
+    }
+
+    private func saveRecommendationPreferences(_ preferences: RecommendationPreferences, changesFilter: Bool) {
+        guard preferences != recommendationPreferences else { return }
+        do {
+            let data = try JSONEncoder().encode(preferences)
+            defaults.set(data, forKey: "recommendationPreferences.v1")
+            recommendationPreferences = preferences
+            if changesFilter { recommendationFilterRevision = UUID() }
+        } catch { persistenceError = "無法保存推薦偏好，原有設定已保留。" }
+    }
 
     func rememberSearch(_ query: String) {
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -152,11 +213,6 @@ final class AppModel: ObservableObject {
     private func restoreLibrary() {
         library.selectSource(libraryKey, legacy: defaults.data(forKey: libraryKey), allowsAccount: playbackMode == .native)
     }
-}
-
-enum AppError: LocalizedError {
-    case message(String)
-    var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
 }
 
 private enum KeychainToken {

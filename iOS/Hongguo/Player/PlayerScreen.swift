@@ -9,6 +9,7 @@ struct PlayerScreen: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @EnvironmentObject private var appModel: AppModel
     @StateObject private var model: PlayerModel
     private let onClose: (() -> Void)?
     private let onSeriesSwipe: ((Int) -> Void)?
@@ -116,12 +117,16 @@ struct PlayerScreen: View {
             hideTask?.cancel()
             endBoostGesture()
             model.stop()
+            Task { await appModel.flushLibrary() }
         }
         .onChange(of: scenePhase) { _, phase in
             model.setSceneActive(phase == .active)
             if phase != .active { cancelBoostGesture(); showControls() }
         }
         .onChange(of: model.isPlaying) { _, _ in showControls() }
+        .onChange(of: model.canPausePlayback) { _, canPause in
+            if !canPause { Task { await appModel.flushLibrary() } }
+        }
         .onChange(of: model.isLoading) { _, loading in
             if loading { cancelBoostGesture() }
             showControls()
@@ -568,6 +573,9 @@ struct PlayerScreen: View {
 struct NativePlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     let fillsScreen: Bool
+    var onReadyForDisplayChange: ((Bool) -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> PlayerLayerSurface {
         let view = PlayerLayerSurface()
@@ -577,16 +585,81 @@ struct NativePlayerSurface: UIViewRepresentable {
         view.clipsToBounds = true
         view.playerLayer.player = player
         view.playerLayer.videoGravity = fillsScreen ? .resizeAspectFill : .resizeAspect
+        context.coordinator.observe(view.playerLayer, player: player, callback: onReadyForDisplayChange)
         return view
     }
 
     func updateUIView(_ view: PlayerLayerSurface, context: Context) {
-        if view.playerLayer.player !== player { view.playerLayer.player = player }
+        if view.playerLayer.player !== player {
+            view.playerLayer.player = player
+            context.coordinator.observe(view.playerLayer, player: player, callback: onReadyForDisplayChange)
+        } else { context.coordinator.update(callback: onReadyForDisplayChange) }
         view.playerLayer.videoGravity = fillsScreen ? .resizeAspectFill : .resizeAspect
     }
 
-    static func dismantleUIView(_ view: PlayerLayerSurface, coordinator: Void) {
+    static func dismantleUIView(_ view: PlayerLayerSurface, coordinator: Coordinator) {
+        coordinator.invalidate()
         view.playerLayer.player = nil
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var readyObservation: NSKeyValueObservation?
+        private var itemObservation: NSKeyValueObservation?
+        private var callback: ((Bool) -> Void)?
+        private weak var layer: AVPlayerLayer?
+        private weak var observedItem: AVPlayerItem?
+        private var generation = UUID()
+        private var itemGeneration = UUID()
+        private var lastReady: Bool?
+
+        func observe(_ layer: AVPlayerLayer, player: AVPlayer, callback: ((Bool) -> Void)?) {
+            invalidate()
+            self.layer = layer
+            self.callback = callback
+            let token = generation
+            bindReadiness(to: player.currentItem, layer: layer, token: token)
+            itemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] player, _ in
+                let item = player.currentItem
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token,
+                          let layer = self.layer, layer.player?.currentItem === item else { return }
+                    self.bindReadiness(to: item, layer: layer, token: token)
+                }
+            }
+        }
+
+        private func bindReadiness(to item: AVPlayerItem?, layer: AVPlayerLayer, token: UUID) {
+            readyObservation?.invalidate()
+            itemGeneration = UUID()
+            let itemToken = itemGeneration
+            observedItem = item
+            // Deliver state outside UIViewRepresentable's update transaction.
+            readyObservation = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.generation == token, self.itemGeneration == itemToken,
+                          self.observedItem === item, let layer = self.layer,
+                          layer.player?.currentItem === item else { return }
+                    // Query the current layer instead of delivering an older captured ready bit.
+                    self.report(item != nil && layer.isReadyForDisplay)
+                }
+            }
+        }
+
+        func update(callback: ((Bool) -> Void)?) { self.callback = callback }
+
+        func invalidate() {
+            generation = UUID(); itemGeneration = UUID()
+            readyObservation?.invalidate(); readyObservation = nil
+            itemObservation?.invalidate(); itemObservation = nil
+            callback = nil; layer = nil; observedItem = nil; lastReady = nil
+        }
+
+        private func report(_ ready: Bool) {
+            guard lastReady != ready else { return }
+            lastReady = ready
+            callback?(ready)
+        }
     }
 }
 
