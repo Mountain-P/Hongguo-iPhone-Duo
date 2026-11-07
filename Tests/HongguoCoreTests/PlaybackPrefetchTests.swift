@@ -27,12 +27,32 @@ private actor PrefetchFixtureProbe {
     let source: PlaybackSource
     var calls: [String] = []
     var cancelled = 0
+    private var preparations: [String: CheckedContinuation<PlaybackSource, any Error>] = [:]
+    private var entered: Set<String> = []
+    private var entryWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     init(_ source: PlaybackSource) { self.source = source }
     func prepare(_ id: String) async throws -> PlaybackSource {
-        calls.append(id)
-        do { try await Task.sleep(for: .milliseconds(80)) }
-        catch { cancelled += 1; throw error }
-        return source
+        try Task.checkCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                preparations[id] = continuation
+                calls.append(id); entered.insert(id)
+                entryWaiters.removeValue(forKey: id)?.forEach { $0.resume() }
+                // Cancellation may precede installing this continuation. The actor-side
+                // cancellation callback also uses removeValue so it can complete only once.
+                if Task.isCancelled { cancel(id) }
+            }
+        } onCancel: { Task { await self.cancel(id) } }
+    }
+    func waitUntilEntered(_ id: String) async {
+        if entered.contains(id) { return }
+        await withCheckedContinuation { entryWaiters[id, default: []].append($0) }
+    }
+    func complete(_ id: String) { preparations.removeValue(forKey: id)?.resume(returning: source) }
+    private func cancel(_ id: String) {
+        guard let preparation = preparations.removeValue(forKey: id) else { return }
+        cancelled += 1
+        preparation.resume(throwing: CancellationError())
     }
 }
 
@@ -69,11 +89,11 @@ struct PlaybackPrefetchTests {
         #expect(try await prefetch.prepare(seriesID: "1", episodeID: "2", service: service, allowed: false) == .skipped)
         #expect(await probe.calls.isEmpty)
         let first = Task { try await prefetch.prepare(seriesID: "1", episodeID: "2", service: service) }
-        for _ in 0..<100 {
-            if await !probe.calls.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(2))
-        }
-        #expect(try await prefetch.prepare(seriesID: "1", episodeID: "3", service: service) == .prepared)
+        await probe.waitUntilEntered("2")
+        let second = Task { try await prefetch.prepare(seriesID: "1", episodeID: "3", service: service) }
+        await probe.waitUntilEntered("3")
+        await probe.complete("3")
+        #expect(try await second.value == .prepared)
         await #expect(throws: CancellationError.self) { try await first.value }
         #expect(await probe.calls == ["2", "3"])
         #expect(await probe.cancelled == 1)
@@ -84,10 +104,7 @@ struct PlaybackPrefetchTests {
         let service = PrefetchFixtureService { try await probe.prepare($0) }
         let prefetch = NativePlaybackPrefetch()
         let task = Task { try await prefetch.prepare(seriesID: "1", episodeID: "2", service: service) }
-        for _ in 0..<100 {
-            if await !probe.calls.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(2))
-        }
+        await probe.waitUntilEntered("2")
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(await probe.cancelled == 1)
