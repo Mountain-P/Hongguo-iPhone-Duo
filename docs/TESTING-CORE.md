@@ -1,5 +1,13 @@
 # 內容核心驗證
 
+## 0.12.1 最終本機測試
+
+2026-11-08，`swift test --disable-sandbox`：Core 註冊 482 項／52 suites，481 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 101 項／6 suites 全通過，合計 **582 通過、1 略過、無失敗**，記錄 `build/core-0.12.1-final-tests.log`。
+
+新增 `PlaybackDoubleTapTests` 10 項，使用正式 `PlaybackDoubleTap` 與 `PlaybackRelativeSeek`：核對不同畫布寬度下的左右等分、中線與邊界、無效及越界座標、前後十秒；相對定位核對待完成目標優先於舊時鐘、連續前進累加、立即反向、首尾夾限、無變化不回饋、無效時長／輸入及加法溢位。無效 pending target 不回退使用舊時鐘；有有效 pending 時，尚未更新的時鐘不影響累加。
+
+UI 與 recognizer 並非上述純狀態測試的涵蓋範圍。正式播放器使用 SwiftUI 雙點優先的 exclusive tap；試看沿既有 UIKit recognizer 加上單點等待雙點、雙點等待長按／pinch 的失敗依賴，不改 ScrollView pan 關係。中央按鈕與進度條維持較上層的原操作入口；實際左右雙點、長按及上下滑動的當版模擬器結果見 [TESTING.md](TESTING.md)。
+
 ## 0.12.0 最終本機測試
 
 2026-11-08，`swift test --disable-sandbox`：Core 註冊 472 項／51 suites，471 通過、1 項可選 `currentWebsiteSnapshot` 實網快照略過；AppSupport 101 項／6 suites 全通過，合計 **572 通過、1 略過、無失敗**，記錄 `build/core-0.12.0-final-tests.log`。
