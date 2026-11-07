@@ -1,12 +1,16 @@
 # 建置與安裝
 
+## 0.11.1／build 28
+
+本版只補播放操作的 UIKit 觸覺回饋，不增加建置或外部服務依賴；0.11.0 的交接、推薦及滿版功能保留。模擬器可檢查操作流程，不能驗證實體觸覺馬達的震感；當版建置、GUI 與手機結果見 [TESTING.md](TESTING.md)。
+
 ## 0.11.0／build 27
 
 2026-11-08 更新。本版加入符合條件時重用同一 AVPlayer／item 的試看追劇交接、換集保留舊實際影格至新畫面與定位完成、明確多／少推薦題材及跨頁題材交錯，並加入試看頁內滿版與縮放。既有 0.10.0 短期試看記憶、拖曳提示與精細進度保留。`generate_project.py` 自動收錄新的 Swift 檔，公開專案仍不保存簽署 team；實機 team 僅由本機命令列提供。此處記錄實作與建置方法，Core／AppSupport、Duo 模擬器、iPhoneOS 建置及手機安裝的當版結果請見 [TESTING.md](TESTING.md)。
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.11.0／build 27；播放器交接、題材偏好與滿版操作不增加外部服務依賴，原有上下換集、畫質偏好及原生手機簡訊登入持續保留。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.11.1／build 28；播放器交接、題材偏好與滿版操作不增加外部服務依賴，原有上下換集、畫質偏好及原生手機簡訊登入持續保留。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。

@@ -1,5 +1,9 @@
 # 內容核心驗證
 
+## 0.11.1 播放回饋回歸
+
+本輪只改 iOS 播放器的 UIKit 觸覺回饋與使用者命令接線，未改 Core／AppSupport 狀態規則。`swift test --disable-sandbox --filter PlaybackSpeedTests` 的 15 項倍速回歸全部通過，見 `build/core-0.11.1-speed-tests.log`，涵蓋暫停不自行啟播、鎖定／解除、重複結束與背景取消。未另寫只鏡像 UIKit 呼叫的單元測試；實際命令觸發次數、兩平台建置及手機部署見 [TESTING.md](TESTING.md)。上一版完整本機結果保留在下節。
+
 ## 0.11.0 最終本機測試
 
 2026-11-08，`swift test --disable-sandbox` 通過：Core 註冊 435 項／48 suites，434 通過、1 項可選 `currentWebsiteSnapshot` 實網快照略過；AppSupport 101 項／6 suites 全通過。合計 535 通過、1 略過、無失敗，記錄 `build/core-0.11.0-final-tests.log`。
