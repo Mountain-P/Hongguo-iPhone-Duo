@@ -19,6 +19,7 @@ private struct RecommendationFeedFrames: PreferenceKey {
 private struct RecommendationFeedScrollPhase: ViewModifier {
     let changed: (Bool, Bool) -> Void
     let fallbackDrag: (Bool) -> Void
+    let offsetChanged: (CGFloat) -> Void
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -29,6 +30,10 @@ private struct RecommendationFeedScrollPhase: ViewModifier {
                 guard phase != .tracking else { return }
                 changed(phase == .idle, phase == .interacting)
             }
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                // Keep offsets in the same content coordinates as page origins.
+                max(geometry.contentOffset.y, 0)
+            } action: { _, offset in offsetChanged(offset) }
         } else {
             content.simultaneousGesture(DragGesture(minimumDistance: 4)
                 .onChanged { _ in fallbackDrag(true) }
@@ -46,6 +51,8 @@ struct RecommendationPreviewView: View {
     @State private var scrollID: String?
     @State private var frames: [String: CGFloat] = [:]
     @State private var viewportHeight: CGFloat = 1
+    @State private var contentOffset: CGFloat?
+    @State private var pendingScrollTarget: String?
     @State private var phaseIsIdle = true
     @State private var fallbackDragging = false
     @State private var fallbackSettle: Task<Void, Never>?
@@ -84,10 +91,12 @@ struct RecommendationPreviewView: View {
                         .scrollTargetLayout()
                     }
                     .coordinateSpace(name: "recommendationFeed")
-                    .scrollTargetBehavior(.paging)
+                    .contentMargins(.vertical, 0, for: .scrollContent)
+                    .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
                     .scrollPosition(id: $scrollID, anchor: .top)
                     .scrollIndicators(.hidden)
-                    .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged))
+                    .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged,
+                        offsetChanged: offsetChanged))
                     .onPreferenceChange(RecommendationFeedFrames.self, perform: framesChanged)
                 }
             }
@@ -129,7 +138,7 @@ struct RecommendationPreviewView: View {
         }
         .onChange(of: model.revision) { _, _ in
             fallbackSettle?.cancel(); fallbackSettle = nil
-            scrollID = nil; frames = [:]; requiresManualResume = false
+            scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil; requiresManualResume = false
             preview.invalidateSource()
             if tabIsActive { activateSource() }
         }
@@ -229,6 +238,12 @@ struct RecommendationPreviewView: View {
     }
 
     private var alignedID: String? {
+        if let contentOffset {
+            let index = Int((contentOffset / viewportHeight).rounded())
+            guard preview.items.indices.contains(index),
+                  abs(contentOffset - CGFloat(index) * viewportHeight) <= 2 else { return nil }
+            return preview.items[index].id
+        }
         let known = Set(preview.items.map(\.id))
         guard let closest = frames.filter({ known.contains($0.key) }).min(by: { abs($0.value) < abs($1.value) }),
               abs(closest.value) <= 2 else { return nil }
@@ -236,6 +251,10 @@ struct RecommendationPreviewView: View {
     }
 
     private func intersectsViewport(_ id: String) -> Bool {
+        if let contentOffset, let index = preview.items.firstIndex(where: { $0.id == id }) {
+            let top = CGFloat(index) * viewportHeight - contentOffset
+            return top > -viewportHeight && top < viewportHeight
+        }
         guard let top = frames[id] else { return false }
         return top > -viewportHeight && top < viewportHeight
     }
@@ -252,21 +271,36 @@ struct RecommendationPreviewView: View {
 
     private func refreshEligibility() {
         let sourceMatches = preview.revision == model.revision
-        preview.update(selectedID: alignedID == scrollID ? alignedID : nil, isIdle: phaseIsIdle,
+        let aligned = alignedID
+        let commandHasArrived = pendingScrollTarget == nil || pendingScrollTarget == aligned
+        if commandHasArrived { pendingScrollTarget = nil }
+        preview.update(selectedID: commandHasArrived ? aligned : nil, isIdle: phaseIsIdle,
             isActive: isVisible && tabIsActive && sourceMatches && !requiresManualResume,
             isSceneActive: scenePhase == .active, isDetailPresented: detailSeries != nil)
     }
 
     private func phaseChanged(_ idle: Bool, _ userInitiated: Bool) {
         phaseIsIdle = idle
+        fallbackDragging = userInitiated
+        if userInitiated { pendingScrollTarget = nil }
         if userInitiated, detailSeries == nil { requiresManualResume = false }
+        if idle || userInitiated { fallbackSettle?.cancel(); fallbackSettle = nil }
         refreshEligibility()
+        if !idle, !userInitiated { scheduleFallbackSettle() }
     }
 
     private func framesChanged(_ next: [String: CGFloat]) {
         frames = next
-        if #available(iOS 18.0, *) { refreshEligibility() }
+        if #available(iOS 18.0, *) {
+            if contentOffset == nil { refreshEligibility() }
+        }
         else { scheduleFallbackSettle() }
+    }
+
+    private func offsetChanged(_ offset: CGFloat) {
+        contentOffset = offset
+        refreshEligibility()
+        if !phaseIsIdle, !fallbackDragging { scheduleFallbackSettle() }
     }
 
     private func fallbackDragChanged(_ dragging: Bool) {
@@ -298,6 +332,7 @@ struct RecommendationPreviewView: View {
             return
         }
         requiresManualResume = false
+        pendingScrollTarget = preview.items[index + offset].id
         // Geometry alignment and the system's scroll phase gate activation.
         // A binding-driven accessibility scroll does not always emit a phase
         // transition, so do not leave it waiting for an idle callback forever.
