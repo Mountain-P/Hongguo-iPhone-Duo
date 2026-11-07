@@ -74,6 +74,14 @@ public struct RecommendationPreviewQueue: Sendable {
 
     public mutating func cancelPageRequest() { pendingPage = nil }
 
+    /// Scroll positions use stable series IDs; trimming older cards cannot retarget one.
+    @discardableResult
+    public mutating func select(seriesID: String) -> Series? {
+        guard let index = items.firstIndex(where: { $0.id == seriesID }) else { return nil }
+        currentIndex = index
+        return items[index]
+    }
+
     @discardableResult
     public mutating func move(by offset: Int) -> Series? {
         guard (-1...1).contains(offset), let index = currentIndex else { return nil }

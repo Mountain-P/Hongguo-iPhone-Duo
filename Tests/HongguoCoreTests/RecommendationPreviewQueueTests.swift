@@ -111,6 +111,31 @@ struct RecommendationPreviewQueueTests {
         }
     }
 
+    @Test func stableIDSelectionAllowsScrollJumpsWithoutUnknownIDsMovingTheCursor() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10", "20", "30", "40"], more: true), for: queue.beginPageRequest()!)
+        #expect(queue.select(seriesID: "40")?.id == "40")
+        #expect(queue.select(seriesID: "10")?.id == "10")
+        #expect(queue.select(seriesID: "999") == nil)
+        #expect(queue.current?.id == "10")
+        #expect(queue.select(seriesID: "30")?.id == "30")
+        #expect(queue.move(by: 1)?.id == "40")
+    }
+
+    @Test func trimmingHistoryPreservesCurrentIDAndCannotRetargetAnEvictedPosition() throws {
+        var queue = RecommendationPreviewQueue(capacity: 120)
+        try queue.receive(page(1, (100...199).map(String.init), more: true), for: queue.beginPageRequest()!)
+        #expect(queue.select(seriesID: "199")?.id == "199")
+        try queue.receive(page(2, (200...299).map(String.init), more: false), for: queue.beginPageRequest()!)
+        #expect(queue.items.count == 120)
+        #expect(queue.current?.id == "199")
+        #expect(queue.currentIndex == 19)
+        #expect(queue.select(seriesID: "100") == nil)
+        #expect(queue.current?.id == "199")
+        #expect(queue.select(seriesID: "201")?.id == "201")
+        #expect(queue.select(seriesID: "199")?.id == "199")
+    }
+
     private func page(_ number: Int, _ ids: [String], more: Bool) -> SeriesPage {
         .init(items: ids.map { .init(id: $0, title: "劇集\($0)") }, page: number, hasMore: more)
     }
