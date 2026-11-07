@@ -1,5 +1,13 @@
 # 內容核心驗證
 
+## 0.11.0 最終本機測試
+
+2026-11-08，`swift test --disable-sandbox` 通過：Core 註冊 435 項／48 suites，434 通過、1 項可選 `currentWebsiteSnapshot` 實網快照略過；AppSupport 101 項／6 suites 全通過。合計 535 通過、1 略過、無失敗，記錄 `build/core-0.11.0-final-tests.log`。
+
+新增 13 項播放器交接有效性測試，涵蓋同一 item、位置容差、片庫／來源／品質／revision、準備與 seek 狀態、前景、期限、取消與一次性消費；10 項題材偏好測試涵蓋正規化、泛型排除、儲存上限、隔離及損壞資料；推薦排序新增 9 項，正式推薦 model 新增 6 項，驗證跨頁尾部題材、回應時的最新偏好、負向題材不插隊，以及目前卡片與既有媒體保持不動。
+
+另新增 8 項 `PreviewZoomStateTests`：縮放限制 0.5–3 倍、到達邊界後反向即回應、取消回復、重複 begin 不覆寫起點、無效數值及選單覆蓋舊手勢。這些是純縮放狀態與正式 model 的測試，不能代替 AVPlayer 畫面交接、雙指觸控或 Duo 布局驗收；實際畫面與部署結果另見 [TESTING.md](TESTING.md)。
+
 ## 0.10.0 最終本機測試
 
 `swift test --disable-sandbox` 已通過：Core 395 項／45 suites 中 394 通過、1 項可選實網快照略過，AppSupport 95 項／6 suites 全通過；合計 489 通過、1 略過，無失敗，記錄 `build/core-0.10.0-final-tests.log`。原有 prefetch 取消測例已以可控 gate 取代固定 80ms 睡眠，避免 CI 排程導致誤報；取消、prepared 與請求順序的嚴格斷言保留，App／Core 原碼不變。
