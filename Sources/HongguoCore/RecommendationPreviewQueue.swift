@@ -45,7 +45,8 @@ public struct RecommendationPreviewQueue: Sendable {
 
     /// False means the request was cancelled or belongs to a replaced source.
     @discardableResult
-    public mutating func receive(_ result: SeriesPage, for request: PageRequest) throws -> Bool {
+    public mutating func receive(_ result: SeriesPage, for request: PageRequest,
+                                 preferences: RecommendationPreferences? = nil) throws -> Bool {
         guard pendingPage == request, request.generation == generation else { return false }
         guard result.page == request.page, result.items.count <= Self.maximumPageItems else {
             throw CatalogError.malformedResponse
@@ -55,7 +56,11 @@ public struct RecommendationPreviewQueue: Sendable {
             guard !series.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CatalogError.malformedResponse }
         }
         var seen = seenIDs
-        let additions = result.items.filter { seen.insert($0.id).inserted }
+        // Source pages still advance when every valid item was excluded by local choices.
+        // Reset the queue when restoring/changing choices to revisit previously excluded IDs.
+        let additions = result.items.filter {
+            seen.insert($0.id).inserted && (preferences?.allows(seriesID: $0.id) ?? true)
+        }
         guard seen.count <= Self.maximumSeenIDs else { throw CatalogError.responseTooLarge }
         var combined = items + additions
         var index = currentIndex ?? (combined.isEmpty ? nil : 0)
