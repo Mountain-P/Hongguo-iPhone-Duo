@@ -1,6 +1,32 @@
 # 驗證紀錄
 
-更新：2026-11-07，當前版本 0.8.2／build 21。本輪修正不感興趣的片單重設、過小進度差的選擇提示、播放狀態變化喚出 HUD，以及首幀立即算已試看。預設內建取源與 progressive Range 播放不使用帳號憑據。
+更新：2026-11-07，當前版本 0.9.0／build 22。本輪新增試看候選來源與追劇原地重試。預設內建取源與 progressive Range 播放不使用帳號憑據。
+
+## 0.9.0 候選擴源與原地重試
+
+完整回歸登錄 432 項：Core 351 項／43 個 suites（350 通過、1 項可選官網快照略過），AppSupport 81 項／6 個 suites 全數通過，記錄為 `build/core-0.9.0-validated-tests.log`。Duo 模擬器及 iPhoneOS／arm64 Debug build 22 均建置成功，嚴格簽章驗證通過；記錄為 `build/ios-0.9.0-build22-final.log`、`build/ios-real-device-0.9.0-build22-final.log`。106 份 App 來源雜湊及兩平台版號存於本機 `build/ios-0.9.0-build22-validation.json`，公開工程團隊保持空白。
+
+原碼 `a8de819726521845a033f9217d5402b72c6ed921` 的 [GitHub Actions](https://github.com/Mountain-P/Hongguo-iPhone-Duo/actions/runs/42370054003) 核心測試成功。遠端缺少相容 Duo SDK，App 建置步驟略過；兩平台實際建置證據以上述本機結果為準。
+
+### 公開 metadata 探針
+
+新增 `CatalogDiscoveryCheck preview <category> [pages]`，只讀 metadata，不取影片。2026-11-07 實測真人與 AI：第一頁各 24 部原目錄，第二／三頁各 24 部原目錄及 6 部近 7 天新劇。漫劇前三頁各 24 部原目錄；實作不呼叫不支援的漫劇新劇來源，也不保證每次都有不重複補充作品。獨立真人榜單回傳 20 筆、新劇 88 筆；這些是當時來源快照，不是推薦命中率或速度比較。
+
+結果存於 `build/discovery-0.9.0-preview-real.json`、`…-preview-ai.json`、`…-preview-comic.json` 及 `…-rank-real.json`、`…-new-real.json`。探針會在第一頁後刻意等待背景準備窗口；正式 App 的第一頁不做這個等待。
+
+### 模擬器操作
+
+- 在外螢幕橫向，以 loopback 合成服務讓 QA 2 首次試看詳情成功，中央按鈕暫停在約 54%（24 秒片，約 13 秒）。下一次詳情刻意回傳 503；按「追這部」顯示原地「重試／關閉」，按重試後正式播放器從第 1 集約 13 秒接續，隨後可用中央按鈕暫停。合成服務核對同劇 `200 → 503 → 200`，見 `build/qa-0.9.0-fixture/ui-retry-state.json`。
+- 再次讓同劇失敗後換到 QA 3，舊錯誤及重試入口消失。帳號／來源／背景變動、進度選擇期間紀錄更新、非暫時錯誤及取消舊 caller 的競態另由正式 model 測試核對。
+- 恢復內建來源後，實際滑動及輔助換頁進入後續候選；看到《墨痕》的「真人近 7 天上新」文字、中央播放控制與動態影片。來源標示與片名、第一集提示分開，影片維持原畫布，不額外留下控制黑帶。這次沒有重做所有姿態、VoiceOver 或大型字級的布局驗收。
+
+模擬器已恢復內建播放與首頁，合成服務停止。合成片無音軌，不代表聲音驗收；本輪沒有宣稱首幀、資料用量、推薦準確度或耗電改善，也未重新驗證真人帳號同步。
+
+### 手機部署
+
+build 22 已覆蓋安裝，App 清單讀回 0.9.0／22。首次查詢遇到短暫開發連線斷線，重新確認通道後讀回成功；啟動請求由 iOS 明確以 Locked 拒絕，目前等待使用者解鎖。安裝與版號不作為真機互動或啟動成功的證據。
+
+本機記錄為 `build/ios-real-device-0.9.0-build22-install.json`、`…-app.json`、`…-details.json`、`…-app-recheck.json` 及 `…-launch.json`，裝置及簽署識別只保留本機。
 
 ## 0.8.2 推薦與播放細節
 

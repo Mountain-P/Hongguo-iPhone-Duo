@@ -2,7 +2,9 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.8.2／build 21。最終完整回歸為 **Core 339 項／42 個 suites，338 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 69 項／6 個 suites，全部通過**。合計登錄 408 項，407 通過、1 略過，記錄於 `build/core-0.8.2-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、推薦 feed model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+當前程式版本為 0.9.0／build 22。最終完整回歸為 **Core 351 項／43 個 suites，350 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 81 項／6 個 suites，全部通過**。合計登錄 432 項，431 通過、1 略過，記錄於 `build/core-0.9.0-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、推薦 feed model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+
+0.9.0 新增 24 項測試：擴源 Core 12 項驗證首頁不等待、同類映射、漫劇不取新劇、去重與 metadata 不污染、容量／provenance 上限、主來源耗盡、逾時與取消不等待不合作 worker、重載晚回覆拒絕、取消傳至副來源及 delegate 契約。正式 retry 10 項驗證原 snapshot、最新詳情與紀錄、choice 變動重讀、人工多次重試、拒絕非暫時錯誤、scope 失效、舊 callback／已取消 caller 不影響新工作及 model 釋放。推薦來源 2 項核對 label 與理由分離、排除後清理及晚到 provenance 不能污染新來源。
 
 0.8.2 新增 32 項測試：續播等價規則 7 項、正式 launcher 4 項、有效試看計時 9 項、推薦 queue 6 項及正式推薦 model 6 項。等價規則測兩秒含邊界、超界、98% 完成狀態、原始集與末集重播；計時測有效 wall time、暫停／背景、短片門檻、未知時長、倍速與 seek 不加時間、保留卡重入、採樣缺口與只回報一次。Queue 與 model 測保留分頁 token、最新排除、相鄰替代、其他媒體 UUID 與 lease 不變、遲到詳情／分頁／預取拒絕、空列讀第二頁及明確重新載入。
 
