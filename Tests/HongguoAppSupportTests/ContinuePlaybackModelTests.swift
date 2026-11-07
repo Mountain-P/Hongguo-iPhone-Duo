@@ -250,6 +250,72 @@ struct ContinuePlaybackModelTests {
         }
     }
 
+    @Test func sameEpisodePositionsWithinTwoSecondsLaunchThePreviewPositionWithoutAnIdenticalChoice() async throws {
+        for (saved, position, needsChoice) in [(20.1, 20.2, false), (20.0, 22.0, false),
+                                               (22.0, 20.0, false), (20.0, 22.000_001, true)] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record(seconds: saved))
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: position)))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            if needsChoice {
+                #expect(launcher.pendingChoice != nil && launcher.route == nil && box.factories == 0)
+            } else {
+                #expect(launcher.pendingChoice == nil && launcher.route?.continuation.seconds == position)
+                #expect(launcher.route?.continuation.episode.id == "900" && box.factories == 1)
+            }
+        }
+    }
+
+    @Test func tinyResolvedDifferencesDoNotHideCompletionAdvancementOrFinalReplayIntent() async throws {
+        let cases: [(WatchRecord, PreviewPlaybackSnapshot)] = [
+            (record(seconds: 88.1), preview(position: 88.3)),
+            (record(seconds: 90), preview(episodeID: "902", position: 0)),
+            (record(id: "902", number: 3, seconds: 90), preview(episodeID: "902", position: 1)),
+            (record(id: "902", number: 3, seconds: 1), preview(episodeID: "902", position: 90))
+        ]
+        for (saved, snapshot) in cases {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: saved)
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(snapshot))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            #expect(launcher.pendingChoice != nil && launcher.route == nil && box.factories == 0)
+        }
+    }
+
+    @Test func nearPositionComparisonUsesTheLatestRecordAfterDetailRatherThanTheButtonTime() async throws {
+        for latestIsNear in [false, true] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel()
+            let box = ContinueBox(record: record(seconds: latestIsNear ? 50 : 20))
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 21)))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); box.record = record(seconds: latestIsNear ? 20 : 50)
+            await service.release("100", detail: detail()); await operation.value
+            if latestIsNear {
+                #expect(launcher.pendingChoice == nil && launcher.route?.continuation.seconds == 21)
+            } else {
+                #expect(launcher.route == nil && launcher.pendingChoice?.saved.seconds == 50)
+            }
+        }
+    }
+
+    @Test func nearPositionFastPathStillRejectsCancelledOrChangedContextsBeforePresenting() async throws {
+        for change in 0..<5 {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record(seconds: 20))
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 20.1)))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1)
+            switch change {
+            case 0: box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+            case 1: box.context = .init(owner: .guest, revision: UUID(), sceneActive: true)
+            case 2: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: false)
+            case 3: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: true, parentActive: false)
+            default: launcher.cancelPending()
+            }
+            await service.release("100", detail: detail()); await operation.value
+            #expect(launcher.route == nil && launcher.pendingChoice == nil && box.factories == 0)
+        }
+    }
+
     private func preview(episodeID: String = "900", position: Double = 20) -> PreviewPlaybackSnapshot {
         .init(seriesID: "100", episodeID: episodeID, position: position, duration: 90)
     }

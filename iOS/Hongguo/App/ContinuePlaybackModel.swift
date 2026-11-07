@@ -113,7 +113,7 @@ final class ContinuePlaybackModel: ObservableObject {
                     if let record, record.series.id == series.id,
                        detail.episodes.contains(where: { $0.id == record.episode.id && $0.isAvailable }),
                        let saved = PlaybackContinuation.preferred(seriesID: series.id, episodes: detail.episodes, record: record),
-                       saved != preview {
+                       !PreviewPlaybackEquivalence.canContinueWithoutChoice(snapshot: snapshot, record: record, detail: detail) {
                         self.pendingPreview = .init(request: request, context: value, detail: detail, service: service,
                             snapshot: snapshot, record: record, currentContext: currentContext,
                             latestRecord: latestRecord, progressFactory: progressFactory)
