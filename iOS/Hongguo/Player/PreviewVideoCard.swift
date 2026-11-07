@@ -17,17 +17,20 @@ struct RecommendationPreviewMediaCard: View {
     var onToggleFavorite: (() -> Void)? = nil
     var onPreviewStarted: (() -> Void)? = nil
     var recommendationTitle: String? = nil
+    var recommendationReason: String? = nil
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
-    let onOpenSeries: () -> Void
+    var onViewDetails: (() -> Void)? = nil
+    let onOpenSeries: (PreviewPlaybackSnapshot) -> Void
 
     var body: some View {
         PreviewVideoContent(series: series, episode: episode, service: service,
                             isActive: isActive, retainsFrame: retainsFrame,
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
                             onToggleFavorite: onToggleFavorite, onPreviewStarted: onPreviewStarted,
-                            recommendationTitle: recommendationTitle, onShowPreferences: onShowPreferences,
-                            onNotInterested: onNotInterested, onOpenSeries: onOpenSeries)
+                            recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
+                            onShowPreferences: onShowPreferences,
+                            onNotInterested: onNotInterested, onViewDetails: onViewDetails, onOpenSeries: onOpenSeries)
             .id(Identity(seriesID: series.id, episodeID: episode.id))
     }
 
@@ -50,9 +53,11 @@ private struct PreviewVideoContent: View {
     let onToggleFavorite: (() -> Void)?
     let onPreviewStarted: (() -> Void)?
     let recommendationTitle: String?
+    let recommendationReason: String?
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
-    let onOpenSeries: () -> Void
+    let onViewDetails: (() -> Void)?
+    let onOpenSeries: (PreviewPlaybackSnapshot) -> Void
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
     @State private var boostStarted = false
@@ -65,8 +70,9 @@ private struct PreviewVideoContent: View {
 
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
-         onToggleFavorite: (() -> Void)?, onPreviewStarted: (() -> Void)?, recommendationTitle: String?,
-         onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onOpenSeries: @escaping () -> Void) {
+         onToggleFavorite: (() -> Void)?, onPreviewStarted: (() -> Void)?, recommendationTitle: String?, recommendationReason: String?,
+         onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
+         onOpenSeries: @escaping (PreviewPlaybackSnapshot) -> Void) {
         self.isActive = isActive
         self.retainsFrame = retainsFrame
         self.allowsInteraction = allowsInteraction
@@ -74,8 +80,10 @@ private struct PreviewVideoContent: View {
         self.onToggleFavorite = onToggleFavorite
         self.onPreviewStarted = onPreviewStarted
         self.recommendationTitle = recommendationTitle
+        self.recommendationReason = recommendationReason
         self.onShowPreferences = onShowPreferences
         self.onNotInterested = onNotInterested
+        self.onViewDetails = onViewDetails
         self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: [episode],
             initialEpisodeID: episode.id, resumeSeconds: 0, service: service,
@@ -116,6 +124,9 @@ private struct PreviewVideoContent: View {
                         footer
                     }
                     .padding(region.height < 400 ? 12 : 20)
+                    .opacity(controlsVisible || !isActive ? 1 : 0)
+                    .allowsHitTesting(controlsVisible || !isActive)
+                    .accessibilityHidden(!controlsVisible && isActive)
                 }
                 .frame(width: region.width, height: region.height)
                 .clipped()
@@ -143,20 +154,22 @@ private struct PreviewVideoContent: View {
             onTap: {
                 guard allowsInteraction, isActive, !boostStarted,
                       Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
-                togglePlayback()
+                toggleControlsVisibility()
             }, onHoldBegan: {
                 guard allowsInteraction, isActive, !boostStarted,
                       scenePhase == .active, !model.isLoading,
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
-                hideTask?.cancel()
+                revealControls()
                 model.beginSpeedBoost()
             }, onHoldEnded: { endBoost() })
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("第 1 集試看影片")
             .accessibilityAddTraits(.isButton)
+            .accessibilityAction { revealControls() }
+            .accessibilityAction(named: Text("顯示播放控制"), revealControls)
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放"), togglePlayback)
-            .accessibilityAction(named: Text("看整部"), openSeries)
+            .accessibilityAction(named: Text("追這部"), openSeries)
             .accessibilityHidden(!isActive)
     }
 
@@ -200,7 +213,23 @@ private struct PreviewVideoContent: View {
         VStack(spacing: 14) {
             HStack(alignment: .bottom, spacing: 16) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(model.series.title).font(.headline).lineLimit(2)
+                    if let recommendationReason {
+                        Text(recommendationReason).font(.caption2).lineLimit(2)
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                    if let onViewDetails {
+                        Button {
+                            guard allowsInteraction, scenePhase == .active else { return }
+                            deactivate()
+                            onViewDetails()
+                        } label: {
+                            Text(model.series.title).font(.headline).lineLimit(2)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看\(model.series.title)劇集詳情")
+                    } else {
+                        Text(model.series.title).font(.headline).lineLimit(2)
+                    }
                     Text("第 1 集試看 · 上滑看下一部").font(.caption)
                         .foregroundStyle(.white.opacity(0.8))
                 }
@@ -219,7 +248,7 @@ private struct PreviewVideoContent: View {
                         .accessibilityIdentifier("preview.favorite"), in: Circle())
                 }
                 glass(Button(action: openSeries) {
-                    Label("看整部", systemImage: "play.rectangle")
+                    Label("追這部", systemImage: "play.rectangle")
                         .font(.subheadline.weight(.semibold)).fixedSize()
                         .padding(.horizontal, 16).frame(minHeight: 46)
                 }.buttonStyle(.plain).accessibilityIdentifier("preview.openSeries"), in: Capsule())
@@ -343,9 +372,11 @@ private struct PreviewVideoContent: View {
     }
 
     private func openSeries() {
-        guard allowsInteraction, scenePhase == .active else { return }
+        guard allowsInteraction, scenePhase == .active, let episode = model.currentEpisode else { return }
+        let snapshot = PreviewPlaybackSnapshot(seriesID: model.series.id, episodeID: episode.id,
+            position: model.elapsed, duration: model.duration)
         deactivate()
-        onOpenSeries()
+        onOpenSeries(snapshot)
     }
 
     private func cancelBoost(reveal: Bool = true) {
@@ -362,6 +393,17 @@ private struct PreviewVideoContent: View {
     private func revealControls() {
         hideTask?.cancel()
         controlsVisible = true
+        scheduleAutoHide()
+    }
+
+    private func toggleControlsVisibility() {
+        hideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
+        if controlsVisible { scheduleAutoHide() }
+    }
+
+    private func scheduleAutoHide() {
+        hideTask?.cancel()
         guard isActive, scenePhase == .active, model.isPlaying,
               !model.isBuffering, model.errorMessage == nil,
               !boostStarted, !voiceOverEnabled else { return }

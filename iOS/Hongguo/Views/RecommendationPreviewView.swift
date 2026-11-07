@@ -50,6 +50,7 @@ struct RecommendationPreviewView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var preview = RecommendationPreviewModel()
     @StateObject private var networkPolicy = PreviewNetworkPolicy()
+    @StateObject private var playback = ContinuePlaybackModel()
     @State private var scrollID: String?
     @State private var frames: [String: CGFloat] = [:]
     @State private var viewportHeight: CGFloat = 1
@@ -67,11 +68,19 @@ struct RecommendationPreviewView: View {
     private struct Activation: Hashable {
         let revision: UUID
         let preferences: UUID
+        let scope: LibraryScope
         let active: Bool
     }
 
+    private var playbackContext: ContinuePlaybackContext {
+        .init(owner: model.selectedLibraryOwner, revision: model.revision,
+              sceneActive: scenePhase == .active && UIApplication.shared.applicationState == .active,
+              parentActive: isActive && tabIsActive && isVisible && detailSeries == nil && !showingPreferences)
+    }
+
     var body: some View {
-        let activation = Activation(revision: model.revision, preferences: model.recommendationFilterRevision, active: isActive)
+        let activation = Activation(revision: model.revision, preferences: model.recommendationFilterRevision,
+                                    scope: model.recommendationScope, active: isActive)
         return GeometryReader { geometry in
             Group {
                 if preview.items.isEmpty {
@@ -110,12 +119,15 @@ struct RecommendationPreviewView: View {
                 refreshEligibility()
             }
         }
+        .allowsHitTesting(playback.pendingChoice == nil && playback.route == nil && playback.preparingSeriesID == nil)
+        .accessibilityHidden(playback.preparingSeriesID != nil || playback.pendingChoice != nil || playback.route != nil)
         .clipped().background(Color.black).foregroundStyle(.white)
         .navigationTitle("推薦試看").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
         .task(id: activation) {
             guard !Task.isCancelled, activation.revision == model.revision,
                   activation.preferences == model.recommendationFilterRevision,
+                  activation.scope == model.recommendationScope,
                   activation.active == isActive, activation.active else { return }
             tabIsActive = true
             activateSource()
@@ -126,14 +138,15 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onDisappear {
-            isVisible = false
+            // Our own player cover hides the feed too; keep that presentation alive.
+            if playback.route == nil { isVisible = false; playback.cancelPending() }
             fallbackSettle?.cancel(); fallbackSettle = nil
             preview.suspend()
         }
         .onChange(of: isActive) { _, active in
             tabIsActive = active
             if active { activateSource() }
-            else { preview.suspend() }
+            else { preview.suspend(); playback.dismiss() }
             refreshEligibility()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -145,6 +158,10 @@ struct RecommendationPreviewView: View {
             resetFeed()
         }
         .onChange(of: model.recommendationFilterRevision) { _, _ in resetFeed() }
+        .onChange(of: model.recommendationScope) { _, _ in resetFeed() }
+        .onChange(of: model.recommendationProfile) { _, profile in
+            preview.updateRankingProfile(profile, scope: model.recommendationScope)
+        }
         .onChange(of: model.recommendationPreferences.previewedIDs) { _, _ in
             preview.updatePreferences(model.recommendationPreferences)
         }
@@ -160,11 +177,11 @@ struct RecommendationPreviewView: View {
         }
         .onChange(of: scrollID) { _, _ in refreshEligibility() }
         .onChange(of: detailSeries) { _, detail in
-            if detail != nil { preview.suspend() }
+            if detail != nil { requiresManualResume = true; preview.suspend(); playback.cancelPending() }
             refreshEligibility()
         }
         .onChange(of: showingPreferences) { _, presented in
-            if presented { requiresManualResume = true; preview.suspend() }
+            if presented { requiresManualResume = true; preview.suspend(); playback.cancelPending() }
             refreshEligibility()
         }
         .sheet(isPresented: $showingPreferences) {
@@ -173,6 +190,21 @@ struct RecommendationPreviewView: View {
         .navigationDestination(item: $detailSeries) { series in
             DetailView(series: series).toolbar(.visible, for: .navigationBar)
         }
+        .onChange(of: playback.route?.id) { _, routeID in
+            if routeID != nil { requiresManualResume = true; preview.suspend() }
+            refreshEligibility()
+        }
+        .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
+        .overlay(alignment: .bottom) {
+            if let message = playback.errorMessage {
+                HStack(alignment: .top, spacing: 12) {
+                    Text(message).font(.footnote)
+                    Button("關閉") { playback.cancelPending() }
+                }
+                .padding(16).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14)).padding(18)
+            }
+        }
+        .continuePlaybackPresentation(playback, context: playbackContext)
     }
 
     private var emptyFeed: some View {
@@ -193,9 +225,10 @@ struct RecommendationPreviewView: View {
     }
 
     private func feedCard(_ series: Series) -> some View {
-        let canRetainFrame = isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && intersectsViewport(series.id)
+        let canRetainFrame = isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && playback.route == nil && intersectsViewport(series.id)
         let allowsInteraction = alignedID == series.id && isVisible && tabIsActive
             && scenePhase == .active && detailSeries == nil && !showingPreferences && phaseIsIdle
+            && playback.preparingSeriesID == nil && playback.pendingChoice == nil && playback.route == nil
         return ZStack {
             Poster(series: series, contentMode: .fit).allowsHitTesting(false)
             if let media = preview.media[series.id] {
@@ -209,9 +242,11 @@ struct RecommendationPreviewView: View {
                         preview.didStartPreview(seriesID: series.id)
                     },
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
+                    recommendationReason: recommendationReason(for: series.id),
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { model.setNotInterested(series, value: true) },
-                    onOpenSeries: { openEntireSeries(media.series) })
+                    onViewDetails: { openEntireSeries(media.series) },
+                    onOpenSeries: { snapshot in startFollowing(media.series, snapshot: snapshot) })
                     .id(media.id)
             } else {
                 posterInformation(series)
@@ -254,9 +289,12 @@ struct RecommendationPreviewView: View {
                 Button("重試第一集") { preview.retry(seriesID: series.id) }.buttonStyle(.bordered)
             }
             Text(series.title).font(.title3.weight(.semibold)).lineLimit(3)
+            if let reason = recommendationReason(for: series.id) {
+                Text(reason).font(.caption).foregroundStyle(.white.opacity(0.8)).lineLimit(2)
+            }
             Text("第 1 集試看 · 上滑看下一部").font(.subheadline).foregroundStyle(.white.opacity(0.8))
             HStack {
-                Button("看整部") { openEntireSeries(series) }.buttonStyle(.borderedProminent).tint(Theme.accent)
+                Button("劇集詳情") { openEntireSeries(series) }.buttonStyle(.borderedProminent).tint(Theme.accent)
                 Button {
                     model.toggleFavorite(series)
                 } label: {
@@ -278,6 +316,12 @@ struct RecommendationPreviewView: View {
 
     private var effectivePlaybackAllowed: Bool {
         isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && !requiresManualResume && phaseIsIdle
+            && playback.route == nil && playback.pendingChoice == nil && playback.preparingSeriesID == nil
+    }
+
+    private func recommendationReason(for seriesID: String) -> String? {
+        guard preview.rankingScope == model.recommendationScope else { return nil }
+        return preview.reasonByID[seriesID]
     }
 
     private var alignedID: String? {
@@ -297,17 +341,21 @@ struct RecommendationPreviewView: View {
 
     private func activateSource() {
         guard tabIsActive else { return }
-        if preview.revision != model.revision || preview.filterRevision != model.recommendationFilterRevision {
+        if preview.revision != model.revision || preview.filterRevision != model.recommendationFilterRevision
+            || preview.rankingScope != model.recommendationScope {
             do {
                 preview.configure(revision: model.revision, filterRevision: model.recommendationFilterRevision,
-                    preferences: model.recommendationPreferences, catalogue: try model.previewCatalogService(), playback: try model.playbackService())
+                    preferences: model.recommendationPreferences, profile: model.recommendationProfile, scope: model.recommendationScope,
+                    catalogue: try model.previewCatalogService(), playback: try model.playbackService())
             } catch { preview.configureFailure(error, revision: model.revision) }
         }
+        preview.updateRankingProfile(model.recommendationProfile, scope: model.recommendationScope)
         preview.loadInitial()
         preview.setPrefetchAllowed(model.playbackMode == .native && networkPolicy.allowsPrefetch)
     }
 
     private func resetFeed() {
+        playback.dismiss()
         fallbackSettle?.cancel(); fallbackSettle = nil
         scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil
         requiresManualResume = showingPreferences
@@ -317,6 +365,7 @@ struct RecommendationPreviewView: View {
 
     private func refreshEligibility() {
         let sourceMatches = preview.revision == model.revision && preview.filterRevision == model.recommendationFilterRevision
+            && preview.rankingScope == model.recommendationScope
         let aligned = alignedID
         let commandHasArrived = pendingScrollTarget == nil || pendingScrollTarget == aligned
         #if DEBUG
@@ -330,7 +379,8 @@ struct RecommendationPreviewView: View {
         #endif
         if commandHasArrived { pendingScrollTarget = nil }
         preview.update(selectedID: commandHasArrived ? aligned : nil, isIdle: phaseIsIdle,
-            isActive: isVisible && tabIsActive && sourceMatches && !showingPreferences && !requiresManualResume,
+            isActive: isVisible && tabIsActive && sourceMatches && !showingPreferences && !requiresManualResume
+                && playback.route == nil && playback.pendingChoice == nil && playback.preparingSeriesID == nil,
             isSceneActive: scenePhase == .active, isDetailPresented: detailSeries != nil)
     }
 
@@ -400,12 +450,64 @@ struct RecommendationPreviewView: View {
         preview.suspend()
         detailSeries = series
     }
+
+    private func startFollowing(_ series: Series, snapshot: PreviewPlaybackSnapshot) {
+        guard playbackContext.permitsStart, alignedID == series.id, phaseIsIdle,
+              snapshot.seriesID == series.id, playback.route == nil,
+              playback.preparingSeriesID == nil, playback.pendingChoice == nil else { return }
+        requiresManualResume = true; preview.suspend()
+        do {
+            playback.start(series: series, selection: .preview(snapshot), context: playbackContext,
+                service: try model.playbackService(), currentContext: { playbackContext },
+                latestRecord: { model.record(for: series) },
+                progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
+        } catch { playback.fail(error, seriesID: series.id) }
+    }
+
+    private func continuationChoice(_ choice: ContinuePlaybackChoice) -> some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 18) {
+                Text("選擇播放位置").font(.headline)
+                Text("這部劇已有正式觀看進度，請選擇這次要從哪裡開始。")
+                    .font(.subheadline).multilineTextAlignment(.center)
+                Button {
+                    playback.choose(.saved, choiceID: choice.id)
+                } label: {
+                    VStack(spacing: 4) {
+                        Text("接續原進度").fontWeight(.semibold)
+                        Text(positionLabel(choice.saved)).font(.caption)
+                    }.frame(maxWidth: .infinity, minHeight: 48)
+                }.buttonStyle(.borderedProminent).tint(Theme.accent)
+                Button {
+                    playback.choose(.preview, choiceID: choice.id)
+                } label: {
+                    VStack(spacing: 4) {
+                        Text("從試看位置看").fontWeight(.semibold)
+                        Text(positionLabel(choice.preview)).font(.caption)
+                    }.frame(maxWidth: .infinity, minHeight: 48)
+                }.buttonStyle(.bordered)
+                Button("取消") { playback.cancelPending() }.frame(minHeight: 44)
+            }
+            .padding(24).frame(maxWidth: 380)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22))
+            .padding(24)
+        }
+    }
+
+    private func positionLabel(_ continuation: PlaybackContinuation) -> String {
+        let seconds = continuation.seconds.isFinite ? Int(min(max(continuation.seconds, 0), 86_400)) : 0
+        return "第 \(continuation.episode.number) 集 · \(seconds / 60):\(String(format: "%02d", seconds % 60))"
+    }
 }
 
 @MainActor
 private final class RecommendationPreviewModel: ObservableObject {
     @Published private(set) var queue = RecommendationPreviewQueue()
     @Published private(set) var media: [String: RecommendationFeedMedia] = [:]
+    @Published private(set) var reasonByID: [String: String] = [:]
+    private(set) var rankingScope: LibraryScope?
+    private var rankingProfile: PersonalizedRecommendationProfile?
     @Published private(set) var lease: RecommendationFeedActivation.Lease?
     @Published private(set) var loadingID: String?
     @Published private(set) var detailErrors: [String: String] = [:]
@@ -432,13 +534,31 @@ private final class RecommendationPreviewModel: ObservableObject {
     var current: Series? { queue.current }
 
     func configure(revision: UUID, filterRevision: UUID, preferences: RecommendationPreferences,
+                   profile: PersonalizedRecommendationProfile, scope: LibraryScope,
                    catalogue: any CatalogService, playback: any CatalogService) {
         invalidateSource()
         self.revision = revision; self.filterRevision = filterRevision; self.preferences = preferences
+        rankingScope = scope; rankingProfile = profile
         self.catalogue = catalogue; self.playback = playback
     }
 
     func updatePreferences(_ preferences: RecommendationPreferences) { self.preferences = preferences }
+
+    func updateRankingProfile(_ profile: PersonalizedRecommendationProfile, scope: LibraryScope) {
+        guard rankingScope == scope, rankingProfile != profile else { return }
+        rankingProfile = profile
+        refreshReasons()
+    }
+
+    private func refreshReasons() {
+        guard let rankingScope, let rankingProfile else { reasonByID = [:]; return }
+        var reasons: [String: String] = [:]
+        for item in PersonalizedRecommendation.rank(queue.items, using: rankingProfile, scope: rankingScope) {
+            if let reason = item.reason { reasons[item.series.id] = reason.displayText }
+        }
+        // Updating explanations never changes the queue's current card or source pagination.
+        reasonByID = reasons
+    }
 
     func configureFailure(_ error: any Error, revision: UUID) {
         invalidateSource(); self.revision = revision; pageError = error.localizedDescription
@@ -447,6 +567,7 @@ private final class RecommendationPreviewModel: ObservableObject {
     func invalidateSource() {
         suspend(); queue.reset(); media = [:]; recentMediaIDs = []; detailErrors = [:]; startedPreviewIDs = []
         revision = nil; filterRevision = nil; catalogue = nil; playback = nil; pageError = nil
+        rankingScope = nil; rankingProfile = nil; reasonByID = [:]
     }
 
     func suspend() {
@@ -493,7 +614,8 @@ private final class RecommendationPreviewModel: ObservableObject {
     }
 
     private func loadPage() {
-        guard let catalogue, catalogueTask == nil, queue.hasMore else { return }
+        guard let catalogue, let profile = rankingProfile, let scope = rankingScope,
+              catalogueTask == nil, queue.hasMore else { return }
         let request = catalogueGeneration
         let previousTail = queue.items.last?.id
         isLoadingPage = true; pageError = nil
@@ -512,7 +634,10 @@ private final class RecommendationPreviewModel: ObservableObject {
                     let result = try await catalogue.home(page: pageRequest.page)
                     try Task.checkCancellation()
                     guard self.catalogueGeneration == request else { return }
-                    guard try self.queue.receive(result, for: pageRequest, preferences: self.preferences) else { throw CancellationError() }
+                    guard try self.queue.receive(result, for: pageRequest, preferences: self.preferences, ranking: {
+                        PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
+                    }) else { throw CancellationError() }
+                    self.refreshReasons()
                     self.pruneMedia()
                     if self.queue.items.last?.id != previousTail || !self.queue.hasMore { return }
                 }

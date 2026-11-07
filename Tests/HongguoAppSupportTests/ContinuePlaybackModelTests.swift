@@ -140,9 +140,123 @@ struct ContinuePlaybackModelTests {
         #expect(box.progressOwners == [.guest])
     }
 
+    @Test func followingAPreviewWithoutARecordOnlyCreatesTheFormalRouteAfterLatestDetail() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+        let operation = try #require(launcher.operation)
+        await service.waitForCalls(1)
+        #expect(launcher.route == nil && launcher.pendingChoice == nil && box.factories == 0)
+        await service.release("100", detail: detail()); await operation.value
+        #expect(launcher.route?.continuation.episode.id == "900" && launcher.route?.continuation.seconds == 20)
+        #expect(box.record == nil && box.factories == 1 && box.progressOwners.isEmpty)
+        #expect(await service.videoCalls == 0)
+    }
+
+    @Test func aDifferentFormalPositionRequiresAnExplicitChoiceUsingTheLatestRecord() async throws {
+        for selectSaved in [false, true] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record(seconds: 10))
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); box.record = record(id: "902", number: 3, seconds: 50)
+            await service.release("100", detail: detail()); await operation.value
+            let choice = try #require(launcher.pendingChoice)
+            #expect(launcher.route == nil && box.factories == 0 && launcher.preparingSeriesID == nil)
+            #expect(choice.saved.episode.id == "902" && choice.saved.seconds == 50)
+            #expect(choice.preview.episode.id == "900" && choice.preview.seconds == 20)
+            launcher.choose(selectSaved ? .saved : .preview, choiceID: choice.id)
+            #expect(launcher.pendingChoice == nil && box.factories == 1)
+            #expect(launcher.route?.continuation.seconds == (selectSaved ? 50 : 20))
+            #expect(launcher.route?.continuation.episode.id == (selectSaved ? "902" : "900"))
+        }
+    }
+
+    @Test func equalContinuationsNeedNoChoiceAndACompletedPreviewAdvances() async throws {
+        for completed in [false, true] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel()
+            let box = ContinueBox(record: completed ? nil : record(seconds: 20))
+            launch(launcher, service: service, box: box, requiresRecord: false,
+                   selection: .preview(preview(position: completed ? 90 : 20)))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            #expect(launcher.pendingChoice == nil)
+            #expect(launcher.route?.continuation.episode.id == (completed ? "902" : "900"))
+            #expect(launcher.route?.continuation.seconds == (completed ? 0 : 20))
+        }
+    }
+
+    @Test func aChangedOrDeletedRecordWhileChoosingCannotApplyAnOldDecision() async throws {
+        for removed in [false, true] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            let choice = try #require(launcher.pendingChoice)
+            box.record = removed ? nil : record(seconds: 55)
+            launcher.choose(.saved, choiceID: choice.id)
+            #expect(launcher.route == nil && launcher.pendingChoice == nil && box.factories == 0)
+            #expect(launcher.errorMessage != nil)
+        }
+    }
+
+    @Test func choiceAcceptanceRechecksOwnerSourceSceneParentAndCancellationEvenBeforeViewUpdates() async throws {
+        for change in 0..<5 {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            let choice = try #require(launcher.pendingChoice)
+            switch change {
+            case 0: box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+            case 1: box.context = .init(owner: .guest, revision: UUID(), sceneActive: true)
+            case 2: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: false)
+            case 3: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: true, parentActive: false)
+            default: launcher.cancelPending()
+            }
+            launcher.choose(.preview, choiceID: choice.id)
+            #expect(launcher.route == nil && launcher.pendingChoice == nil && box.factories == 0)
+        }
+    }
+
+    @Test func oldChoicesCannotSelectANewerRequestAndTheChosenProgressHandlerKeepsItsOriginalScope() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+        let first = try #require(launcher.operation)
+        await service.waitForCalls(1); await service.release("100", detail: detail()); await first.value
+        let oldChoice = try #require(launcher.pendingChoice)
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 40)))
+        let second = try #require(launcher.operation)
+        await service.waitForCalls(2); await service.release("100", detail: detail()); await second.value
+        let newChoice = try #require(launcher.pendingChoice)
+        launcher.choose(.preview, choiceID: oldChoice.id)
+        #expect(launcher.route == nil && launcher.pendingChoice?.id == newChoice.id)
+        launcher.choose(.preview, choiceID: newChoice.id)
+        let route = try #require(launcher.route)
+        #expect(route.continuation.seconds == 40)
+        box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+        launcher.updateContext(box.context)
+        route.onProgress(route.continuation.episode, 45, 90)
+        #expect(box.progressOwners == [.guest] && launcher.route == nil)
+    }
+
+    @Test func anUnavailableOrForeignPreviewCannotCreateAChoiceOrAFormalPlayer() async throws {
+        for snapshot in [preview(episodeID: "999"), preview(episodeID: "901"),
+                         PreviewPlaybackSnapshot(seriesID: "200", episodeID: "900", position: 20, duration: 90)] {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(snapshot))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.release("100", detail: detail()); await operation.value
+            #expect(launcher.route == nil && launcher.pendingChoice == nil && box.factories == 0)
+            #expect(launcher.errorMessage != nil)
+        }
+    }
+
+    private func preview(episodeID: String = "900", position: Double = 20) -> PreviewPlaybackSnapshot {
+        .init(seriesID: "100", episodeID: episodeID, position: position, duration: 90)
+    }
+
     private func launch(_ launcher: ContinuePlaybackModel, seriesID: String = "100", service: ContinueServiceProbe,
-                        box: ContinueBox, requiresRecord: Bool = true) {
-        launcher.start(series: .init(id: seriesID, title: "Fixture"), requiresRecord: requiresRecord, context: box.context,
+                        box: ContinueBox, requiresRecord: Bool = true, selection: ContinuePlaybackSelection = .preferred) {
+        launcher.start(series: .init(id: seriesID, title: "Fixture"), requiresRecord: requiresRecord, selection: selection, context: box.context,
             service: service, currentContext: { box.context }, latestRecord: { box.record }, progressFactory: { _ in
                 box.factories += 1
                 let capturedOwner = box.context.owner
