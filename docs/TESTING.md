@@ -24,9 +24,9 @@
 
 ### 手機部署
 
-build 22 已覆蓋安裝，App 清單讀回 0.9.0／22。首次查詢遇到短暫開發連線斷線，重新確認通道後讀回成功；啟動請求由 iOS 明確以 Locked 拒絕，目前等待使用者解鎖。安裝與版號不作為真機互動或啟動成功的證據。
+build 22 已覆蓋安裝，App 清單讀回 0.9.0／22。首次查詢遇到短暫開發連線斷線，重新確認通道後讀回成功；初次啟動由 iOS 以 Locked 拒絕。2026-11-07 使用者解鎖後重新啟動成功，程序查詢確認同一個 Hongguo 程序持續執行，App 清單再次讀回 0.9.0／22。106 份 App 原碼雜湊均與兩平台建置驗證清單相符。這是版本、啟動與程序證據；推薦來源標示及原地重試的互動驗證仍以上述模擬器記錄為準，未追加真人帳號操作或真機長播測試。
 
-本機記錄為 `build/ios-real-device-0.9.0-build22-install.json`、`…-app.json`、`…-details.json`、`…-app-recheck.json` 及 `…-launch.json`，裝置及簽署識別只保留本機。
+本機記錄為 `build/ios-real-device-0.9.0-build22-install.json`、`…-app.json`、`…-details.json`、`…-app-recheck.json` 及 `…-launch.json`；解鎖後為 `…-launch-unlocked.json`、`…-processes-unlocked.json` 與 `…-app-unlocked.json`。裝置及簽署識別只保留本機。
 
 ## 0.8.2 推薦與播放細節
 
