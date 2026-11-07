@@ -565,7 +565,7 @@ struct PlayerScreen: View {
 }
 
 @MainActor
-private struct NativePlayerSurface: UIViewRepresentable {
+struct NativePlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     let fillsScreen: Bool
 
@@ -591,7 +591,7 @@ private struct NativePlayerSurface: UIViewRepresentable {
 }
 
 @MainActor
-private final class PlayerLayerSurface: UIView {
+final class PlayerLayerSurface: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
@@ -601,7 +601,7 @@ private final class PlayerLayerSurface: UIView {
 
 
 /// Only the picture avoids active fold/camera regions. Native containers place all bars.
-private enum PlayerViewingRegion {
+enum PlayerViewingRegion {
     static func fit(_ rect: CGRect, aspect: CGFloat) -> CGRect {
         let width = max(0, min(rect.width, rect.height * aspect))
         let height = width / aspect

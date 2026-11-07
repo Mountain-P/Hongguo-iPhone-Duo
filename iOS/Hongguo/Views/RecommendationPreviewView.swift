@@ -1,14 +1,41 @@
 import SwiftUI
 import HongguoCore
 
-private struct RecommendationPreviewSelection: Identifiable {
+private struct RecommendationFeedMedia: Identifiable {
     let id = UUID()
     let series: Series
     let episode: Episode
     let service: any CatalogService
 }
 
-private struct RecommendationPreviewPresentation: Identifiable { let id = UUID() }
+private struct RecommendationFeedFrames: PreferenceKey {
+    static let defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+@MainActor
+private struct RecommendationFeedScrollPhase: ViewModifier {
+    let changed: (Bool, Bool) -> Void
+    let fallbackDrag: (Bool) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                // Tracking includes a stationary tap or long press on the card's controls.
+                // Revoke playback only once an actual scroll begins.
+                guard phase != .tracking else { return }
+                changed(phase == .idle, phase == .interacting)
+            }
+        } else {
+            content.simultaneousGesture(DragGesture(minimumDistance: 4)
+                .onChanged { _ in fallbackDrag(true) }
+                .onEnded { _ in fallbackDrag(false) })
+        }
+    }
+}
 
 @MainActor
 struct RecommendationPreviewView: View {
@@ -16,10 +43,16 @@ struct RecommendationPreviewView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var preview = RecommendationPreviewModel()
-    @State private var presentation: RecommendationPreviewPresentation?
-    @State private var pendingSeries: Series?
+    @State private var scrollID: String?
+    @State private var frames: [String: CGFloat] = [:]
+    @State private var viewportHeight: CGFloat = 1
+    @State private var phaseIsIdle = true
+    @State private var fallbackDragging = false
+    @State private var fallbackSettle: Task<Void, Never>?
+    @State private var tabIsActive = false
+    @State private var isVisible = false
+    @State private var requiresManualResume = false
     @State private var detailSeries: Series?
-    @State private var hasStarted = false
 
     private struct Activation: Hashable {
         let revision: UUID
@@ -28,282 +61,405 @@ struct RecommendationPreviewView: View {
 
     var body: some View {
         let activation = Activation(revision: model.revision, active: isActive)
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                Text("先看第一集，再決定追哪部").font(.title2.weight(.bold))
-                Text("從目前目錄逐部試看。上滑換下一部，喜歡時點「看整部」，進入詳情與選集。")
-                    .font(.subheadline).foregroundStyle(Theme.muted)
-                if let series = preview.current {
-                    HStack(alignment: .top, spacing: 18) {
-                        Poster(series: series, contentMode: .fit)
-                            .frame(width: 112, height: 160)
-                            .clipShape(RoundedRectangle(cornerRadius: 10)).allowsHitTesting(false)
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(series.title).font(.headline)
-                            if !series.badge.isEmpty { Text(series.badge).font(.caption).foregroundStyle(Theme.muted) }
-                            Text("第 1 集試看").font(.subheadline).foregroundStyle(Theme.accent)
+        return GeometryReader { geometry in
+            Group {
+                if preview.items.isEmpty {
+                    emptyFeed
+                } else {
+                    ScrollView(.vertical) {
+                        LazyVStack(spacing: 0) {
+                            ForEach(preview.items) { series in
+                                feedCard(series)
+                                    .frame(width: max(geometry.size.width, 1), height: max(geometry.size.height, 1))
+                                    .clipped()
+                                    .background {
+                                        GeometryReader { card in
+                                            Color.clear.preference(key: RecommendationFeedFrames.self,
+                                                value: [series.id: card.frame(in: .named("recommendationFeed")).minY])
+                                        }
+                                    }
+                                    .id(series.id)
+                            }
                         }
+                        .scrollTargetLayout()
                     }
+                    .coordinateSpace(name: "recommendationFeed")
+                    .scrollTargetBehavior(.paging)
+                    .scrollPosition(id: $scrollID, anchor: .top)
+                    .scrollIndicators(.hidden)
+                    .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged))
+                    .onPreferenceChange(RecommendationFeedFrames.self, perform: framesChanged)
                 }
-                Button(hasStarted ? "繼續試看" : "開始試看") { openPreview() }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
-                    .frame(maxWidth: .infinity)
-                if let error = preview.error {
-                    Text(error).font(.footnote).foregroundStyle(Theme.muted)
-                }
-                Text("試看不寫入觀看紀錄，也不改變原有續播位置。每部只播放第 1 集，播完會暫停。")
-                    .font(.footnote).foregroundStyle(Theme.muted)
             }
-            .padding(20)
+            .onAppear { viewportHeight = max(geometry.size.height, 1) }
+            .onChange(of: geometry.size.height) { _, height in
+                viewportHeight = max(height, 1)
+                refreshEligibility()
+            }
         }
-        .background(Theme.background).foregroundStyle(.white)
+        .clipped().background(Color.black).foregroundStyle(.white)
         .navigationTitle("推薦試看").navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
-        .task(id: activation) { activate(activation) }
-        .onChange(of: isActive) { _, active in
-            if !active { closePreview(); pendingSeries = nil }
+        .toolbar(.hidden, for: .navigationBar)
+        .task(id: activation) {
+            guard !Task.isCancelled, activation.revision == model.revision,
+                  activation.active == isActive, activation.active else { return }
+            tabIsActive = true
+            activateSource()
         }
-        .onChange(of: model.revision) { _, _ in
-            closePreview(); pendingSeries = nil
-            preview.invalidateSource()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active, isActive, !hasStarted { openPreview() }
+        .onAppear {
+            isVisible = true; tabIsActive = isActive; phaseIsIdle = true
+            if tabIsActive { activateSource() }
+            refreshEligibility()
         }
         .onDisappear {
-            guard presentation == nil else { return }
-            preview.cancel()
-            model.isImmersivePlayback = false
+            isVisible = false
+            fallbackSettle?.cancel(); fallbackSettle = nil
+            preview.suspend()
+        }
+        .onChange(of: isActive) { _, active in
+            tabIsActive = active
+            if active { activateSource() }
+            else { preview.suspend() }
+            refreshEligibility()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { preview.suspend() }
+            else if tabIsActive, isVisible { preview.loadInitial() }
+            refreshEligibility()
+        }
+        .onChange(of: model.revision) { _, _ in
+            fallbackSettle?.cancel(); fallbackSettle = nil
+            scrollID = nil; frames = [:]; requiresManualResume = false
+            preview.invalidateSource()
+            if tabIsActive { activateSource() }
+        }
+        .onChange(of: preview.items.map(\.id)) { _, ids in
+            if scrollID == nil || !ids.contains(scrollID ?? "") { scrollID = preview.current?.id ?? ids.first }
+            refreshEligibility()
+        }
+        .onChange(of: scrollID) { _, _ in refreshEligibility() }
+        .onChange(of: detailSeries) { _, detail in
+            if detail != nil { preview.suspend() }
+            refreshEligibility()
         }
         .navigationDestination(item: $detailSeries) { series in
             DetailView(series: series).toolbar(.visible, for: .navigationBar)
         }
-        .fullScreenCover(item: $presentation, onDismiss: finishDismissal) { _ in
-            RecommendationPreviewPlayer(preview: preview, onClose: closePreview, onOpenSeries: openEntireSeries)
+    }
+
+    private var emptyFeed: some View {
+        VStack(spacing: 18) {
+            if preview.isLoadingPage {
+                ProgressView("正在載入試看片單…").tint(.white)
+            } else {
+                Text("推薦試看").font(.title2.weight(.semibold))
+                Text(preview.pageError ?? "目前沒有可試看的劇集。")
+                    .font(.subheadline).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
+                Button("重新載入") { activateSource(); preview.loadInitial() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(28).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func feedCard(_ series: Series) -> some View {
+        let canRetainFrame = isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && intersectsViewport(series.id)
+        let allowsInteraction = alignedID == series.id && isVisible && tabIsActive
+            && scenePhase == .active && detailSeries == nil && phaseIsIdle
+        return ZStack {
+            Poster(series: series, contentMode: .fit).allowsHitTesting(false)
+            if let media = preview.media[series.id] {
+                RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
+                    isActive: preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
+                    retainsFrame: canRetainFrame, allowsInteraction: allowsInteraction,
+                    onOpenSeries: { openEntireSeries(media.series) })
+                    .id(media.id)
+            } else {
+                posterInformation(series)
+            }
+            if requiresManualResume, alignedID == series.id {
+                Button {
+                    requiresManualResume = false
+                    refreshEligibility()
+                } label: {
+                    Label("繼續試看", systemImage: "play.fill")
+                        .font(.headline).padding(.horizontal, 22).padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent).tint(Theme.accent)
+            }
+            if series.id == preview.items.last?.id {
+                VStack {
+                    if preview.isLoadingPage {
+                        ProgressView("正在載入更多劇集…").font(.caption).padding(10).background(.ultraThinMaterial, in: Capsule())
+                    } else if let error = preview.pageError {
+                        VStack(spacing: 8) {
+                            Text(error).font(.caption).multilineTextAlignment(.center)
+                            Button("重試載入更多") { preview.loadMoreIfNeeded(force: true) }.font(.caption.weight(.semibold))
+                        }.padding(12).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    Spacer()
+                }.padding(.top, 18).padding(.horizontal, 24)
+            }
+        }
+        .background(Color.black).contentShape(Rectangle())
+        .accessibilityAction(named: Text("下一部試看")) { scroll(by: 1, from: series.id) }
+        .accessibilityAction(named: Text("上一部試看")) { scroll(by: -1, from: series.id) }
+    }
+
+    private func posterInformation(_ series: Series) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Spacer()
+            if preview.loadingID == series.id { ProgressView("正在準備第 1 集…").tint(.white) }
+            if let error = preview.detailErrors[series.id] {
+                Text(error).font(.footnote)
+                Button("重試第一集") { preview.retry(seriesID: series.id) }.buttonStyle(.bordered)
+            }
+            Text(series.title).font(.title3.weight(.semibold)).lineLimit(3)
+            Text("第 1 集試看 · 上滑看下一部").font(.subheadline).foregroundStyle(.white.opacity(0.8))
+            Button("看整部") { openEntireSeries(series) }.buttonStyle(.borderedProminent).tint(Theme.accent)
+        }
+        .padding(24).frame(maxWidth: .infinity, alignment: .leading)
+        .background(alignment: .bottom) {
+            LinearGradient(colors: [.clear, .black.opacity(0.9)], startPoint: .center, endPoint: .bottom).allowsHitTesting(false)
         }
     }
 
-    private func activate(_ activation: Activation) {
-        guard !Task.isCancelled, activation.revision == model.revision, activation.active == isActive, isActive else { return }
-        configureSource()
-        if !hasStarted, scenePhase == .active { openPreview() }
+    private var effectivePlaybackAllowed: Bool {
+        isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !requiresManualResume && phaseIsIdle
     }
 
-    private func configureSource() {
-        guard preview.revision != model.revision else { return }
-        do {
-            preview.configure(revision: model.revision, catalogue: try model.catalogService(), playback: try model.playbackService())
-        } catch { preview.configureFailure(error, revision: model.revision) }
+    private var alignedID: String? {
+        let known = Set(preview.items.map(\.id))
+        guard let closest = frames.filter({ known.contains($0.key) }).min(by: { abs($0.value) < abs($1.value) }),
+              abs(closest.value) <= 2 else { return nil }
+        return closest.key
     }
 
-    private func openPreview() {
-        guard isActive, scenePhase == .active, presentation == nil else { return }
-        configureSource()
-        hasStarted = true
-        presentation = RecommendationPreviewPresentation()
-        model.isImmersivePlayback = true
-        preview.start()
+    private func intersectsViewport(_ id: String) -> Bool {
+        guard let top = frames[id] else { return false }
+        return top > -viewportHeight && top < viewportHeight
     }
 
-    private func closePreview() {
-        preview.cancel()
-        presentation = nil
-        model.isImmersivePlayback = false
+    private func activateSource() {
+        guard tabIsActive else { return }
+        if preview.revision != model.revision {
+            do {
+                preview.configure(revision: model.revision, catalogue: try model.catalogService(), playback: try model.playbackService())
+            } catch { preview.configureFailure(error, revision: model.revision) }
+        }
+        preview.loadInitial()
+    }
+
+    private func refreshEligibility() {
+        let sourceMatches = preview.revision == model.revision
+        preview.update(selectedID: alignedID, isIdle: phaseIsIdle,
+            isActive: isVisible && tabIsActive && sourceMatches && !requiresManualResume,
+            isSceneActive: scenePhase == .active, isDetailPresented: detailSeries != nil)
+    }
+
+    private func phaseChanged(_ idle: Bool, _ userInitiated: Bool) {
+        phaseIsIdle = idle
+        if userInitiated, detailSeries == nil { requiresManualResume = false }
+        refreshEligibility()
+    }
+
+    private func framesChanged(_ next: [String: CGFloat]) {
+        frames = next
+        if #available(iOS 18.0, *) { refreshEligibility() }
+        else { scheduleFallbackSettle() }
+    }
+
+    private func fallbackDragChanged(_ dragging: Bool) {
+        fallbackDragging = dragging
+        if dragging {
+            fallbackSettle?.cancel(); phaseIsIdle = false
+            if detailSeries == nil { requiresManualResume = false }
+            refreshEligibility()
+        } else { scheduleFallbackSettle() }
+    }
+
+    private func scheduleFallbackSettle() {
+        fallbackSettle?.cancel()
+        phaseIsIdle = false
+        refreshEligibility()
+        guard !fallbackDragging else { return }
+        fallbackSettle = Task {
+            do { try await Task.sleep(for: .milliseconds(450)) } catch { return }
+            guard !Task.isCancelled, !fallbackDragging, alignedID != nil else { return }
+            phaseIsIdle = true
+            refreshEligibility()
+        }
+    }
+
+    private func scroll(by offset: Int, from id: String) {
+        guard let index = preview.items.firstIndex(where: { $0.id == id }),
+              preview.items.indices.contains(index + offset) else {
+            preview.loadMoreIfNeeded(force: true)
+            return
+        }
+        requiresManualResume = false
+        phaseIsIdle = false
+        refreshEligibility()
+        withAnimation { scrollID = preview.items[index + offset].id }
     }
 
     private func openEntireSeries(_ series: Series) {
-        pendingSeries = series
-        closePreview()
+        requiresManualResume = true
+        preview.suspend()
+        detailSeries = series
     }
-
-    private func finishDismissal() {
-        preview.cancel()
-        model.isImmersivePlayback = false
-        if let pendingSeries, isActive {
-            self.pendingSeries = nil
-            detailSeries = pendingSeries
-        }
-    }
-}
-
-@MainActor
-private struct RecommendationPreviewPlayer: View {
-    @ObservedObject var preview: RecommendationPreviewModel
-    let onClose: () -> Void
-    let onOpenSeries: (Series) -> Void
-
-    var body: some View {
-        Group {
-            if let selection = preview.selection {
-                PlayerScreen(series: selection.series, episodes: [selection.episode],
-                             initialEpisodeID: selection.episode.id, resumeSeconds: 0,
-                             service: selection.service, onProgress: { _, _, _ in },
-                             onClose: onClose, onSeriesSwipe: { preview.move(by: $0) },
-                             isPreview: true, onOpenSeries: { onOpenSeries(selection.series) })
-                    .id(selection.id)
-            } else {
-                previewStatus
-            }
-        }
-        .preferredColorScheme(.dark)
-    }
-
-    private var previewStatus: some View {
-        NavigationStack {
-            VStack(spacing: 22) {
-                Spacer()
-                if let series = preview.current {
-                    Poster(series: series, contentMode: .fit)
-                        .frame(width: 140, height: 200)
-                        .clipShape(RoundedRectangle(cornerRadius: 12)).allowsHitTesting(false)
-                    Text(series.title).font(.title3.weight(.semibold)).multilineTextAlignment(.center)
-                }
-                if preview.isLoading {
-                    ProgressView(preview.status).tint(.white)
-                } else {
-                    Text(preview.error ?? "目前沒有可試看的劇集。")
-                        .font(.subheadline).foregroundStyle(Theme.muted).multilineTextAlignment(.center)
-                    Button("再試一次") { preview.start() }.buttonStyle(.bordered)
-                }
-                HStack(spacing: 22) {
-                    Button("上一部") { preview.move(by: -1) }.disabled(!preview.hasPrevious)
-                    Button("下一部") { preview.move(by: 1) }.disabled(!preview.canAdvance)
-                }
-                .buttonStyle(.bordered).controlSize(.large)
-                Text("上滑看下一部 · 第 1 集試看").font(.footnote).foregroundStyle(Theme.muted)
-                Spacer()
-            }
-            .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .gesture(DragGesture(minimumDistance: 30).onEnded { value in
-                guard abs(value.translation.height) > 80,
-                      abs(value.translation.height) > abs(value.translation.width) * 1.4 else { return }
-                preview.move(by: value.translation.height < 0 ? 1 : -1)
-            })
-            .background(Theme.background).foregroundStyle(.white)
-            .navigationTitle("推薦試看").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("關閉", action: onClose) }
-                if let series = preview.current {
-                    ToolbarItem(placement: .primaryAction) { Button("看整部") { onOpenSeries(series) } }
-                }
-            }
-        }
-    }
-
 }
 
 @MainActor
 private final class RecommendationPreviewModel: ObservableObject {
     @Published private(set) var queue = RecommendationPreviewQueue()
-    @Published private(set) var selection: RecommendationPreviewSelection?
-    @Published private(set) var isLoading = false
-    @Published private(set) var status = "正在載入試看片單…"
-    @Published private(set) var error: String?
+    @Published private(set) var media: [String: RecommendationFeedMedia] = [:]
+    @Published private(set) var lease: RecommendationFeedActivation.Lease?
+    @Published private(set) var loadingID: String?
+    @Published private(set) var detailErrors: [String: String] = [:]
+    @Published private(set) var isLoadingPage = false
+    @Published private(set) var pageError: String?
     private(set) var revision: UUID?
     private var catalogue: (any CatalogService)?
     private var playback: (any CatalogService)?
-    private var operation: Task<Void, Never>?
-    private var operationID = UUID()
+    private var activation = RecommendationFeedActivation()
+    private var catalogueGeneration = UUID()
+    private var catalogueTask: Task<Void, Never>?
+    private var detailTask: Task<Void, Never>?
+    private var detailGeneration = UUID()
+    private var recentMediaIDs: [String] = []
 
+    var items: [Series] { queue.items }
     var current: Series? { queue.current }
-    var hasPrevious: Bool { queue.hasPrevious }
-    var canAdvance: Bool { queue.hasNext || queue.hasMore }
 
     func configure(revision: UUID, catalogue: any CatalogService, playback: any CatalogService) {
-        cancel(); queue.reset()
-        error = nil
+        invalidateSource()
         self.revision = revision; self.catalogue = catalogue; self.playback = playback
     }
 
     func configureFailure(_ error: any Error, revision: UUID) {
-        invalidateSource()
-        self.revision = revision
-        self.error = error.localizedDescription
+        invalidateSource(); self.revision = revision; pageError = error.localizedDescription
     }
 
     func invalidateSource() {
-        cancel(); queue.reset()
-        revision = nil; catalogue = nil; playback = nil; error = nil
+        suspend(); queue.reset(); media = [:]; recentMediaIDs = []; detailErrors = [:]
+        revision = nil; catalogue = nil; playback = nil; pageError = nil
     }
 
-    func start() {
-        if queue.current == nil, !queue.hasMore { queue.reset() }
-        prepare(move: 0)
+    func suspend() {
+        activation.invalidate(); lease = nil
+        detailGeneration = UUID()
+        detailTask?.cancel(); detailTask = nil; loadingID = nil
+        catalogueGeneration = UUID(); catalogueTask?.cancel(); catalogueTask = nil
+        queue.cancelPageRequest(); isLoadingPage = false
     }
 
-    func move(by offset: Int) {
-        guard offset == 1 || offset == -1 else { return }
-        if offset < 0, !queue.hasPrevious { return }
-        prepare(move: offset)
+    func update(selectedID: String?, isIdle: Bool, isActive: Bool, isSceneActive: Bool, isDetailPresented: Bool) {
+        let validID = selectedID.flatMap { id in queue.items.contains(where: { $0.id == id }) ? id : nil }
+        let next = activation.update(selectedID: validID, isIdle: isIdle, isActive: isActive,
+                                     isSceneActive: isSceneActive, isDetailPresented: isDetailPresented)
+        guard next != lease else { return }
+        detailGeneration = UUID()
+        detailTask?.cancel(); detailTask = nil; loadingID = nil
+        lease = next
+        guard let next else { return }
+        queue.select(seriesID: next.seriesID)
+        prepare(next)
+        loadMoreIfNeeded()
     }
 
-    func cancel() {
-        operationID = UUID(); operation?.cancel(); operation = nil
-        queue.cancelPageRequest()
-        selection = nil; isLoading = false
+    func retry(seriesID: String) {
+        guard let lease, lease.seriesID == seriesID else { return }
+        detailTask?.cancel(); detailTask = nil
+        media.removeValue(forKey: seriesID); detailErrors.removeValue(forKey: seriesID)
+        prepare(lease)
     }
 
-    private func prepare(move offset: Int) {
-        guard let catalogue, let playback else {
-            error = error ?? CatalogError.invalidConfiguration.localizedDescription
-            return
-        }
-        let hadCurrent = queue.current != nil
-        cancel()
-        let request = operationID
-        error = nil; isLoading = true; status = "正在載入試看片單…"
-        operation = Task { [weak self] in
+    func loadInitial() {
+        guard items.isEmpty else { return }
+        if !queue.hasMore { queue.reset() }
+        loadPage()
+    }
+
+    func loadMoreIfNeeded(force: Bool = false) {
+        guard queue.hasMore, let index = queue.currentIndex,
+              force || index >= max(queue.items.count - 3, 0) else { return }
+        loadPage()
+    }
+
+    private func loadPage() {
+        guard let catalogue, catalogueTask == nil, queue.hasMore else { return }
+        let request = catalogueGeneration
+        let previousTail = queue.items.last?.id
+        isLoadingPage = true; pageError = nil
+        catalogueTask = Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.operationID == request { self.isLoading = false; self.operation = nil }
+                if self.catalogueGeneration == request { self.isLoadingPage = false; self.catalogueTask = nil }
             }
             do {
-                if self.queue.current == nil || (offset > 0 && !self.queue.hasNext) {
-                    try await self.loadPages(needsNext: hadCurrent && offset > 0, catalogue: catalogue, request: request)
+                for _ in 0..<3 {
+                    guard let pageRequest = self.queue.beginPageRequest() else { return }
+                    let result = try await catalogue.home(page: pageRequest.page)
+                    try Task.checkCancellation()
+                    guard self.catalogueGeneration == request else { return }
+                    guard try self.queue.receive(result, for: pageRequest) else { throw CancellationError() }
+                    self.pruneMedia()
+                    if self.queue.items.last?.id != previousTail || !self.queue.hasMore { return }
                 }
-                try self.check(request)
-                if hadCurrent, offset != 0, self.queue.move(by: offset) == nil {
-                    self.error = self.queue.hasMore ? "這一頁沒有新的劇集，請再滑一次或點下一部繼續找。" : "目前已到片單最後一部，可重新試看或稍後再來。"
-                    return
+                self.pageError = "這幾頁沒有新的劇集，可重試載入更多。"
+            } catch is CancellationError { return }
+            catch {
+                guard self.catalogueGeneration == request, !Task.isCancelled else { return }
+                self.queue.cancelPageRequest(); self.pageError = error.localizedDescription
+            }
+        }
+    }
+
+    private func prepare(_ lease: RecommendationFeedActivation.Lease) {
+        guard let playback else { return }
+        if media[lease.seriesID] != nil {
+            touch(lease.seriesID)
+            return
+        }
+        detailGeneration = UUID()
+        let request = detailGeneration
+        loadingID = lease.seriesID; detailErrors.removeValue(forKey: lease.seriesID)
+        detailTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.activation.accepts(lease), self.detailGeneration == request {
+                    self.loadingID = nil; self.detailTask = nil
                 }
-                guard let series = self.queue.current else {
-                    self.error = "目前沒有可試看的劇集，請稍後再試。"
-                    return
-                }
-                self.status = "正在準備第 1 集…"
+            }
+            do {
                 let detail: SeriesDetail
-                if let bridge = playback as? BridgeService { detail = try await bridge.verifiedDetail(id: series.id) }
-                else { detail = try await playback.detail(id: series.id) }
-                try self.check(request)
-                let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: series.id)
-                self.selection = RecommendationPreviewSelection(series: detail.series, episode: episode, service: playback)
-            } catch is CancellationError {
-                return
-            } catch {
-                if self.operationID == request, !Task.isCancelled { self.error = error.localizedDescription }
+                if let bridge = playback as? BridgeService { detail = try await bridge.verifiedDetail(id: lease.seriesID) }
+                else { detail = try await playback.detail(id: lease.seriesID) }
+                try Task.checkCancellation()
+                guard self.activation.accepts(lease), self.detailGeneration == request else { return }
+                let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: lease.seriesID)
+                self.media[lease.seriesID] = RecommendationFeedMedia(series: detail.series, episode: episode, service: playback)
+                self.touch(lease.seriesID)
+            } catch is CancellationError { return }
+            catch {
+                if self.activation.accepts(lease), self.detailGeneration == request, !Task.isCancelled {
+                    self.detailErrors[lease.seriesID] = error.localizedDescription
+                }
             }
         }
     }
 
-    private func loadPages(needsNext: Bool, catalogue: any CatalogService, request: UUID) async throws {
-        // At most three overlapping/empty pages per user swipe; no unbounded background scan.
-        for _ in 0..<3 {
-            if needsNext ? queue.hasNext : queue.current != nil { return }
-            guard let pageRequest = queue.beginPageRequest() else { return }
-            do {
-                let result = try await catalogue.home(page: pageRequest.page)
-                try check(request)
-                guard try queue.receive(result, for: pageRequest) else { throw CancellationError() }
-            } catch {
-                if operationID == request { queue.cancelPageRequest() }
-                throw error
-            }
-        }
+    private func touch(_ id: String) {
+        recentMediaIDs.removeAll { $0 == id }; recentMediaIDs.append(id)
+        while recentMediaIDs.count > 3 { media.removeValue(forKey: recentMediaIDs.removeFirst()) }
+        pruneMedia()
     }
 
-    private func check(_ request: UUID) throws {
-        try Task.checkCancellation()
-        guard operationID == request else { throw CancellationError() }
+    private func pruneMedia() {
+        let retained = Set(queue.items.map(\.id))
+        media = media.filter { retained.contains($0.key) }
+        recentMediaIDs.removeAll { !retained.contains($0) }
+        detailErrors = detailErrors.filter { retained.contains($0.key) }
     }
 }
