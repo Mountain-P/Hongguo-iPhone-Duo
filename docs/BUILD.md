@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.7.0／build 18，加入來源畫質／省流量偏好、海報縮圖與有界快取，以及首頁／片庫一鍵續播；保留音訊中斷與片尾銜接、更新失敗保留、分頁續讀、片庫管理與原生手機簡訊登入。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.8.0／build 19，加入依目前片庫排序的本機推薦、試看位置直接接續正式播放，以及空白點按顯隱／中央播放按鈕；保留畫質偏好、有界海報、片庫管理與原生手機簡訊登入。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
@@ -98,7 +98,7 @@ sh scripts/build-ios.sh archive
 
 工程採用 Apple 標準架構設定：Debug 的 `ONLY_ACTIVE_ARCH=YES`，Release 為 `NO`。這已修正指定 Duo 執行時 App 同時編譯 x86_64、套件卻只產生 arm64 module 的不一致；指定 Duo 的 CLI 與 Xcode Run 建置均已通過。參考 [Apple TN3117](https://developer.apple.com/documentation/technotes/tn3117-resolving-build-errors-for-apple-silicon)。
 
-Duo 的原生列使用 TabView／NavigationStack 與帶名稱、symbol 的 toolbar items。外螢幕與內螢幕橫向可使用側欄，內螢幕直向則使用上下列；位置由系統依姿態處理。播放器單點影片切換播放／暫停並顯示同步控制；控制列透明覆蓋影片，播放時可閒置隱藏，影片畫布保持不縮小。實作依據見 Apple [Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/) 與 [Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo)。
+Duo 的原生列使用 TabView／NavigationStack 與帶名稱、symbol 的 toolbar items。外螢幕與內螢幕橫向可使用側欄，內螢幕直向則使用上下列；位置由系統依姿態處理。播放器點影片空白處顯示／隱藏控制，使用中央按鈕播放／暫停；控制列透明覆蓋影片，播放時可閒置隱藏，影片畫布保持不縮小。實作依據見 Apple [Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/) 與 [Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo)。
 
 ## 區域網路測試
 

@@ -2,13 +2,17 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.7.0／build 18。最終完整回歸為 **Core 294 項／38 個 suites，293 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 50 項／5 個 suites，全部通過**。合計登錄 344 項，343 通過、1 略過，記錄於 `build/core-0.7.0-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+當前程式版本為 0.8.0／build 19。最終完整回歸為 **Core 317 項／40 個 suites，316 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 59 項／5 個 suites，全部通過**。合計登錄 376 項，375 通過、1 略過，記錄於 `build/core-0.8.0-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+
+0.8.0 新增本機推薦 16 項，驗證收藏與足夠保存位置的弱訊號、真實共同題材與簡繁正規化、泛型題材排除、穩定排序、探索／交錯、重複與上限、跨片庫拒用。試看位置政策新增 6 項，正式 launcher 新增 7 項，涵蓋最新詳情、位置選擇、紀錄改變／刪除、取消與舊選項、場景／帳號及原 scope handler。另增 queue 1 項與 CatalogModel 2 項，確認只排序新頁、目前卡片及游標不動、搜尋維持來源順序，以及網路回覆前片庫完成還原時會使用新快照。UI 點按行為由模擬器檢查，不以靜態字串測試取代操作。
+
+歷史 0.7.0／build 18 為 Core 294 項／38 個 suites（293 通過、1 略過）與 AppSupport 50 項／5 個 suites 全通過，合計登錄 344 項、343 通過、1 略過，記錄為 `build/core-0.7.0-validated-tests.log`。
 
 歷史 0.6.1／build 17 為 Core 286 項／37 個 suites（285 通過、1 略過）及 AppSupport 27 項／3 個 suites 全部通過，合計 313 項、312 通過、1 略過，記錄於 `build/core-0.6.1-tests.log`。
 
 0.7.0 增加 `NativePlaybackQualityTests` 7 項，以及既有 progressive suite 的 1 項畫質偏好首段隔離：驗證持久偏好、無效值預設、真正 bundled JS 入口／真實來源尺寸排序／單版本 fallback、取源與首段快取隔離及取消。簽章向量與 12 份 bundled JS hash 仍參與回歸；這些不是實網影片解碼或手機播放證據。
 
-`PosterImagePipelineTests` 14 項直接執行 ImageIO、正式 actor 與 URLSession delegate，涵蓋 EXIF 方向、縮圖與像素上限、LRU 位元組／項數上限、URL 及不同尺寸工作共用、取消單個／全部消費者、佇列名額回收、失敗後再試、HTTP 拒絕／長度與串流上限、憑據 header 清除，以及大圖解碼量測。`ContinuePlaybackModelTests` 9 項執行正式 launcher，涵蓋按鈕前不請求、最新進度、完成集跳過未開放集／末集重播、過期分集 ID、準備期間刪紀錄、取消及晚回覆、帳號／來源／前景／分頁有效性、錯誤與原 scope 進度 handler。UI 與真機結果分開驗收。
+`PosterImagePipelineTests` 14 項直接執行 ImageIO、正式 actor 與 URLSession delegate，涵蓋 EXIF 方向、縮圖與像素上限、LRU 位元組／項數上限、URL 及不同尺寸工作共用、取消單個／全部消費者、佇列名額回收、失敗後再試、HTTP 拒絕／長度與串流上限、憑據 header 清除，以及大圖解碼量測。`ContinuePlaybackModelTests` 在 0.7.0 新增的 9 項執行正式 launcher，涵蓋按鈕前不請求、最新進度、完成集跳過未開放集／末集重播、過期分集 ID、準備期間刪紀錄、取消及晚回覆、帳號／來源／前景／分頁有效性、錯誤與原 scope 進度 handler。UI 與真機結果分開驗收。
 
 ```sh
 swift test --disable-sandbox --disable-xctest --filter NativePlaybackQualityTests
@@ -45,7 +49,7 @@ Discovery 測試涵蓋公開分類與動態題材、四榜單 alias、inline／d
 
 PlaybackSpeed 共 15 項，涵蓋選定速度、暫時長按／放開、鎖定／解除、背景取消、手動選速、無效輸入、等待中的速率更新與等速回饋抑制，以及暫停／換集／錯誤重載的播放意圖。暫停時改速不應啟播，自動重載不能把先前的暫停改成播放。手勢命中、AVPlayer 的實際等待與 seek 時序仍由獨立 UI 驗收確認，結果見 [TESTING.md](TESTING.md)。
 
-PlaybackContinuation 共 7 項，驗證續播目標與進度判斷。RecommendationPreviewQueue 現為 10 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源與可播放的第 1 集；0.4.4 新增穩定 ID 任意選卡、未知 ID 不移動游標，以及裁除舊頁後保留目前 ID、不把失效位置錯認成其他劇集。
+PlaybackContinuation 共 7 項，驗證續播目標與進度判斷。RecommendationPreviewQueue 現為 11 項（包含 0.8.0 的新頁排序／目前卡片保護），驗證推薦片單的分頁、去重、有界容量、取消／替換來源與可播放的第 1 集；0.4.4 新增穩定 ID 任意選卡、未知 ID 不移動游標，以及裁除舊頁後保留目前 ID、不把失效位置錯認成其他劇集。
 
 0.5.0 額外驗證已取消的舊分頁 Task 不能佔用重設後片單；正常的新 Task 仍可要求第 1 頁。
 
