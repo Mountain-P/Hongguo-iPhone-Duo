@@ -1,5 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+/// Classifies a recognized double tap in the current video touch surface.
+/// Recognition, competing gestures and playback eligibility remain the caller's responsibility.
+public enum PlaybackDoubleTap {
+    public enum Side: Sendable, Equatable { case backward, forward }
+
+    /// The midpoint belongs to the right side. Coordinates outside the surface are rejected.
+    public static func side(x: Double, width: Double) -> Side? {
+        guard x.isFinite, width.isFinite, width > 0, x >= 0, x <= width else { return nil }
+        return x < width / 2 ? .backward : .forward
+    }
+
+    public static func seekOffset(side: Side) -> Double {
+        switch side {
+        case .backward: -10
+        case .forward: 10
+        }
+    }
+}
+
+/// Relative seeks accumulate from the last pending target instead of a stale player clock.
+public enum PlaybackRelativeSeek {
+    /// A supplied pending target is authoritative, including when the current clock is invalid.
+    /// An invalid pending target never falls back to the clock. Duration must be known and positive.
+    public static func target(current: Double, pendingTarget: Double?, offset: Double,
+                              duration: Double) -> Double? {
+        let origin = pendingTarget ?? current
+        guard origin.isFinite, offset.isFinite, duration.isFinite, duration > 0 else { return nil }
+        let requested = origin + offset
+        guard requested.isFinite else { return nil }
+        let target = min(max(requested, 0), duration)
+        return abs(target - origin) > 0.001 ? target : nil
+    }
+}
+
 /// One vertical gesture. The caller supplies translations from its original touch point.
 /// This type never changes an episode; only `end` can return a destination, once.
 public struct EpisodeSwipeState: Sendable, Equatable {

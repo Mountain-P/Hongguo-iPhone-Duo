@@ -105,6 +105,8 @@ private struct PreviewVideoContent: View {
     @State private var handoffFrame: PlaybackTransitionFrame?
     @State private var zoom = PreviewZoomState()
     @State private var fillsScreen = true
+    @State private var seekNotice: PlaybackDoubleTap.Side?
+    @State private var seekNoticeTask: Task<Void, Never>?
 
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, resumeSeconds: Double, handoffContext: PlaybackHandoffEligibility.Context?, allowsReadAhead: Bool,
@@ -204,6 +206,12 @@ private struct PreviewVideoContent: View {
                             .allowsHitTesting(false)
                     }
                 }
+                .overlay {
+                    if let seekNotice {
+                        PlaybackSeekNotice(side: seekNotice)
+                            .accessibilityIdentifier("preview.seekNotice")
+                    }
+                }
                 .clipped()
                 .position(x: region.midX, y: region.midY)
             }
@@ -223,38 +231,39 @@ private struct PreviewVideoContent: View {
             if wasActive, !active { reportPositionSnapshot(allowLeaving: true) }
             if active { clearHandoffFrame(reason: "active") }
             else if allowsInteraction { clearHandoffFrame(reason: "not_preparing") }
-            if !active { reportedPlaybackStarted = false }
+            if !active { reportedPlaybackStarted = false; clearSeekNotice() }
             synchronizeActivation(); updatePreviewQualification()
         }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
         .onChange(of: allowsInteraction) { _, allowed in
-            if !allowed { zoom.cancelPinch() }
+            if !allowed { zoom.cancelPinch(); clearSeekNotice() }
             if allowed { clearHandoffFrame(reason: "interaction") }
             else if let handoffFrame { traceTransition("retained_preparing", frame: handoffFrame) }
             updatePreviewQualification()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { zoom.cancelPinch(); clearHandoffFrame(reason: "scene") }
+            if phase != .active { zoom.cancelPinch(); clearSeekNotice(); clearHandoffFrame(reason: "scene") }
             synchronizeActivation(); updatePreviewQualification()
         }
         .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
         .onChange(of: model.isLoading) { _, loading in
-            if loading { firstFrameReady = false }
+            if loading { firstFrameReady = false; clearSeekNotice() }
             else { reportPositionSnapshot() }
             scheduleAutoHide(); updatePreviewQualification()
         }
         .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
         .onChange(of: model.duration) { _, _ in updatePreviewQualification() }
         .onChange(of: model.elapsed) { _, _ in reportPositionSnapshot() }
-        .onChange(of: model.errorMessage) { _, _ in revealControls(); updatePreviewQualification() }
+        .onChange(of: model.errorMessage) { _, _ in clearSeekNotice(); revealControls(); updatePreviewQualification() }
         .onChange(of: voiceOverEnabled) { _, enabled in
             if isExpanded, !enabled { hideControls() } else { revealControls() }
         }
         .onChange(of: isExpanded) { _, expanded in
             zoom.cancelPinch()
+            clearSeekNotice()
             if expanded, !voiceOverEnabled { hideControls() } else { revealControls() }
         }
-        .onDisappear { zoom.cancelPinch(); clearHandoffFrame(reason: "disappear"); deactivate() }
+        .onDisappear { zoom.cancelPinch(); clearSeekNotice(); clearHandoffFrame(reason: "disappear"); deactivate() }
     }
 
     private var informationVisible: Bool { controlsVisible || (!isExpanded && !isActive) }
@@ -265,11 +274,12 @@ private struct PreviewVideoContent: View {
                 guard allowsInteraction, isActive, !boostStarted, !zoom.isPinching,
                       Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
                 toggleControlsVisibility()
-            }, onHoldBegan: {
+            }, onDoubleTap: seekByDoubleTap, onHoldBegan: {
                 guard allowsInteraction, isActive, !boostStarted, !zoom.isPinching,
                       scenePhase == .active, !model.isLoading,
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
+                clearSeekNotice()
                 hideTask?.cancel()
                 model.beginSpeedBoost(feedback: true)
             }, onHoldEnded: { cancelled in
@@ -280,6 +290,7 @@ private struct PreviewVideoContent: View {
                 }
             }, onPinchBegan: {
                 guard allowsInteraction, isActive, scenePhase == .active else { return }
+                clearSeekNotice()
                 cancelBoost(reveal: false)
                 hideTask?.cancel()
                 zoom.beginPinch()
@@ -296,6 +307,8 @@ private struct PreviewVideoContent: View {
             .accessibilityAction { revealControls() }
             .accessibilityAction(named: Text("顯示播放控制"), revealControls)
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放"), togglePlayback)
+            .accessibilityAction(named: Text("後退十秒")) { seekByDoubleTap(.backward) }
+            .accessibilityAction(named: Text("前進十秒")) { seekByDoubleTap(.forward) }
             .accessibilityAction(named: Text("追這部"), openSeries)
             .accessibilityAction(named: Text("放大影片")) { changeZoom { $0.zoomIn() } }
             .accessibilityAction(named: Text("縮小影片")) { changeZoom { $0.zoomOut() } }
@@ -599,6 +612,7 @@ private struct PreviewVideoContent: View {
 
     private func pauseRetainingFrame() {
         guard PreviewPlaybackOwner.isOwner(ownerID) else { return }
+        clearSeekNotice()
         reportPositionSnapshot(allowLeaving: true)
         // With no decoded frame yet, cancellation is preferable to continuing
         // the initial network request while the user scrolls elsewhere.
@@ -614,6 +628,7 @@ private struct PreviewVideoContent: View {
 
     private func deactivate() {
         zoom.cancelPinch()
+        clearSeekNotice()
         if PreviewPlaybackOwner.isOwner(ownerID) { reportPositionSnapshot(allowLeaving: true) }
         reportedPlaybackStarted = false
         stopPreviewQualification()
@@ -632,6 +647,33 @@ private struct PreviewVideoContent: View {
         }
         model.togglePlayback()
         revealControls()
+    }
+
+    private func seekByDoubleTap(_ side: PlaybackDoubleTap.Side) {
+        guard allowsInteraction, isActive, scenePhase == .active,
+              PreviewPlaybackOwner.isOwner(ownerID), !suspendedForPaging,
+              !boostStarted, !zoom.isPinching, firstFrameReady, model.isInitialSeekComplete,
+              !model.isLoading, model.errorMessage == nil, model.duration > 0,
+              Date().timeIntervalSince(lastBoostEndAt) > 0.25,
+              model.skip(PlaybackDoubleTap.seekOffset(side: side), feedback: true) else { return }
+        seekNoticeTask?.cancel()
+        seekNotice = side
+        seekNoticeTask = Task { @MainActor in
+            do { try await Task.sleep(for: .milliseconds(800)) } catch { return }
+            guard !Task.isCancelled else { return }
+            seekNotice = nil
+        }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-playback-gesture-diagnostics") {
+            NSLog("PlaybackDoubleTap preview=1 direction=%@", side == .backward ? "backward" : "forward")
+        }
+        #endif
+    }
+
+    private func clearSeekNotice() {
+        seekNoticeTask?.cancel()
+        seekNoticeTask = nil
+        seekNotice = nil
     }
 
     private func openSeries() {
@@ -753,6 +795,7 @@ private struct PreviewVideoContent: View {
 private struct PreviewGestureSurface: UIViewRepresentable {
     let isEnabled: Bool
     let onTap: () -> Void
+    let onDoubleTap: (PlaybackDoubleTap.Side) -> Void
     let onHoldBegan: () -> Void
     let onHoldEnded: (_ cancelled: Bool) -> Void
     let onPinchBegan: () -> Void
@@ -771,14 +814,17 @@ private struct PreviewGestureSurface: UIViewRepresentable {
         view.onMultipleTouchesBegan = { [weak coordinator = context.coordinator] in coordinator?.multipleTouchesBegan() }
         view.onAllTouchesEnded = { [weak coordinator = context.coordinator] cancelled in coordinator?.allTouchesEnded(cancelled: cancelled) }
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
+        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
         let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
         let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.pinched(_:)))
         tap.numberOfTouchesRequired = 1
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.numberOfTouchesRequired = 1
         hold.numberOfTouchesRequired = 1
         hold.minimumPressDuration = 0.35
         hold.allowableMovement = 18
         context.coordinator.holdRecognizer = hold
-        for recognizer in [tap, hold, pinch] {
+        for recognizer in [tap, doubleTap, hold, pinch] {
             recognizer.delegate = context.coordinator
             recognizer.cancelsTouchesInView = false
             recognizer.delaysTouchesBegan = false
@@ -787,6 +833,9 @@ private struct PreviewGestureSurface: UIViewRepresentable {
         }
         tap.require(toFail: hold)
         tap.require(toFail: pinch)
+        tap.require(toFail: doubleTap)
+        doubleTap.require(toFail: hold)
+        doubleTap.require(toFail: pinch)
         return view
     }
 
@@ -828,6 +877,14 @@ private struct PreviewGestureSurface: UIViewRepresentable {
             guard recognizer.state == .ended, parent.isEnabled, !isHolding, !isPinching, !hasMultipleTouches,
                   ProcessInfo.processInfo.systemUptime - lastMultipleTouchEnd > 0.25 else { return }
             parent.onTap()
+        }
+
+        @objc func doubleTapped(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer.state == .ended, parent.isEnabled, !isHolding, !isPinching, !hasMultipleTouches,
+                  ProcessInfo.processInfo.systemUptime - lastMultipleTouchEnd > 0.25,
+                  let view, let side = PlaybackDoubleTap.side(x: Double(recognizer.location(in: view).x),
+                      width: Double(view.bounds.width)) else { return }
+            parent.onDoubleTap(side)
         }
 
         @objc func held(_ recognizer: UILongPressGestureRecognizer) {

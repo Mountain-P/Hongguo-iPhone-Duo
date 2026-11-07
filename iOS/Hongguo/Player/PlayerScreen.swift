@@ -27,6 +27,8 @@ struct PlayerScreen: View {
     @State private var hideTask: Task<Void, Never>?
     @State private var episodeNotice: String?
     @State private var episodeNoticeTask: Task<Void, Never>?
+    @State private var seekNotice: PlaybackDoubleTap.Side?
+    @State private var seekNoticeTask: Task<Void, Never>?
     @GestureState private var holdingBoost = false
     @State private var boostStarted = false
     @State private var boostCommitted = false
@@ -99,8 +101,12 @@ struct PlayerScreen: View {
                                 .position(x: region.midX, y: region.midY)
                                 .allowsHitTesting(false).accessibilityHidden(true)
                         }
-                        videoTouchSurface
+                        videoTouchSurface(width: geometry.size.width)
                             .frame(width: geometry.size.width, height: geometry.size.height)
+                        if let seekNotice {
+                            PlaybackSeekNotice(side: seekNotice)
+                                .accessibilityIdentifier("player.seekNotice")
+                        }
                     }
                     .frame(width: geometry.size.width, height: geometry.size.height)
                     .onContinuousHover(coordinateSpace: .global, perform: updateHover)
@@ -168,6 +174,7 @@ struct PlayerScreen: View {
         .onDisappear {
             hideTask?.cancel()
             episodeNoticeTask?.cancel()
+            clearSeekNotice()
             endBoostGesture()
             cancelEpisodeSwipe()
             discardTransitionFrame()
@@ -179,6 +186,7 @@ struct PlayerScreen: View {
             if phase != .active {
                 episodeNoticeTask?.cancel()
                 episodeNotice = nil
+                clearSeekNotice()
                 cancelEpisodeSwipe()
                 discardTransitionFrame()
                 cancelBoostGesture(); showControls()
@@ -192,17 +200,18 @@ struct PlayerScreen: View {
             if !canPause { Task { await appModel.flushLibrary() } }
         }
         .onChange(of: model.isLoading) { _, loading in
-            if loading { cancelBoostGesture(); cancelEpisodeSwipe(); surfaceReadyItem = nil }
+            if loading { clearSeekNotice(); cancelBoostGesture(); cancelEpisodeSwipe(); surfaceReadyItem = nil }
             finishTransitionIfReady()
             scheduleAutoHide()
         }
         .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
         .onChange(of: model.errorMessage) { _, message in
-            if message != nil { discardTransitionFrame() }
+            if message != nil { clearSeekNotice(); discardTransitionFrame() }
             showControls()
         }
         .onChange(of: model.currentEpisode?.id) { _, episodeID in
             if episodeID != transitionFrame?.episodeID { discardTransitionFrame() }
+            clearSeekNotice()
             cancelEpisodeSwipe()
         }
         .onChange(of: model.elapsed) { _, _ in finishTransitionIfReady() }
@@ -211,7 +220,7 @@ struct PlayerScreen: View {
             await Task.yield()
             if !episodeDragging { cancelEpisodeSwipe() }
         }
-        .onChange(of: showingEpisodes) { _, _ in showControls() }
+        .onChange(of: showingEpisodes) { _, _ in clearSeekNotice(); showControls() }
         .onChange(of: voiceOverEnabled) { _, _ in showControls() }
         .onChange(of: holdingBoost) { _, holding in
             if !holding {
@@ -373,7 +382,7 @@ struct PlayerScreen: View {
                 FinePlaybackScrubber(elapsed: model.elapsed, duration: model.duration,
                     disabled: model.isLoading || model.duration <= 0,
                     onEditingChanged: { editing, seconds in
-                        if editing { cancelBoostGesture(); cancelEpisodeSwipe() }
+                        if editing { clearSeekNotice(); cancelBoostGesture(); cancelEpisodeSwipe() }
                         isScrubbing = editing
                         scrubPosition = seconds
                         showControls()
@@ -393,19 +402,19 @@ struct PlayerScreen: View {
     }
 
     @ViewBuilder
-    private var videoTouchSurface: some View {
+    private func videoTouchSurface(width: CGFloat) -> some View {
         let touch = Color.clear
             .contentShape(Rectangle())
-            .onTapGesture {
-                guard !boostStarted, Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
-                toggleControlsVisibility()
-            }
+            .gesture(videoTapGesture(width: width))
             .simultaneousGesture(speedBoostGesture)
             .simultaneousGesture(verticalSwipeGesture)
+            .id(model.playbackItemIdentity)
             .accessibilityLabel("影片")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { showControls() }
             .accessibilityAction(named: Text("顯示播放控制")) { showControls() }
+            .accessibilityAction(named: Text("後退十秒")) { seekFromDoubleTap(.backward) }
+            .accessibilityAction(named: Text("前進十秒")) { seekFromDoubleTap(.forward) }
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放")) {
                 togglePlaybackFromUser()
             }
@@ -423,6 +432,49 @@ struct PlayerScreen: View {
                 .accessibilityAction(named: Text("下一部推薦")) { onSeriesSwipe?(1) }
                 .accessibilityAction(named: Text("上一部推薦")) { onSeriesSwipe?(-1) }
         } else { touch }
+    }
+
+    private func videoTapGesture(width: CGFloat) -> some Gesture {
+        SpatialTapGesture(count: 2)
+            .exclusively(before: SpatialTapGesture(count: 1))
+            .onEnded { result in
+                switch result {
+                case .first(let value):
+                    // Use this surface's geometry; Duo can change width.
+                    if let side = PlaybackDoubleTap.side(x: Double(value.location.x), width: Double(width)) {
+                        seekFromDoubleTap(side)
+                    }
+                case .second:
+                    guard !boostStarted, !holdingBoost, !episodeDragging,
+                          Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
+                    toggleControlsVisibility()
+                }
+            }
+    }
+
+    private func seekFromDoubleTap(_ side: PlaybackDoubleTap.Side) {
+        guard scenePhase == .active, !showingEpisodes, !isScrubbing, !episodeDragging,
+              !boostStarted, !holdingBoost, model.isInitialSeekComplete,
+              Date().timeIntervalSince(lastBoostEndAt) > 0.25,
+              model.skip(PlaybackDoubleTap.seekOffset(side: side), feedback: true) else { return }
+        seekNoticeTask?.cancel()
+        seekNotice = side
+        seekNoticeTask = Task { @MainActor in
+            do { try await Task.sleep(for: .milliseconds(800)) } catch { return }
+            guard !Task.isCancelled else { return }
+            seekNotice = nil
+        }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-playback-gesture-diagnostics") {
+            NSLog("PlaybackDoubleTap preview=0 direction=%@ controls=%d", side == .backward ? "backward" : "forward", controlsVisible ? 1 : 0)
+        }
+        #endif
+    }
+
+    private func clearSeekNotice() {
+        seekNoticeTask?.cancel()
+        seekNoticeTask = nil
+        seekNotice = nil
     }
 
     private var verticalSwipeGesture: some Gesture {
@@ -669,6 +721,7 @@ struct PlayerScreen: View {
                       !suppressBoostUntilRelease,
                       !model.isLoading, model.errorMessage == nil, model.duration > 0 else { return }
                 if !boostStarted {
+                    clearSeekNotice()
                     cancelEpisodeSwipe()
                     boostStarted = true
                     boostCommitted = false

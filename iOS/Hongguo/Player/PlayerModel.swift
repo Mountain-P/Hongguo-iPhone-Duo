@@ -240,6 +240,8 @@ final class PlayerModel: ObservableObject {
     private var transitionVideoOutput: AVPlayerItemVideoOutput?
     @Published private(set) var episodeTransitionFrame: PlaybackTransitionFrame?
     private var isSeeking = false
+    // AVPlayer's clock/periodic callbacks can lag behind an in-flight seek.
+    private var pendingSeekTarget: Double?
     private var pendingFormalActivation = false
     private let nextPrefetcher = NativePlaybackPrefetch()
     private var nextPrefetchState = EpisodePrefetchState()
@@ -328,14 +330,14 @@ final class PlayerModel: ObservableObject {
         beginLoad(episode, position: resumePosition, fresh: true, autoplay: true)
     }
 
-    func skip(_ seconds: Double, feedback: Bool = false) {
-        guard hasStarted, seconds.isFinite, !isLoading, errorMessage == nil else { return }
-        let current = player.currentTime().seconds
-        guard current.isFinite else { return }
-        let target = min(max(0, current + seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
-        guard target.isFinite, abs(target - current) > 0.001 else { return }
+    @discardableResult
+    func skip(_ seconds: Double, feedback: Bool = false) -> Bool {
+        guard hasStarted, sceneActive, !isLoading, errorMessage == nil,
+              let target = PlaybackRelativeSeek.target(current: player.currentTime().seconds,
+                  pendingTarget: pendingSeekTarget, offset: seconds, duration: duration) else { return false }
         seek(to: target)
         if feedback { PlaybackHaptics.emit(.skip) }
+        return true
     }
 
     func seek(to seconds: Double) {
@@ -344,12 +346,14 @@ final class PlayerModel: ObservableObject {
         let requestGeneration = generation
         let seekRequest = UUID(); seekGeneration = seekRequest
         isSeeking = true
+        pendingSeekTarget = target
         elapsed = target
         reachedEnd = false
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
                 self.isSeeking = false
+                self.pendingSeekTarget = nil
                 guard finished, self.playbackSpeed.wantsPlayback, self.sceneActive,
                       self.player.timeControlStatus == .paused else { return }
                 self.resumePlayback()
@@ -375,12 +379,14 @@ final class PlayerModel: ObservableObject {
         }
         playbackSpeed.requestPlayback()
         isSeeking = true
+        pendingSeekTarget = 0
         reachedEnd = false
         elapsed = 0
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
                 self.isSeeking = false
+                self.pendingSeekTarget = nil
                 guard finished else {
                     if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
                     self.finishDiagnostics(outcome: .failed)
@@ -741,6 +747,7 @@ final class PlayerModel: ObservableObject {
         bufferPolicy.reset()
         hasStarted = false
         isSeeking = false
+        pendingSeekTarget = nil
         preparingGeneration = nil
         isPlaying = false
         isBuffering = false
