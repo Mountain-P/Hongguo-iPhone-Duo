@@ -1,8 +1,12 @@
 # 建置與安裝
 
+## 0.10.0／build 26
+
+本版新增短期試看記憶、最後影格交接、換集拖曳提示與細調進度。`generate_project.py` 自動收錄新的 Swift 檔，公開專案仍不保存簽署 team；實機 team 僅由本機命令列提供。Core／AppSupport、Duo 模擬器、iPhoneOS 建置與手機安裝核對請見 [TESTING.md](TESTING.md)。
+
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.9.3／build 25，一般播放器加入上下滑換緊鄰分集；0.9.2 的獨立倍速提示、0.9.1 的換劇交接、試看候選、人工重試、影片滿版、畫質偏好與原生手機簡訊登入持續保留。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.10.0／build 26，一般播放器加入上下滑換緊鄰分集；0.9.2 的獨立倍速提示、0.9.1 的換劇交接、試看候選、人工重試、影片滿版、畫質偏好與原生手機簡訊登入持續保留。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。

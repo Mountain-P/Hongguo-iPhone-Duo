@@ -1,8 +1,14 @@
 # 內容核心驗證
 
+## 0.10.0 最終本機測試
+
+`swift test --disable-sandbox` 已通過：Core 395 項／45 suites 中 394 通過、1 項可選實網快照略過，AppSupport 95 項／6 suites 全通過；合計 489 通過、1 略過，無失敗，記錄 `build/core-0.10.0-final-tests.log`。原有 prefetch 取消測例已以可控 gate 取代固定 80ms 睡眠，避免 CI 排程導致誤報；取消、prepared 與請求順序的嚴格斷言保留，App／Core 原碼不變。
+
+新增 14 項 `PlaybackGesturePolicyTests`、10 項 `PreviewSessionTests` 與 6 項正式 `RecommendationPreviewModelTests`，涵蓋手勢最終位置／取消／單次提交、fine sensitivity 增量切換、片庫／來源／類型隔離、24h／8 scopes／24 cards／128 KiB、壞資料、最新第一集不吻合、真正 page 1 成功與失敗保留 current、雙重啟動合併、舊來源回呼及正式 history key 不變。位置還原不復用播放權限或 stream URL；畫面及手機驗證另見 [TESTING.md](TESTING.md)。
+
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.9.3／build 25。相鄰分集導覽新增 8 項邊界測試，`EpisodeSelectionTests` 與 `PlaybackSpeedTests` 共 30 項／2 個 suites 全部通過，記錄於 `build/core-0.9.3-navigation-speed-tests.log`。涵蓋未排序／稀疏分集、首末與單集邊界、未開放的緊鄰分集不能跳過、找不到或重複的當前 ID；原有選集定位規則及倍速狀態也參與此次檢查。AppSupport 未改；實際手勢及布局另由模擬器操作核對，結果見 [TESTING.md](TESTING.md)。
+0.9.3／build 25 的歷史驗證：相鄰分集導覽新增 8 項邊界測試，`EpisodeSelectionTests` 與 `PlaybackSpeedTests` 共 30 項／2 個 suites 全部通過，記錄於 `build/core-0.9.3-navigation-speed-tests.log`。涵蓋未排序／稀疏分集、首末與單集邊界、未開放的緊鄰分集不能跳過、找不到或重複的當前 ID；原有選集定位規則及倍速狀態也參與此次檢查。AppSupport 未改；實際手勢及布局另由模擬器操作核對，結果見 [TESTING.md](TESTING.md)。
 
 0.9.2／build 24 僅調整 App 的倍速提示與控制列顯示，未改 Core 或 AppSupport；當時 `PlaybackSpeedTests` 15 項全部通過，記錄於 `build/core-0.9.2-speed-tests.log`，沒有新增鏡像 UI 的單元測試。
 
