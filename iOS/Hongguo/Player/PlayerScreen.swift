@@ -357,14 +357,14 @@ struct PlayerScreen: View {
                 if model.isSpeedBoostLocked { model.unlockSpeedBoost() }
                 else { model.lockSpeedBoost() }
             }
-        if onSeriesSwipe != nil {
-            touch
-                .accessibilityAction(named: Text("下一部推薦")) { onSeriesSwipe?(1) }
-                .accessibilityAction(named: Text("上一部推薦")) { onSeriesSwipe?(-1) }
-        } else if !isPreview {
+        if !isPreview {
             touch
                 .accessibilityAction(named: Text("下一集")) { navigateEpisode(.next) }
                 .accessibilityAction(named: Text("上一集")) { navigateEpisode(.previous) }
+        } else if onSeriesSwipe != nil {
+            touch
+                .accessibilityAction(named: Text("下一部推薦")) { onSeriesSwipe?(1) }
+                .accessibilityAction(named: Text("上一部推薦")) { onSeriesSwipe?(-1) }
         } else { touch }
     }
 
@@ -374,8 +374,8 @@ struct PlayerScreen: View {
                   Date().timeIntervalSince(lastBoostEndAt) > 0.25,
                   abs(value.translation.height) > 90,
                   abs(value.translation.height) > abs(value.translation.width) * 1.2 else { return }
-            if let onSeriesSwipe { onSeriesSwipe(value.translation.height < 0 ? 1 : -1) }
-            else if !isPreview { navigateEpisode(value.translation.height < 0 ? .next : .previous) }
+            if !isPreview { navigateEpisode(value.translation.height < 0 ? .next : .previous) }
+            else { onSeriesSwipe?(value.translation.height < 0 ? 1 : -1) }
         }
     }
 
