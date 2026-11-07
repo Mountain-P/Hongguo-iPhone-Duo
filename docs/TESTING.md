@@ -18,7 +18,7 @@ Duo 模擬器與 iPhoneOS／arm64 Debug 均建置成功並通過嚴格簽章檢�
 
 以上不是實網長時間播放或真機耗電量測；0.6.0 的 297 集合成長播保留為該版歷史證據，沒有冒稱本版重新完成同樣長測。真耳機／來電及真人帳號重試仍待對應實機驗收。
 
-0.6.1／build 17 已經既有 `localNetwork` 通道覆蓋安裝至手機，App 清單讀回相同版號；最後的收藏作用域防護也已再次安裝並讀回。啟動兩次均因 iOS 鎖定狀態拒絕，已請使用者解鎖，尚不能宣稱本輪真機啟動驗收。初次記錄為 `build/ios-real-device-0.6.1-build17-install.json`、`build/ios-real-device-0.6.1-build17-app.json`、`build/ios-real-device-0.6.1-build17-launch-locked.json`；最終覆蓋與讀回為 `build/ios-real-device-0.6.1-build17-source-guard-install.json`、`build/ios-real-device-0.6.1-build17-source-guard-app.json`、`build/ios-real-device-0.6.1-build17-source-guard-launch.json`。96 個 App 原碼檔的雜湊與兩種平台產物版號核對保存於 `build/ios-0.6.1-build17-validation.json`。裝置、簽署識別及私人產物只保留本機。
+0.6.1／build 17 已經既有 `localNetwork` 通道覆蓋安裝至手機，App 清單讀回相同版號；最後的收藏作用域防護也已再次安裝並讀回。前兩次啟動因 iOS 鎖定狀態拒絕；2026-11-07 使用者解鎖後重新啟動成功，程序查詢確認同一個 Hongguo 程序仍在執行，版本再次讀回為 0.6.1／build 17，96 個 App 原碼雜湊與原驗證清單相符。這是部署、版本及啟動證據，未重新驗收本版真機手勢、播放、耳機／來電或帳號同步。初次記錄為 `build/ios-real-device-0.6.1-build17-install.json`、`build/ios-real-device-0.6.1-build17-app.json`、`build/ios-real-device-0.6.1-build17-launch-locked.json`；最終覆蓋與讀回為 `build/ios-real-device-0.6.1-build17-source-guard-install.json`、`build/ios-real-device-0.6.1-build17-source-guard-app.json`、`build/ios-real-device-0.6.1-build17-source-guard-launch.json`。解鎖後的成功證據為 `build/ios-real-device-0.6.1-build17-launch-unlocked.json`、`build/ios-real-device-0.6.1-build17-app-unlocked.json`、`build/ios-real-device-0.6.1-build17-processes-unlocked.json`；原碼與產物核對保存於 `build/ios-0.6.1-build17-validation.json`。裝置、簽署識別及私人產物只保留本機。
 
 ## 0.6.0 播放、搜尋與片庫整理
 
