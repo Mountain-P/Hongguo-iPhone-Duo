@@ -126,6 +126,23 @@ struct CatalogModelTests {
         #expect(search.items.map(\.id) == ["10", "20"])
     }
 
+    @Test func rankingReadsTheLibrarySnapshotAfterThePageArrives() async {
+        let service = CatalogPageProbe(pages: [
+            1: .init(items: [series("10"), series("20")], page: 1, hasMore: false)
+        ], suspendFirst: true)
+        let model = CatalogModel()
+        var libraryLoaded = false
+        let request = Task {
+            await model.load(service: service, ranking: { libraryLoaded ? Array($0.reversed()) : $0 })
+        }
+        await service.waitForRequest()
+        libraryLoaded = true
+        await service.release()
+        await request.value
+        #expect(model.items.map(\.id) == ["20", "10"])
+        #expect(await service.calls == [1])
+    }
+
     private func series(_ id: String) -> Series { .init(id: id, title: "合成劇集 \(id)") }
 }
 

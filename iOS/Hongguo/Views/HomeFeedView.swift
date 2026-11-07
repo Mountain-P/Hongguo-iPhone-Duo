@@ -268,14 +268,19 @@ struct HomeFeedView: View {
         guard !Task.isCancelled else { return }
         let key = loadKey
         let scope = model.recommendationScope
-        let profile = model.recommendationProfile
+        var profile = model.recommendationProfile
         let previousIDs = reset ? Set<String>() : Set(catalogue.items.map(\.id))
         if reset { recommendationReasons = [:]; reasonScope = scope }
         do {
             let service: any CatalogService = model.catalogSource == .website
                 ? NativeCatalogService(category: category) : try model.catalogService()
             await catalogue.load(service: service, reset: reset, ranking: {
-                PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
+                guard key == loadKey else { return [] }
+                // Initial library loading can finish while the catalogue is on
+                // the network. Use that current snapshot before publishing the
+                // new cards, without moving any existing cards later.
+                profile = model.recommendationProfile
+                return PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
             })
             if !Task.isCancelled, key == loadKey {
                 lastLoadKey = key

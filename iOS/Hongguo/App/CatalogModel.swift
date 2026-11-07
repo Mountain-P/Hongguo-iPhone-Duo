@@ -13,7 +13,7 @@ final class CatalogModel: ObservableObject {
     var hasLoadedPage: Bool { page > 0 }
 
     func load(service: any CatalogService, query: String? = nil, reset: Bool = false,
-              ranking: @Sendable ([Series]) -> [Series] = { $0 }) async {
+              ranking: @MainActor ([Series]) -> [Series] = { $0 }) async {
         guard !Task.isCancelled else { return }
         if reset {
             generation = UUID(); items = []; page = 0; hasMore = false; isLoading = false
