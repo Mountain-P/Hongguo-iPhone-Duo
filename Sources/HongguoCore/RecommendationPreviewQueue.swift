@@ -37,7 +37,7 @@ public struct RecommendationPreviewQueue: Sendable {
     }
 
     public mutating func beginPageRequest() -> PageRequest? {
-        guard pendingPage == nil, hasMore, page < Self.maximumPages else { return nil }
+        guard !Task.isCancelled, pendingPage == nil, hasMore, page < Self.maximumPages else { return nil }
         let request = PageRequest(page: page + 1, generation: generation)
         pendingPage = request
         return request

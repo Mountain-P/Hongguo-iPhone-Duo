@@ -47,6 +47,35 @@ struct RecommendationPreviewQueueTests {
         #expect(queue.items.map(\.id) == ["20", "40"])
     }
 
+    @Test func cancelledTaskCannotClaimAResetQueueOrBlockItsReplacement() async throws {
+        var initial = RecommendationPreviewQueue()
+        let oldPending = initial.beginPageRequest()
+        let oldRequest = try #require(oldPending)
+        initial.reset()
+        let cancelled = Task { [initial] in
+            var queue = initial
+            withUnsafeCurrentTask { $0?.cancel() }
+            #expect(Task.isCancelled)
+            #expect(queue.beginPageRequest() == nil)
+            return queue
+        }
+        let returnedQueue = await cancelled.value
+        #expect(!Task.isCancelled)
+        let replacement = Task { [returnedQueue] in
+            var queue = returnedQueue
+            let pending = queue.beginPageRequest()
+            let request = try #require(pending)
+            #expect(request.page == 1)
+            #expect(try !queue.receive(page(1, ["20"], more: false), for: oldRequest))
+            try queue.receive(page(1, ["30"], more: false), for: request)
+            return queue
+        }
+        let result = try await replacement.value
+        #expect(result.items.map(\.id) == ["30"])
+        #expect(result.page == 1)
+        #expect(!result.hasMore)
+    }
+
     @Test func malformedPagesCannotPartiallyReplaceCurrentQueue() throws {
         var queue = RecommendationPreviewQueue()
         try queue.receive(page(1, ["10"], more: true), for: queue.beginPageRequest()!)
