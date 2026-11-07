@@ -12,7 +12,8 @@ final class CatalogModel: ObservableObject {
     private var generation = UUID()
     var hasLoadedPage: Bool { page > 0 }
 
-    func load(service: any CatalogService, query: String? = nil, reset: Bool = false) async {
+    func load(service: any CatalogService, query: String? = nil, reset: Bool = false,
+              ranking: @Sendable ([Series]) -> [Series] = { $0 }) async {
         guard !Task.isCancelled else { return }
         if reset {
             generation = UUID(); items = []; page = 0; hasMore = false; isLoading = false
@@ -29,7 +30,10 @@ final class CatalogModel: ObservableObject {
             guard request == generation, !Task.isCancelled else { return }
             guard result.page == next else { throw CatalogError.malformedResponse }
             var known = Set(items.map(\.id))
-            items.append(contentsOf: result.items.filter { known.insert($0.id).inserted })
+            // Rank only new candidates, preserving every already displayed card
+            // and the source cursor. Search callers retain their source order.
+            let additions = result.items.filter { known.insert($0.id).inserted }
+            items.append(contentsOf: query == nil ? ranking(additions) : additions)
             page = next
             // Duplicate or empty pages can precede valid later pages. Keep the
             // explicit next-page action while respecting the source and cap.

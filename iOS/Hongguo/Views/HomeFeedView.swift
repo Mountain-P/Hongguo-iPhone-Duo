@@ -12,10 +12,17 @@ struct HomeFeedView: View {
     @State private var category: DirectWebService.Category = .realDrama
     @State private var scrollTargetID: String?
     @StateObject private var playback = ContinuePlaybackModel()
-    @State private var lastLoadKey = ""
+    private struct LoadKey: Hashable {
+        let revision: UUID
+        let category: DirectWebService.Category
+        let scope: LibraryScope
+    }
+    @State private var lastLoadKey: LoadKey?
     @State private var activeTab = true
+    @State private var recommendationReasons: [String: PersonalizedRecommendationReason] = [:]
+    @State private var reasonScope: LibraryScope?
 
-    private var loadKey: String { "\(model.revision):\(category.rawValue)" }
+    private var loadKey: LoadKey { .init(revision: model.revision, category: category, scope: model.recommendationScope) }
     private var route: ContinuePlaybackRoute? { playback.route }
     private var preparingID: String? { playback.preparingSeriesID }
     private var failure: String? { playback.errorMessage }
@@ -92,6 +99,11 @@ struct HomeFeedView: View {
             }
         }
         .onChange(of: model.revision) { _, _ in playback.dismiss() }
+        .onChange(of: model.recommendationScope) { _, _ in
+            recommendationReasons = [:]
+            reasonScope = nil
+            playback.dismiss()
+        }
         .onChange(of: route?.id) { _, _ in model.isImmersivePlayback = activeTab && route != nil }
         .onDisappear {
             // Presenting the player also hides this view. It must not cancel its own presentation.
@@ -189,6 +201,11 @@ struct HomeFeedView: View {
             }
             .clipped()
             .contentShape(Rectangle())
+            if let reason = recommendationReason(for: series) {
+                Text(reason).font(.caption2).foregroundStyle(Theme.accent)
+                    .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8).padding(.top, 6)
+            }
             if failureSeriesID == series.id, let failure, preparingID == nil {
                 Text(failure).font(.system(size: 10)).foregroundStyle(Theme.muted)
                     .padding(.horizontal, 8).padding(.top, 3)
@@ -235,14 +252,42 @@ struct HomeFeedView: View {
         if lastID == catalogue.items.last?.id, catalogue.hasMore { Task { await load() } }
     }
 
+    private func recommendationReason(for series: Series) -> String? {
+        guard reasonScope == model.recommendationScope, let reason = recommendationReasons[series.id] else { return nil }
+        // A removed favorite must stop being presented as current evidence.
+        switch reason.kind {
+        case .favorite:
+            guard model.favorites.contains(where: { $0.id == reason.sourceSeriesID }) else { return nil }
+        case .recentlyWatched:
+            guard model.history.contains(where: { $0.id == reason.sourceSeriesID && PersonalizedRecommendationProfile.hasSufficientPosition($0) }) else { return nil }
+        }
+        return reason.displayText
+    }
+
     private func load(reset: Bool = false) async {
+        guard !Task.isCancelled else { return }
         let key = loadKey
+        let scope = model.recommendationScope
+        let profile = model.recommendationProfile
+        let previousIDs = reset ? Set<String>() : Set(catalogue.items.map(\.id))
+        if reset { recommendationReasons = [:]; reasonScope = scope }
         do {
             let service: any CatalogService = model.catalogSource == .website
                 ? NativeCatalogService(category: category) : try model.catalogService()
-            await catalogue.load(service: service, reset: reset)
+            await catalogue.load(service: service, reset: reset, ranking: {
+                PersonalizedRecommendation.rank($0, using: profile, scope: scope).map(\.series)
+            })
             if !Task.isCancelled, key == loadKey {
                 lastLoadKey = key
+                reasonScope = scope
+                // Store the evidence used for this batch without reordering the
+                // already displayed grid as progress or favorites change.
+                let additions = catalogue.items.filter { !previousIDs.contains($0.id) }
+                for item in PersonalizedRecommendation.rank(additions, using: profile, scope: scope) {
+                    if recommendationReasons[item.series.id] == nil, let reason = item.reason {
+                        recommendationReasons[item.series.id] = reason
+                    }
+                }
                 if reset { scrollTargetID = nil }
             }
         } catch { catalogue.fail(error) }

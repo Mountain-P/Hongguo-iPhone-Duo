@@ -46,7 +46,8 @@ public struct RecommendationPreviewQueue: Sendable {
     /// False means the request was cancelled or belongs to a replaced source.
     @discardableResult
     public mutating func receive(_ result: SeriesPage, for request: PageRequest,
-                                 preferences: RecommendationPreferences? = nil) throws -> Bool {
+                                 preferences: RecommendationPreferences? = nil,
+                                 ranking: @Sendable ([Series]) -> [Series] = { $0 }) throws -> Bool {
         guard pendingPage == request, request.generation == generation else { return false }
         guard result.page == request.page, result.items.count <= Self.maximumPageItems else {
             throw CatalogError.malformedResponse
@@ -62,7 +63,9 @@ public struct RecommendationPreviewQueue: Sendable {
             seen.insert($0.id).inserted && (preferences?.allows(seriesID: $0.id) ?? true)
         }
         guard seen.count <= Self.maximumSeenIDs else { throw CatalogError.responseTooLarge }
-        var combined = items + additions
+        // The current and visited cards remain anchored to their stable IDs.
+        // Local ranking only changes a newly arrived batch after validation.
+        var combined = items + ranking(additions)
         var index = currentIndex ?? (combined.isEmpty ? nil : 0)
         if combined.count > capacity {
             let removeCount = combined.count - capacity

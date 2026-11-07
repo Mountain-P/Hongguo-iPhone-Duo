@@ -165,6 +165,24 @@ struct RecommendationPreviewQueueTests {
         #expect(queue.select(seriesID: "199")?.id == "199")
     }
 
+    @Test func rankingNewCandidatesKeepsCurrentAndVisitedCardsAnchored() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10", "20"], more: true), for: queue.beginPageRequest()!,
+                          ranking: { Array($0.reversed()) })
+        #expect(queue.items.map(\.id) == ["20", "10"])
+        queue.select(seriesID: "10")
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "30", value: true)
+        try queue.receive(page(2, ["10", "30", "40", "50"], more: false),
+                          for: queue.beginPageRequest()!, preferences: preferences,
+                          ranking: { Array($0.reversed()) })
+        #expect(queue.items.map(\.id) == ["20", "10", "50", "40"])
+        #expect(queue.current?.id == "10")
+        #expect(queue.move(by: 1)?.id == "50")
+        #expect(queue.page == 2)
+        #expect(!queue.hasMore)
+    }
+
     private func page(_ number: Int, _ ids: [String], more: Bool) -> SeriesPage {
         .init(items: ids.map { .init(id: $0, title: "劇集\($0)") }, page: number, hasMore: more)
     }

@@ -108,6 +108,24 @@ struct CatalogModelTests {
         #expect(await service.calls == [1, 2, 3])
     }
 
+    @Test func rankingNewPagesDoesNotMoveExistingCardsOrChangeSearchOrder() async {
+        let service = CatalogPageProbe(pages: [
+            1: .init(items: [series("10"), series("20")], page: 1, hasMore: true),
+            2: .init(items: [series("10"), series("30"), series("40")], page: 2, hasMore: false)
+        ])
+        let model = CatalogModel()
+        await model.load(service: service, ranking: { Array($0.reversed()) })
+        #expect(model.items.map(\.id) == ["20", "10"])
+        await model.load(service: service, ranking: { Array($0.reversed()) })
+        #expect(model.items.map(\.id) == ["20", "10", "40", "30"])
+        #expect(!model.hasMore)
+        #expect(await service.calls == [1, 2])
+
+        let search = CatalogModel()
+        await search.load(service: service, query: "合成", ranking: { Array($0.reversed()) })
+        #expect(search.items.map(\.id) == ["10", "20"])
+    }
+
     private func series(_ id: String) -> Series { .init(id: id, title: "合成劇集 \(id)") }
 }
 
