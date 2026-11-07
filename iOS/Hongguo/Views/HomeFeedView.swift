@@ -128,6 +128,7 @@ struct HomeFeedView: View {
                                 Poster(series: record.series, contentMode: .fit)
                                     .frame(width: 56, height: 80).clipShape(RoundedRectangle(cornerRadius: 6))
                             }.buttonStyle(.plain)
+                                .accessibilityLabel("查看\(record.series.title)劇集詳情")
                             VStack(alignment: .leading, spacing: 5) {
                                 NavigationLink(value: record.series) {
                                     Text(record.series.title).font(.caption.weight(.medium))
