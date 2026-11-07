@@ -1,6 +1,37 @@
 # 驗證紀錄
 
-更新：2026-11-07，當前版本 0.6.1／build 17。本輪改善片尾與音訊中斷、更新失敗保留、分頁續讀、片庫返回及人工同步重試。預設內建取源與 progressive Range 播放不使用帳號憑據。
+更新：2026-11-07，當前版本 0.7.0／build 18。本輪加入來源畫質／省流量偏好、海報縮圖與有界快取，以及首頁／片庫一鍵續播。預設內建取源與 progressive Range 播放不使用帳號憑據。
+
+## 0.7.0 畫質、海報與一鍵續播
+
+最終完整回歸登錄 344 項：Core 294 項／38 個 suites，293 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 50 項／5 個 suites，全部通過。記錄為 `build/core-0.7.0-validated-tests.log`。CI 曾發現海報測試在 transport 真正進入前就讀取計數；測試改用已安裝 pending continuation 的同步屏障，保留精確共用請求／最大並行斷言，沒有修改正式 App 管線。補修後完整本機回歸記錄為 `build/core-0.7.0-poster-barrier-combined-tests.log`。新增畫質 7 項、progressive 品質隔離 1 項、正式海報管線 14 項及正式續播 launcher 9 項。測試範圍與命令見 [TESTING-CORE.md](TESTING-CORE.md)；沒有發簡訊或寫入真人官方片庫。
+
+### 來源畫質與解碼
+
+相同真人劇第 4 集的兩次唯讀 macOS 取源／AVAssetReader startup 均成功。自動模式實際選到 HEVC 1080×1920／1080p，來源檔長 7,506,580 bytes，準備 3.18 秒、首個解碼影格 5.72 秒；省流量選到 HEVC 360×640／360p，來源檔長 2,436,342 bytes，準備 2.44 秒、首個解碼影格 2.71 秒，兩次均未 fallback。安全摘要為 `build/quality-0.7.0/validation.txt`。檔長不是此次已下載 bytes；單次分開量測不能推算一般網速、流量節省百分比或 iPhone 啟播／耗電。畫質依來源實際模型選取，未發明固定 720p／480p 選項，亦非播放中 ABR。
+
+### 海報記憶體與網路
+
+正式 ImageIO 大圖測試的 4096×6144 合成圖，原解碼量 100,663,296 bytes，512px 長邊縮圖為 704,512 bytes；獨立基準兩次請求相較於管線並行消費者共用一次請求。這是實際縮圖位元組與計數，不是原 AsyncImage 或手機程序記憶體比較。
+
+Mac 公開八張海報／三工作批次全部載入，下載 1,218,644 bytes、冷載 16.613 秒／8 請求，解碼快取共 5,947,392 bytes；同批暖快取 8／8 成功，0.00187 秒且零額外下載。記錄為 `build/poster-image-batch-live.json`。另以固定八個 URL、三並行與相同 512px ImageIO 目標交替測試 session 取捨：單一 session 第一輪 25 秒截止、已完成 7／8（26.501 秒含取消收尾），第二輪 9.896 秒；正式每下載獨立 session 為 8.041 與 12.136 秒，均 8／8。網路波動及 DNS／TLS／CDN 暖度未控制，共享實驗也與正式串流上限 delegate 不同，不能判定首次載入優劣。詳見 `build/poster-image-session-compare/summary.json`；原始 `success=0` 是逾時 sentinel，不是零張載入。
+
+正式管線保留每下載獨立的 ephemeral session，無 cookie、憑據或磁碟圖片快取；最多三個工作、解碼 LRU 32 MiB／80 項，每下載 12 MiB、來源 32M pixels、縮圖長邊 2048px 上限。這些是各資源預算，不能把 32 MiB 當成 App 全部記憶體上限。相同 URL 調整尺寸時先保留現圖，像素足夠就沿用，較大縮圖成功後才替換；不同 URL 不顯舊圖，離屏釋放 view 圖片。
+
+### Duo 畫面與播放整合
+
+Duo 模擬器與 iPhoneOS／arm64 Debug 均建置成功並通過嚴格簽章檢查。主要記錄為 `build/ios-0.7.0-build18-final.log`、`build/ios-real-device-0.7.0-build18-final.log`；最後海報尺寸銜接與續播圖示輔助標籤的產物為 `build/ios-0.7.0-build18-resize-final.log`、`build/ios-real-device-0.7.0-build18-resize-final.log`。測試期間已安裝並啟動當版模擬器，最終產物再覆蓋啟動確認；公開工程團隊仍空白，本輪未另產生 Release IPA。
+
+當次畫面觀察：
+
+- 首頁在原主網格上方顯示緊湊「接著看」卡與原有第 8 集紀錄，海報完整顯示，未點播放前維持瀏覽。按獨立 CTA 後直接進第 8 集播放器，看到實際影片；點畫面暫停在 0:37，返回後首頁與片庫更新為約 32%。
+- 從片庫歷史的獨立 CTA 再次進同一第 8 集，後續暫停於 1:13，進度保存為約 64%；未先經詳情頁。進入歷史編輯模式時 CTA 消失，仍為選取／全選／移除，退出後恢復續播，沒有刪除紀錄。
+- 設定「省流量」後終止並重啟 App，回設定仍顯示省流量，期間兩個續播入口均可正常播放。測後還原「自動（最佳可用）」。UI 不自行聲稱當集解析度，前述 1080p／360p 為另一次同集 macOS 管線量測。
+- 最終版在收合橫向與展開直向均能顯示續播卡、原生分頁與完整比例海報，展開後主網格依寬度增加欄數；收合後回到首頁。續播小海報的詳情入口有完整輔助標籤。
+
+以上不代替真人帳號續播／跨帳號實測、實體收合手勢、行動網路切換、真耳機／來電或真機長播／耗電驗收。續播的取消、晚回覆與 scope 保護以正式 model 測試核對；實機部署結果另記於下方。
+
+同一批 0.7.0／build 18 真機產物已經既有 `localNetwork` 通道覆蓋安裝，沒有刪除 App 或重新登入。首次啟動回報無線遠端連線失效，緊接的 App 查詢雖成功但清單為空，因此當時未判定部署驗收完成；重新確認通道後，App 清單讀回 0.7.0／build 18，另一次啟動成功，程序查詢亦確認同一個 Hongguo 程序仍在執行。記錄為 `build/ios-real-device-0.7.0-build18-install.json`、`build/ios-real-device-0.7.0-build18-launch.json`、`build/ios-real-device-0.7.0-build18-app-recheck.json`、`build/ios-real-device-0.7.0-build18-launch-recheck.json`、`build/ios-real-device-0.7.0-build18-processes.json`。100 個 App 原碼檔雜湊及兩種平台產物版號核對保存於 `build/ios-0.7.0-build18-validation.json`；簽署／裝置識別只保留本機。這是安裝、版本及程序啟動證據，本輪未在真人手機重做播放、帳號同步或耗電驗收。
 
 ## 0.6.1 播放與資料恢復
 

@@ -2,7 +2,19 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.6.1／build 17。最終完整回歸為 **Core 286 項／37 個 suites，285 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 27 項／3 個 suites，全部通過**。合計登錄 313 項，312 通過、1 略過，記錄於 `build/core-0.6.1-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄與片庫查詢 model，測試使用合成片庫、隔離 defaults 及注入儲存／服務，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+當前程式版本為 0.7.0／build 18。最終完整回歸為 **Core 294 項／38 個 suites，293 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 50 項／5 個 suites，全部通過**。合計登錄 344 項，343 通過、1 略過，記錄於 `build/core-0.7.0-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+
+歷史 0.6.1／build 17 為 Core 286 項／37 個 suites（285 通過、1 略過）及 AppSupport 27 項／3 個 suites 全部通過，合計 313 項、312 通過、1 略過，記錄於 `build/core-0.6.1-tests.log`。
+
+0.7.0 增加 `NativePlaybackQualityTests` 7 項，以及既有 progressive suite 的 1 項畫質偏好首段隔離：驗證持久偏好、無效值預設、真正 bundled JS 入口／真實來源尺寸排序／單版本 fallback、取源與首段快取隔離及取消。簽章向量與 12 份 bundled JS hash 仍參與回歸；這些不是實網影片解碼或手機播放證據。
+
+`PosterImagePipelineTests` 14 項直接執行 ImageIO、正式 actor 與 URLSession delegate，涵蓋 EXIF 方向、縮圖與像素上限、LRU 位元組／項數上限、URL 及不同尺寸工作共用、取消單個／全部消費者、佇列名額回收、失敗後再試、HTTP 拒絕／長度與串流上限、憑據 header 清除，以及大圖解碼量測。`ContinuePlaybackModelTests` 9 項執行正式 launcher，涵蓋按鈕前不請求、最新進度、完成集跳過未開放集／末集重播、過期分集 ID、準備期間刪紀錄、取消及晚回覆、帳號／來源／前景／分頁有效性、錯誤與原 scope 進度 handler。UI 與真機結果分開驗收。
+
+```sh
+swift test --disable-sandbox --disable-xctest --filter NativePlaybackQualityTests
+swift test --disable-sandbox --disable-xctest --filter 'PosterImagePipelineTests|ContinuePlaybackModelTests'
+swift run NativePlaybackCheck --quality dataSaver --startup SERIES_ID EPISODE_NUMBER
+```
 
 歷史 0.6.0／build 16 為 Core 279 項／35 個 suites（278 通過、1 略過）及 AppSupport 12 項／1 個 suite 全部通過，合計 291 項、290 通過、1 略過，記錄於 `build/core-0.6.0-validated-tests.log`。
 

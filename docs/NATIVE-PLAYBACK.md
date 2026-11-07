@@ -1,6 +1,16 @@
-# 內建漸進播放（0.6.1）
+# 內建漸進播放（0.7.0／build 18）
 
 App 首次啟動採用「內建播放」。首頁、劇場搜尋與劇集詳情直接連到來源平台；這些頁面的海報瀏覽不會準備影片，按播放後才發出取源與索引請求。0.4.4 的「試看」在同一頁連續垂直捲動，每劇佔一個可用畫面，停穩對齊後才試播第一集。不需要使用者填播放服務網址，也不需要 Mac 持續開機。影片索引準備好即可開始，剩餘資料依播放與拖曳位置取得。「我的」集中觀看歷史、收藏與設定。
+
+## 0.7.0 一鍵續播、來源畫質與海報快取
+
+首頁最近觀看與「我的」歷史提供手動一鍵續播。`ContinuePlaybackModel` 先讀取最新分集，再依 `PlaybackContinuation` 選擇原位置、已播完後的下一個可用集，或末集的零秒重播。準備前後均核對目前片庫、來源版本與前景／分頁資格；已移除的歷史或遲到回覆不能開啟播放器，瀏覽清單本身不會準備影片。
+
+`NativePlaybackQuality` 提供「自動（最佳可用）」與「省流量」，設定保存在本機，由 `AppModel` 注入 `NativeCatalogService`、`NativeSourceResolver` 與 bundled runtime。「自動」保留既有最佳可用選源策略；「省流量」從來源 model 的真實尺寸選擇較低畫質 H.264／HEVC 相容版本，仍驗證網址與解密資訊。只有單一版本、尺寸無法確認或較低版本無效時，回退至實際可播放來源，不虛構 720p／480p 選項。這是 MP4 來源選擇，並非隨網路變動的 ABR；設定只作用於內建播放的下次取源，不即時替換目前影片。設定變更會使後續詳情／試看的載入 context 失效，不改帳號或片庫範圍。
+
+取源快取及可重用首段的鍵均加入畫質偏好；即使省流量回退至與自動模式相同的來源，也分開保存。正式連播與試看預取沿用各自捕捉的 service，使用相同偏好與既有流量／取消限制。`NativeMediaStream.variant` 提供 `NativeMediaVariant`，只含偏好、編碼、來源畫質標籤、尺寸與回退標記，不含播放網址、內容金鑰或身分；工具可觀察實際準備的版本。
+
+海報改用共用 `PosterImagePipeline`，依顯示尺寸在背景產生縮圖，合併同來源下載；取消一個消費者不取消其他消費者。預設解碼縮圖快取最多 32 MiB／80 筆，排程最多三個並行請求，使用記憶體快取而非離線圖片庫。32 MiB 是快取上限，不是整個 App 或顯示中圖片的記憶體上限。目前沒有與舊版 `AsyncImage` 作同條件對照，不宣稱實際捲動、記憶體或網路用量的改善幅度。
 
 0.3.0 新增公開分類／題材、官方榜單、匿名近期上新，以及劇集評分、發布資訊、藝人與相關作品等選劇 metadata。這些讀取不需連結官方帳號，與影片取源分開；按「開始觀看」後仍沿用下面的分集身分綁定、匿名取源與 progressive 播放體系。來源探針、完整核心結果及裝置驗收界線見 [TESTING.md](TESTING.md)。
 
@@ -36,7 +46,7 @@ App 首次啟動採用「內建播放」。首頁、劇場搜尋與劇集詳情�
 
 1. `NativeCatalogService` 讀取官方目錄與劇集 `vid_list`，確認分集屬於目前劇集；網頁預覽的 `accessible_episode_cnt` 不作為內建來源的選集上限。
 2. `NativeSourceResolver` 在本機 JavaScriptCore 執行隨 App 附帶的固定版本簽章程式。原生 URLSession 處理網路，CommonCrypto／CryptoKit 處理密碼演算法，zlib 處理註冊資料壓縮。這個簽章 runtime 只執行隨包程式。
-3. 依目前取源契約先嘗試獨立匿名 GET；沒有可用模型才進入有次數與時間上限的 POST 復原。不同流程的匿名身分與 Cookie 分開；來源明確拒絕立即停止。成功片源以分集／content type 為鍵快取 120 秒、最多 16 筆；fresh 會重新取源，取消或失敗不寫入快取。這個影片取源流程不使用帳號會話或固定裝置憑證。
+3. 依目前取源契約先嘗試獨立匿名 GET；沒有可用模型才進入有次數與時間上限的 POST 復原。不同流程的匿名身分與 Cookie 分開；來源明確拒絕立即停止。成功片源以分集／content type／畫質偏好為鍵快取 120 秒、最多 16 筆；fresh 會重新取源，取消或失敗不寫入快取。這個影片取源流程不使用帳號會話或固定裝置憑證。
 4. `NativeProgressiveMedia` 先抓取前 256 KiB，檢查前置 ftyp／moov，需要時只補索引至 moov 結尾加 16 bytes（最多 8 MiB），以及缺少的 CENC auxiliary 小範圍（最多三輪、8 MiB）。`NativeMP4.prepareStream` 建立可按任意 offset 處理的串流解密計畫，完成後立即返回，不等待整集下載。
 5. App 與 macOS 工具共用 `HongguoPlayback.NativeMediaAssetLoader`，以公開 AVAssetResourceLoader API 將 `hongguo-native` asset 的讀取請求交給 `NativeMediaStream`。串流按需取得 512 KiB 區塊，處理 CENC／sample entry，使用 8 MiB 記憶體 LRU；每個串流重用 URLSession，最多兩筆 Range 同時下載。同一區塊的並行讀取共用一筆下載；取消一個讀取者不影響其餘讀取者，全部取消才取消該區塊請求。
 6. 系統 AVPlayer／AVPlayerLayer 播放按需提供的資料，自適應畫布支援完整畫面與填滿螢幕。一般全螢幕播放器的 NavigationStack 提供原生工具列，倍速、快轉、選集及續播由原生狀態管理。同頁試看直接嵌入影片表面與輕量控制，不建立額外的播放器導覽頁。
@@ -47,7 +57,7 @@ Range 必須回傳精確的 206、Content-Range 與資料長度，檔長及來�
 
 ### 0.5.0 的重用、預取與恢復
 
-`NativeProgressiveMedia` 可重用已準備的串流，鍵包含分集、完整片源 URL、內容金鑰、codec、品質與 User-Agent；不同來源不共用。有效期為 30 秒，最多兩筆，準備時保留的 header／aux 資料合計上限 2 MiB。每筆串流另有最多 8 MiB 的區塊 LRU，因此 2 MiB 不是總記憶體上限。fresh 取源不命中舊項目，過期或來源驗證失敗不重用；401／403、Range／格式拒絕或來源 validator 改變會阻止後續讀取已快取的片段。清除可重用快取不取消正在播放的讀取。
+`NativeProgressiveMedia` 可重用已準備的串流，鍵包含分集、完整片源 URL、內容金鑰、codec、來源品質與 User-Agent，0.7.0 再加入畫質偏好；不同來源或偏好不共用。有效期為 30 秒，最多兩筆，準備時保留的 header／aux 資料合計上限 2 MiB。每筆串流另有最多 8 MiB 的區塊 LRU，因此 2 MiB 不是總記憶體上限。fresh 取源不命中舊項目，過期或來源驗證失敗不重用；401／403、Range／格式拒絕或來源 validator 改變會阻止後續讀取已快取的片段。清除可重用快取不取消正在播放的讀取。
 
 `NativePlaybackPrefetch` 同時只管理一部相鄰首集的預取，不建立 AVPlayer 或音訊會話。媒體索引／aux 的請求位元組上限為 1 MiB；這個限額不包含目錄、劇集 metadata 或取源 API 的 JSON。超出上限就略過預備，不改成下載整集，也不阻止之後正常點播。預取結果可供正常播放重用；滑動、背景、離開分頁、開啟詳情／偏好及來源切換會取消舊預取。省電模式、昂貴或受限網路與尚未連線的路徑不啟用推測性預取；記憶體警告會清理預取快取。
 
@@ -96,6 +106,8 @@ Range 必須回傳精確的 206、Content-Range 與資料長度，檔長及來�
 
 離線核心測試：`swift test --disable-xctest`。
 
+0.7.0 最終完整測試登錄 344 項：Core 294 項／38 個 suites，293 通過、1 項可選測試略過；AppSupport 50 項／5 個 suites，全部通過。正式紀錄為 `build/core-0.7.0-validated-tests.log`，涵蓋品質選源／回退、快取隔離、偏好保存，以及一鍵續播與圖片共用／取消等回歸。模擬器與實機目標的 build 18 建置均通過；當版 GUI 與部署另依 [TESTING.md](TESTING.md)，不以建置代替裝置操作。
+
 0.5.0 播放側 focused fixtures 已涵蓋同區塊下載合併、讀取者取消隔離、全部取消後重新讀取、TTL／LRU／fresh／來源綁定、預取流量上限及取消，以及暫時錯誤／授權拒絕／格式拒絕分類。既有 Range、解密與播放意圖測試仍須一併回歸；完整結果與指令以 [TESTING-CORE.md](TESTING-CORE.md) 為準。
 
 0.4.4 完整同頁介面的歷史模擬器建置記錄為 `build/ios-0.4.4-build14-simulator-final.log`。0.5.0 的完整整合建置、首幀與卡片操作／手勢、裝置結果以 [TESTING.md](TESTING.md) 為準；focused fixtures 與語法檢查不代表已完成新介面 GUI 或本版真機驗收。
@@ -108,9 +120,20 @@ Range 必須回傳精確的 206、Content-Range 與資料長度，檔長及來�
 swift run NativePlaybackCheck SERIES_ID EPISODE_NUMBER
 swift run NativePlaybackCheck --startup SERIES_ID EPISODE_NUMBER
 swift run NativePlaybackCheck --seek SERIES_ID EPISODE_NUMBER
+swift run NativePlaybackCheck --startup SERIES_ID EPISODE_NUMBER --quality automatic
+swift run NativePlaybackCheck --startup SERIES_ID EPISODE_NUMBER --quality dataSaver
 ```
 
-不加旗標時，工具按需取得並完整解碼一集的影片與音訊；`--startup` 只驗證準備與第一幀，`--seek` 直接從影片 70% 位置取得第一幀。輸出影格數、音訊 buffer 數與時長，不印出片源簽名網址、內容金鑰或匿名身分。
+不加旗標時，工具按需取得並完整解碼一集的影片與音訊；`--startup` 只驗證準備與第一幀，`--seek` 直接從影片 70% 位置取得第一幀。所有模式可加 `--quality automatic|dataSaver`，省略時採 automatic。工具輸出影格數、音訊 buffer 數、時長及所選來源的安全畫質資訊，不印出片源簽名網址、內容金鑰或匿名身分。
+
+0.7.0 在同一部 102 集劇集的第 4 集，各作一次 Mac／Debug 的實網取源及 `AVAssetReader` 首幀解碼：
+
+| 模式 | 實際來源 | MP4 總長度 | 準備／首個解碼影格 |
+| --- | --- | --- | --- |
+| 自動（最佳可用） | HEVC，1080p，1080 × 1920 | 7,506,580 bytes | 3.18／5.72 秒 |
+| 省流量 | HEVC，360p，360 × 640 | 2,436,342 bytes | 2.44／2.71 秒 |
+
+兩次均成功準備、解密並解出首幀，來源未使用回退。檔案總長度是該來源回報的 MP4 大小，不是首幀實際下載量；各一次的網路與解碼樣本只能證明這一集存在較低畫質且可解碼，不代表所有作品都有低畫質、手機起播更快或一般化的流量節省比例。安全摘要為 `build/quality-0.7.0/validation.txt`。
 
 0.2.0 的 progressive 基準使用同一部 102 集劇集的第 4 集分次實測：startup 準備 2.82 秒／首幀 3.10 秒；完整串流解碼全部 89.79 秒、2,244 影片影格及 825 音訊 buffer，首幀 1.98 秒／全流程 7.9 秒；70% seek 準備 1.66 秒／首幀 2.09 秒。均不使用播放服務，數值反映各次網路與快取狀態。原先整集準備路徑的 31.2 秒／745 個音訊 buffer 僅保留為歷史對照。
 
