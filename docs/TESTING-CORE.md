@@ -1,5 +1,17 @@
 # 內容核心驗證
 
+## 0.12.0 最終本機測試
+
+2026-11-08，`swift test --disable-sandbox`：Core 註冊 472 項／51 suites，471 通過、1 項可選 `currentWebsiteSnapshot` 實網快照略過；AppSupport 101 項／6 suites 全通過，合計 **572 通過、1 略過、無失敗**，記錄 `build/core-0.12.0-final-tests.log`。
+
+新增 37 項 Core 測例：7 項 `PlaybackBufferPolicyTests` 核對正式／試看的倍速換算、等待後提高、上限、同 item 不降低及重設；`EpisodePrefetchTests` 增加 2 項，確認加速時依播放時間檢查目前尾段餘裕。這兩組與既有 15 項倍速測例共 27 項通過，未把 AVPlayer 偏好值當成實際下載量。
+
+14 項 `NativeChunkDiskCacheTests` 使用隔離目錄驗證原始資料、實體容量與 LRU、替換、大小限制、stream 隔離、損壞、符號／硬連結及根目錄拒絕、清理、IO 失敗、低空間可讀但不新增、取消與清除 epoch。快取不跨工作階段重用，測試不含真實來源網址、金鑰或帳號資料。
+
+14 項 `NativeProgressiveDiskTests` 直接執行正式 stream，核對預讀只存原始資料、前景解密、超過 8 MiB 熱快取後重訪不增加 HTTP、同區塊合併與獨立取消、全部取消的遲到結果、seek、終止拒絕與清除、來源隔離及無磁碟時不預讀。可控寫入 gate 驗證原請求、加入既有工作的前景讀者，以及寫入阻塞後才開始的新未快取前景請求，都可在釋放 gate 前完成；同時核對最多兩個待寫分段、暫忙可恢復與真正寫入失敗停止額外預讀。與原有 progressive 16 項及實際 Range HTTP 3 項合計 33 項／3 suites 通過，見 `build/progressive-disk-tests.log`。
+
+上述 focused 組合互有重疊，不另加到完整回歸總數。這些測試證明可控 IO、取消與快取命中的行為，未測量實網加速比例，也不能代替 AVPlayer 長播或手機熱／電量驗收。當版畫面、建置與部署見 [TESTING.md](TESTING.md)。
+
 ## 0.11.1 播放回饋回歸
 
 本輪只改 iOS 播放器的 UIKit 觸覺回饋與使用者命令接線，未改 Core／AppSupport 狀態規則。`swift test --disable-sandbox --filter PlaybackSpeedTests` 的 15 項倍速回歸全部通過，見 `build/core-0.11.1-speed-tests.log`，涵蓋暫停不自行啟播、鎖定／解除、重複結束與背景取消。未另寫只鏡像 UIKit 呼叫的單元測試；實際命令觸發次數、兩平台建置及手機部署見 [TESTING.md](TESTING.md)。上一版完整本機結果保留在下節。
