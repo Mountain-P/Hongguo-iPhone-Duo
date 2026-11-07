@@ -34,15 +34,22 @@ struct PlayerScreen: View {
     @State private var lastBoostEndAt = Date.distantPast
     @State private var lastHoverRevealAt = Date.distantPast
     @State private var lastHoverLocation: CGPoint?
+    @State private var transitionFrame: PlaybackTransitionFrame?
+    @State private var surfaceReady = false
+    @State private var swipe: EpisodeSwipeState?
+    @GestureState private var episodeDragging = false
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
          onClose: (() -> Void)? = nil, onSeriesSwipe: ((Int) -> Void)? = nil,
-         isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil) {
+         isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil,
+         transitionFrame: PlaybackTransitionFrame? = nil) {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
         self.isPreview = isPreview
         self.onOpenSeries = onOpenSeries
+        _transitionFrame = State(initialValue: transitionFrame?.matches(seriesID: series.id,
+            episodeID: initialEpisodeID, seconds: resumeSeconds) == true ? transitionFrame : nil)
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: episodes,
             initialEpisodeID: initialEpisodeID, resumeSeconds: resumeSeconds, service: service,
             onProgress: onProgress, isPreview: isPreview))
@@ -58,10 +65,21 @@ struct PlayerScreen: View {
                     ZStack(alignment: .topLeading) {
                         Color.black
                         NativePlayerSurface(player: model.player, fillsScreen: fillsScreen,
-                            onReadyForDisplayChange: { if $0 { model.recordFirstFrame() } })
+                            onReadyForDisplayChange: { ready in
+                                surfaceReady = ready
+                                if ready { model.recordFirstFrame() }
+                                finishTransitionIfReady()
+                            })
                             .frame(width: region.width, height: region.height)
                             .clipped()
                             .position(x: region.midX, y: region.midY)
+                        if let transitionFrame {
+                            Image(uiImage: transitionFrame.image).resizable()
+                                .aspectRatio(contentMode: fillsScreen ? .fill : .fit)
+                                .frame(width: region.width, height: region.height).clipped()
+                                .position(x: region.midX, y: region.midY)
+                                .allowsHitTesting(false).accessibilityHidden(true)
+                        }
                         videoTouchSurface
                             .frame(width: geometry.size.width, height: geometry.size.height)
                     }
@@ -89,6 +107,7 @@ struct PlayerScreen: View {
                             .position(x: region.midX, y: region.midY)
                         VStack(spacing: 8) {
                             speedBoostHint.padding(.top, 12)
+                            episodeSwipeFeedback
                             if let episodeNotice {
                                 Text(episodeNotice)
                                     .font(.caption.weight(.semibold))
@@ -131,6 +150,8 @@ struct PlayerScreen: View {
             hideTask?.cancel()
             episodeNoticeTask?.cancel()
             endBoostGesture()
+            cancelEpisodeSwipe()
+            transitionFrame = nil
             model.stop()
             Task { await appModel.flushLibrary() }
         }
@@ -139,6 +160,8 @@ struct PlayerScreen: View {
             if phase != .active {
                 episodeNoticeTask?.cancel()
                 episodeNotice = nil
+                cancelEpisodeSwipe()
+                transitionFrame = nil
                 cancelBoostGesture(); showControls()
             }
         }
@@ -150,11 +173,25 @@ struct PlayerScreen: View {
             if !canPause { Task { await appModel.flushLibrary() } }
         }
         .onChange(of: model.isLoading) { _, loading in
-            if loading { cancelBoostGesture() }
+            if loading { cancelBoostGesture(); cancelEpisodeSwipe(); surfaceReady = false }
+            finishTransitionIfReady()
             scheduleAutoHide()
         }
         .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
-        .onChange(of: model.errorMessage) { _, _ in showControls() }
+        .onChange(of: model.errorMessage) { _, message in
+            if message != nil { transitionFrame = nil }
+            showControls()
+        }
+        .onChange(of: model.currentEpisode?.id) { _, episodeID in
+            if episodeID != transitionFrame?.episodeID { transitionFrame = nil }
+            cancelEpisodeSwipe()
+        }
+        .onChange(of: model.elapsed) { _, _ in finishTransitionIfReady() }
+        .task(id: episodeDragging) {
+            guard !episodeDragging else { return }
+            await Task.yield()
+            if !episodeDragging { cancelEpisodeSwipe() }
+        }
         .onChange(of: showingEpisodes) { _, _ in showControls() }
         .onChange(of: voiceOverEnabled) { _, _ in showControls() }
         .onChange(of: holdingBoost) { _, holding in
@@ -308,20 +345,15 @@ struct PlayerScreen: View {
                 Text(timeLabel(isScrubbing ? scrubPosition : model.elapsed))
                     .frame(minWidth: 34, alignment: .leading)
                     .accessibilityLabel("已播放 \(timeLabel(model.elapsed))")
-                Slider(value: Binding(get: {
-                    min(max(isScrubbing ? scrubPosition : model.elapsed, 0), max(model.duration, 1))
-                }, set: { scrubPosition = $0 }), in: 0...max(model.duration, 1), onEditingChanged: { editing in
-                    if editing { scrubPosition = model.elapsed }
-                    isScrubbing = editing
-                    if !editing { model.seek(to: scrubPosition) }
-                    showControls()
-                })
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-                .tint(Theme.accent)
-                .disabled(model.isLoading || model.duration <= 0)
-                .accessibilityLabel("播放進度")
-                .accessibilityValue("\(timeLabel(model.elapsed))，共 \(timeLabel(model.duration))")
+                FinePlaybackScrubber(elapsed: model.elapsed, duration: model.duration,
+                    disabled: model.isLoading || model.duration <= 0,
+                    onEditingChanged: { editing, seconds in
+                        if editing { cancelBoostGesture(); cancelEpisodeSwipe() }
+                        isScrubbing = editing
+                        scrubPosition = seconds
+                        showControls()
+                    }, onSeek: { model.seek(to: $0); showControls() })
+                    .id(model.currentEpisode?.id)
                 Text(timeLabel(model.duration))
                     .frame(minWidth: 34, alignment: .trailing)
                     .accessibilityLabel("總長 \(timeLabel(model.duration))")
@@ -369,14 +401,96 @@ struct PlayerScreen: View {
     }
 
     private var verticalSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 20).onEnded { value in
-            guard !boostStarted, !holdingBoost, !showingEpisodes, !isScrubbing, scenePhase == .active,
-                  Date().timeIntervalSince(lastBoostEndAt) > 0.25,
-                  abs(value.translation.height) > 90,
-                  abs(value.translation.height) > abs(value.translation.width) * 1.2 else { return }
-            if !isPreview { navigateEpisode(value.translation.height < 0 ? .next : .previous) }
-            else { onSeriesSwipe?(value.translation.height < 0 ? 1 : -1) }
+        DragGesture(minimumDistance: 20)
+            .updating($episodeDragging) { _, state, _ in state = true }
+            .onChanged { value in
+                guard canSwipeEpisode, !isPreview,
+                      let current = model.currentEpisode,
+                      let index = model.episodes.firstIndex(where: { $0.id == current.id }) else { return }
+                if swipe == nil { swipe = EpisodeSwipeState(currentIndex: index,
+                    episodeAvailability: model.episodes.map(\.isAvailable)) }
+                let previouslyArmed = swipe?.feedback.isArmed == true
+                swipe?.update(horizontal: Double(value.translation.width), vertical: Double(value.translation.height),
+                    isHolding: holdingBoost || boostStarted, isScrubbing: isScrubbing)
+                if !previouslyArmed, swipe?.feedback.isArmed == true {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
+            }
+            .onEnded { value in
+                defer { cancelEpisodeSwipe() }
+                guard canSwipeEpisode, !boostStarted, !holdingBoost else { return }
+                if isPreview {
+                    guard abs(value.translation.height) > 90,
+                          abs(value.translation.height) > abs(value.translation.width) * 1.2 else { return }
+                    onSeriesSwipe?(value.translation.height < 0 ? 1 : -1)
+                    return
+                }
+                guard var completed = swipe else { return }
+                let target = completed.end(horizontal: Double(value.translation.width), vertical: Double(value.translation.height))
+                let feedback = completed.feedback
+                let isBoundary = feedback.blockedReason == .firstEpisode || feedback.blockedReason == .lastEpisode ||
+                    feedback.blockedReason == .unavailableEpisode
+                // A returned/diagonal drag never commits, including at a boundary.
+                let boundaryAttempt = isBoundary && feedback.direction != nil && abs(value.translation.height) > 90 &&
+                    abs(value.translation.height) > abs(value.translation.width) * 1.2
+                if target != nil || boundaryAttempt {
+                    navigateEpisode(value.translation.height < 0 ? .next : .previous)
+                }
+            }
+    }
+
+    private var canSwipeEpisode: Bool {
+        !showingEpisodes && !isScrubbing && scenePhase == .active && !model.isLoading &&
+            Date().timeIntervalSince(lastBoostEndAt) > 0.25
+    }
+
+    @ViewBuilder
+    private var episodeSwipeFeedback: some View {
+        if let feedback = swipe?.feedback, let direction = feedback.direction,
+           feedback.progress > 0.12, !boostStarted, !holdingBoost {
+            HStack(spacing: 10) {
+                Image(systemName: direction == .next ? "arrow.up" : "arrow.down")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(swipeTitle(feedback)).font(.subheadline.weight(.semibold))
+                    Text(feedback.isArmed ? "放開切換" : "繼續滑動，放開可返回")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ProgressView(value: feedback.progress).frame(width: 45).tint(Theme.accent)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 12)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+            .offset(y: CGFloat(feedback.progress * (direction == .next ? -6 : 6)))
+            .padding(.top, 54).allowsHitTesting(false)
+            .accessibilityIdentifier("player.episodeSwipeFeedback")
         }
+    }
+
+    private func swipeTitle(_ feedback: EpisodeSwipeState.Feedback) -> String {
+        switch feedback.blockedReason {
+        case .firstEpisode: return "已經是第一集了"
+        case .lastEpisode: return "已經是最後一集了"
+        case .unavailableEpisode: return "相鄰分集尚未開放"
+        default:
+            if let index = feedback.targetIndex, model.episodes.indices.contains(index) {
+                return "第 \(model.episodes[index].number) 集"
+            }
+            return "滑動切換分集"
+        }
+    }
+
+    private func cancelEpisodeSwipe() {
+        withAnimation(.easeOut(duration: 0.18)) { swipe = nil }
+    }
+
+    private func finishTransitionIfReady() {
+        guard transitionFrame != nil, surfaceReady, model.isInitialSeekComplete else { return }
+        // Native surface readiness and the completed initial seek must both belong to this route.
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {
+            NSLog("PlaybackTransition formal ready=1 seekComplete=1 released=1")
+        }
+        #endif
+        transitionFrame = nil
     }
 
     private func navigateEpisode(_ direction: EpisodeNavigation.Direction) {
@@ -514,6 +628,7 @@ struct PlayerScreen: View {
                       !suppressBoostUntilRelease,
                       !model.isLoading, model.errorMessage == nil, model.duration > 0 else { return }
                 if !boostStarted {
+                    cancelEpisodeSwipe()
                     boostStarted = true
                     boostCommitted = false
                     boostStartedLocked = model.isSpeedBoostLocked
@@ -683,6 +798,8 @@ struct NativePlayerSurface: UIViewRepresentable {
             itemGeneration = UUID()
             let itemToken = itemGeneration
             observedItem = item
+            // Readiness is per item: an old true must not suppress the new item's true.
+            lastReady = nil
             // Deliver state outside UIViewRepresentable's update transaction.
             readyObservation = layer.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] _, _ in
                 Task { @MainActor [weak self] in

@@ -30,6 +30,7 @@ private struct ContinuePlaybackPresentation: ViewModifier {
     let context: ContinuePlaybackContext
     var onSeriesSwipe: ((Int) -> Void)?
     var bottomOverlayInset: CGFloat = 0
+    var transitionFrame: PlaybackTransitionFrame?
 
     func body(content: Content) -> some View {
         content
@@ -56,9 +57,17 @@ private struct ContinuePlaybackPresentation: ViewModifier {
                 PlayerScreen(series: selection.detail.series, episodes: selection.detail.episodes,
                              initialEpisodeID: selection.continuation.episode.id, resumeSeconds: selection.continuation.seconds,
                              service: selection.service, onProgress: selection.onProgress,
-                             onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe)
+                             onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe,
+                             transitionFrame: matchingFrame(for: selection))
                     .id(selection.id)
             }
+    }
+
+    private func matchingFrame(for selection: ContinuePlaybackRoute) -> PlaybackTransitionFrame? {
+        guard let transitionFrame,
+              transitionFrame.matches(seriesID: selection.detail.series.id,
+                  episodeID: selection.continuation.episode.id, seconds: selection.continuation.seconds) else { return nil }
+        return transitionFrame
     }
 }
 
@@ -66,8 +75,9 @@ extension View {
     @MainActor
     func continuePlaybackPresentation(_ launcher: ContinuePlaybackModel, context: ContinuePlaybackContext,
                                       onSeriesSwipe: ((Int) -> Void)? = nil,
-                                      bottomOverlayInset: CGFloat = 0) -> some View {
+                                      bottomOverlayInset: CGFloat = 0,
+                                      transitionFrame: PlaybackTransitionFrame? = nil) -> some View {
         modifier(ContinuePlaybackPresentation(launcher: launcher, context: context,
-            onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset))
+            onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset, transitionFrame: transitionFrame))
     }
 }

@@ -43,6 +43,34 @@ public struct RecommendationPreviewQueue: Sendable {
         items = []; currentIndex = nil; page = 0; hasMore = true
     }
 
+    /// A local prefix has no source cursor. The next request is still the real page 1.
+    @discardableResult
+    public mutating func restoreLocalPrefix(items restored: [Series], currentStableID: String,
+                                           preferences: RecommendationPreferences? = nil) throws -> Bool {
+        guard items.isEmpty, page == 0, pendingPage == nil,
+              !restored.isEmpty, restored.count <= min(capacity, PreviewSessionStore.maximumItems) else {
+            throw CatalogError.malformedResponse
+        }
+        for item in restored {
+            try validateID(item.id)
+            guard !item.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CatalogError.malformedResponse }
+        }
+        guard let originalIndex = restored.firstIndex(where: { $0.id == currentStableID }) else { throw CatalogError.malformedResponse }
+        var unique: Set<String> = []
+        let allowed = restored.filter { unique.insert($0.id).inserted && (preferences?.allows(seriesID: $0.id) ?? true) }
+        guard !allowed.isEmpty else { return false }
+        let allowedIDs = Set(allowed.map(\.id))
+        let target = allowedIDs.contains(currentStableID) ? currentStableID
+            : restored.dropFirst(originalIndex + 1).first(where: { allowedIDs.contains($0.id) })?.id
+                ?? restored.prefix(originalIndex).last(where: { allowedIDs.contains($0.id) })?.id
+                ?? allowed[0].id
+        reset()
+        items = allowed; currentIndex = allowed.firstIndex(where: { $0.id == target }) ?? 0
+        seenIDs = Set(allowed.map(\.id))
+        excludedIDs = Set(preferences?.notInterestedIDs ?? [])
+        return true
+    }
+
     public mutating func beginPageRequest() -> PageRequest? {
         guard !Task.isCancelled, pendingPage == nil, hasMore, page < Self.maximumPages else { return nil }
         let request = PageRequest(page: page + 1, generation: generation)

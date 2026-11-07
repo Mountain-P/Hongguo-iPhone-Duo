@@ -1,5 +1,6 @@
 import AVFoundation
 import Combine
+import CoreVideo
 import Foundation
 import HongguoCore
 import HongguoPlayback
@@ -59,6 +60,26 @@ final class PlayerModel: ObservableObject {
 
     func recordFirstFrame() {
         if let diagnosticsID { PlaybackDiagnostics.shared.recordFirstFrame(id: diagnosticsID) }
+    }
+
+    /// readyToPlay alone is insufficient: the initial resume seek must also finish.
+    var isInitialSeekComplete: Bool {
+        hasStarted && !isLoading && errorMessage == nil && player.currentItem?.status == .readyToPlay
+    }
+
+    func captureTransitionFrame() -> PlaybackTransitionFrame? {
+        guard isPreview, isInitialSeekComplete, let episode = currentEpisode,
+              let item = player.currentItem, let output = transitionVideoOutput,
+              item.outputs.contains(where: { $0 === output }) else { return nil }
+        let time = player.currentTime(), position = time.seconds
+        guard position.isFinite, position >= 0 else { return nil }
+        var displayTime = CMTime.invalid
+        guard let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &displayTime) else { return nil }
+        let displayed = displayTime.seconds
+        let seconds = displayed.isFinite && displayed >= 0 ? displayed : position
+        guard abs(seconds - position) <= PlaybackTransitionFrame.maximumPositionDifference else { return nil }
+        return PlaybackTransitionFrame.make(pixelBuffer: buffer, seriesID: series.id, episodeID: episode.id,
+                                            seconds: seconds, presentationSize: item.presentationSize)
     }
 
     func beginSpeedBoost() {
@@ -136,6 +157,7 @@ final class PlayerModel: ObservableObject {
     private var reachedEnd = false
     private var seekGeneration = UUID()
     private var diagnosticsID: UUID?
+    private var transitionVideoOutput: AVPlayerItemVideoOutput?
     private let nextPrefetcher = NativePlaybackPrefetch()
     private var nextPrefetchState = EpisodePrefetchState()
     private var nextPrefetchTask: Task<Void, Never>?
@@ -378,6 +400,14 @@ final class PlayerModel: ObservableObject {
             asset = resourceLoader.makeAsset()
         }
         let item = AVPlayerItem(asset: asset)
+        if isPreview {
+            let output = AVPlayerItemVideoOutput(outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferCGImageCompatibilityKey as String: true,
+                AVVideoAllowWideColorKey: false
+            ])
+            item.add(output); transitionVideoOutput = output
+        }
         item.preferredForwardBufferDuration = 5
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
@@ -599,6 +629,8 @@ final class PlayerModel: ObservableObject {
         if let stalledObserver { NotificationCenter.default.removeObserver(stalledObserver) }
         endObserver = nil
         stalledObserver = nil
+        if let output = transitionVideoOutput { player.currentItem?.remove(output) }
+        transitionVideoOutput = nil
         player.replaceCurrentItem(with: nil)
         loader?.invalidate()
         loader = nil

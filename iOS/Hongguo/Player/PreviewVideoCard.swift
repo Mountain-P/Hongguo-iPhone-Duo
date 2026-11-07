@@ -11,12 +11,14 @@ struct RecommendationPreviewMediaCard: View {
     let episode: Episode
     let service: any CatalogService
     let isActive: Bool
+    var resumeSeconds: Double = 0
     var retainsFrame: Bool = false
     var allowsInteraction: Bool = true
     var isFavorite: Bool = false
     var onToggleFavorite: (() -> Void)? = nil
     var onPlaybackStarted: (() -> Void)? = nil
     var onPreviewQualified: (() -> Void)? = nil
+    var onPositionSnapshot: (PreviewPlaybackSnapshot) -> Void = { _ in }
     var recommendationTitle: String? = nil
     var recommendationReason: String? = nil
     var discoverySourceLabel: String? = nil
@@ -24,14 +26,15 @@ struct RecommendationPreviewMediaCard: View {
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
     var onViewDetails: (() -> Void)? = nil
-    let onOpenSeries: (PreviewPlaybackSnapshot) -> Void
+    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void
 
     var body: some View {
         PreviewVideoContent(series: series, episode: episode, service: service,
-                            isActive: isActive, retainsFrame: retainsFrame,
+                            isActive: isActive, resumeSeconds: resumeSeconds, retainsFrame: retainsFrame,
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
                             onToggleFavorite: onToggleFavorite, onPlaybackStarted: onPlaybackStarted,
                             onPreviewQualified: onPreviewQualified,
+                            onPositionSnapshot: onPositionSnapshot,
                             recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
                             discoverySourceLabel: discoverySourceLabel,
                             bottomControlInset: bottomControlInset,
@@ -52,6 +55,7 @@ private struct PreviewVideoContent: View {
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @StateObject private var model: PlayerModel
+    private let episodeID: String
     let isActive: Bool
     let retainsFrame: Bool
     let allowsInteraction: Bool
@@ -59,6 +63,7 @@ private struct PreviewVideoContent: View {
     let onToggleFavorite: (() -> Void)?
     let onPlaybackStarted: (() -> Void)?
     let onPreviewQualified: (() -> Void)?
+    let onPositionSnapshot: (PreviewPlaybackSnapshot) -> Void
     let recommendationTitle: String?
     let recommendationReason: String?
     let discoverySourceLabel: String?
@@ -66,7 +71,7 @@ private struct PreviewVideoContent: View {
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
     let onViewDetails: (() -> Void)?
-    let onOpenSeries: (PreviewPlaybackSnapshot) -> Void
+    let onOpenSeries: (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
     @State private var boostStarted = false
@@ -79,21 +84,25 @@ private struct PreviewVideoContent: View {
     @State private var reportedPreviewQualified = false
     @State private var watchQualification = PreviewWatchQualification()
     @State private var qualificationTask: Task<Void, Never>?
+    @State private var handoffFrame: PlaybackTransitionFrame?
 
     init(series: Series, episode: Episode, service: any CatalogService,
-         isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
+         isActive: Bool, resumeSeconds: Double, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
          onToggleFavorite: (() -> Void)?, onPlaybackStarted: (() -> Void)?, onPreviewQualified: (() -> Void)?,
+         onPositionSnapshot: @escaping (PreviewPlaybackSnapshot) -> Void,
          recommendationTitle: String?, recommendationReason: String?, discoverySourceLabel: String?,
          bottomControlInset: CGFloat,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
-         onOpenSeries: @escaping (PreviewPlaybackSnapshot) -> Void) {
+         onOpenSeries: @escaping (PreviewPlaybackSnapshot, PlaybackTransitionFrame?) -> Void) {
         self.isActive = isActive
+        self.episodeID = episode.id
         self.retainsFrame = retainsFrame
         self.allowsInteraction = allowsInteraction
         self.isFavorite = isFavorite
         self.onToggleFavorite = onToggleFavorite
         self.onPlaybackStarted = onPlaybackStarted
         self.onPreviewQualified = onPreviewQualified
+        self.onPositionSnapshot = onPositionSnapshot
         self.recommendationTitle = recommendationTitle
         self.recommendationReason = recommendationReason
         self.discoverySourceLabel = discoverySourceLabel
@@ -103,7 +112,7 @@ private struct PreviewVideoContent: View {
         self.onViewDetails = onViewDetails
         self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: [episode],
-            initialEpisodeID: episode.id, resumeSeconds: 0, service: service,
+            initialEpisodeID: episode.id, resumeSeconds: resumeSeconds, service: service,
             onProgress: { _, _, _ in }, isPreview: true))
     }
 
@@ -118,9 +127,15 @@ private struct PreviewVideoContent: View {
                     NativePlayerSurface(player: model.player, fillsScreen: true, onReadyForDisplayChange: { ready in
                         if ready { model.recordFirstFrame() }
                         firstFrameReady = ready
+                        if ready { reportPositionSnapshot() }
                         updatePreviewQualification()
                     })
                         .opacity(firstFrameReady && model.player.currentItem != nil && !model.isLoading && model.errorMessage == nil ? 1 : 0)
+                    if let handoffFrame {
+                        Image(uiImage: handoffFrame.image).resizable().scaledToFill()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
+                            .allowsHitTesting(false).accessibilityHidden(true)
+                    }
                     touchSurface
                     if isActive, controlsVisible || !model.canPausePlayback {
                         centerControl
@@ -161,23 +176,35 @@ private struct PreviewVideoContent: View {
         .foregroundStyle(.white)
         .accessibilityHidden(!allowsInteraction)
         .task { synchronizeActivation(); updatePreviewQualification() }
-        .onChange(of: isActive) { _, active in
+        .onChange(of: isActive) { wasActive, active in
+            if wasActive, !active { reportPositionSnapshot(allowLeaving: true) }
+            if active { clearHandoffFrame(reason: "active") }
+            else if allowsInteraction { clearHandoffFrame(reason: "not_preparing") }
             if !active { reportedPlaybackStarted = false }
             synchronizeActivation(); updatePreviewQualification()
         }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
-        .onChange(of: allowsInteraction) { _, _ in updatePreviewQualification() }
-        .onChange(of: scenePhase) { _, _ in synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: allowsInteraction) { _, allowed in
+            if allowed { clearHandoffFrame(reason: "interaction") }
+            else if let handoffFrame { traceTransition("retained_preparing", frame: handoffFrame) }
+            updatePreviewQualification()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { clearHandoffFrame(reason: "scene") }
+            synchronizeActivation(); updatePreviewQualification()
+        }
         .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
         .onChange(of: model.isLoading) { _, loading in
             if loading { firstFrameReady = false }
+            else { reportPositionSnapshot() }
             scheduleAutoHide(); updatePreviewQualification()
         }
         .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
         .onChange(of: model.duration) { _, _ in updatePreviewQualification() }
+        .onChange(of: model.elapsed) { _, _ in reportPositionSnapshot() }
         .onChange(of: model.errorMessage) { _, _ in revealControls(); updatePreviewQualification() }
         .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
-        .onDisappear { deactivate() }
+        .onDisappear { clearHandoffFrame(reason: "disappear"); deactivate() }
     }
 
     private var touchSurface: some View {
@@ -412,6 +439,7 @@ private struct PreviewVideoContent: View {
 
     private func pauseRetainingFrame() {
         guard PreviewPlaybackOwner.isOwner(ownerID) else { return }
+        reportPositionSnapshot(allowLeaving: true)
         // With no decoded frame yet, cancellation is preferable to continuing
         // the initial network request while the user scrolls elsewhere.
         guard !model.isLoading else { deactivate(); return }
@@ -425,6 +453,7 @@ private struct PreviewVideoContent: View {
     }
 
     private func deactivate() {
+        if PreviewPlaybackOwner.isOwner(ownerID) { reportPositionSnapshot(allowLeaving: true) }
         reportedPlaybackStarted = false
         stopPreviewQualification()
         hideTask?.cancel()
@@ -446,10 +475,38 @@ private struct PreviewVideoContent: View {
 
     private func openSeries() {
         guard allowsInteraction, scenePhase == .active, let episode = model.currentEpisode else { return }
+        let frame = firstFrameReady ? model.captureTransitionFrame() : nil
+        handoffFrame = frame
+        traceTransition(frame == nil ? "capture_fallback" : "capture_success", frame: frame)
+        let position = model.player.currentTime().seconds
         let snapshot = PreviewPlaybackSnapshot(seriesID: model.series.id, episodeID: episode.id,
-            position: model.elapsed, duration: model.duration)
+            position: position.isFinite && position >= 0 ? position : model.elapsed, duration: model.duration)
         deactivate()
-        onOpenSeries(snapshot)
+        onOpenSeries(snapshot, frame)
+    }
+
+    private func reportPositionSnapshot(allowLeaving: Bool = false) {
+        guard isActive || allowLeaving, firstFrameReady, model.isInitialSeekComplete,
+              let episode = model.currentEpisode, episode.id == episodeID,
+              model.duration.isFinite, model.duration > 0 else { return }
+        let position = model.player.currentTime().seconds
+        guard position.isFinite, position >= 0 else { return }
+        onPositionSnapshot(.init(seriesID: model.series.id, episodeID: episode.id,
+            position: min(position, model.duration), duration: model.duration))
+    }
+
+    private func clearHandoffFrame(reason: String) {
+        guard let frame = handoffFrame else { return }
+        traceTransition("cleared_\(reason)", frame: frame)
+        handoffFrame = nil
+    }
+
+    private func traceTransition(_ event: String, frame: PlaybackTransitionFrame?) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") else { return }
+        let bitmap = frame?.image.cgImage
+        NSLog("PreviewTransition %@ size=%dx%d", event, bitmap?.width ?? 0, bitmap?.height ?? 0)
+        #endif
     }
 
     private func cancelBoost(reveal: Bool = true) {

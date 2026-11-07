@@ -42,7 +42,7 @@ struct RecommendationPreviewView: View {
     var bottomControlInset: CGFloat = 0
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var preview = RecommendationPreviewModel()
+    @StateObject private var preview = RecommendationPreviewModel(sessionStore: .shared)
     @StateObject private var networkPolicy = PreviewNetworkPolicy()
     @StateObject private var playback = ContinuePlaybackModel()
     @State private var scrollID: String?
@@ -63,6 +63,7 @@ struct RecommendationPreviewView: View {
     @State private var requiresManualResume = false
     @State private var detailSeries: Series?
     @State private var showingPreferences = false
+    @State private var transitionFrame: PlaybackTransitionFrame?
 
     private struct Activation: Hashable {
         let revision: UUID
@@ -106,15 +107,16 @@ struct RecommendationPreviewView: View {
             if playback.route == nil { isVisible = false; playback.cancelPending() }
             fallbackSettle?.cancel(); fallbackSettle = nil
             preview.suspend()
+            Task { await preview.saveSession() }
         }
         .onChange(of: isActive) { _, active in
             tabIsActive = active
             if active { activateSource() }
-            else { cancelResize(); preview.suspend(); playback.dismiss() }
+            else { cancelResize(); preview.suspend(); playback.dismiss(); transitionFrame = nil; Task { await preview.saveSession() } }
             refreshEligibility()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { cancelResize(); preview.suspend() }
+            if phase != .active { cancelResize(); preview.suspend(); transitionFrame = nil; Task { await preview.saveSession() } }
             else if tabIsActive, isVisible { preview.loadInitial() }
             refreshEligibility()
         }
@@ -143,15 +145,15 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onChange(of: scrollID) { _, id in
-            if let failed = playback.failedSeriesID, id != failed { playback.cancelPending() }
+            if let failed = playback.failedSeriesID, id != failed { playback.cancelPending(); transitionFrame = nil }
             refreshEligibility()
         }
         .onChange(of: detailSeries) { _, detail in
-            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending() }
+            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); transitionFrame = nil }
             refreshEligibility()
         }
         .onChange(of: showingPreferences) { _, presented in
-            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending() }
+            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending(); transitionFrame = nil }
             refreshEligibility()
         }
         .sheet(isPresented: $showingPreferences) {
@@ -162,11 +164,12 @@ struct RecommendationPreviewView: View {
         }
         .onChange(of: playback.route?.id) { _, routeID in
             if routeID != nil { cancelResize(); requiresManualResume = true; preview.suspend() }
+            else if playback.preparingSeriesID == nil && playback.pendingChoice == nil { transitionFrame = nil }
             refreshEligibility()
         }
         .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
         .overlay(alignment: .bottom) { followingError }
-        .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset)
+        .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset, transitionFrame: transitionFrame)
     }
 
     private var feedViewport: some View {
@@ -283,11 +286,13 @@ struct RecommendationPreviewView: View {
         let allowsInteraction = !resizing && resizeTargetID == nil && alignedID == series.id && isVisible && tabIsActive
             && scenePhase == .active && detailSeries == nil && !showingPreferences && phaseIsIdle
             && playback.preparingSeriesID == nil && playback.pendingChoice == nil && playback.route == nil
+        let sessionContextID = preview.sessionContextID
         return ZStack {
             Poster(series: series, contentMode: .fill).allowsHitTesting(false)
             if let media = preview.media[series.id] {
                 RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
                     isActive: !resizing && preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
+                    resumeSeconds: media.resumeSeconds,
                     retainsFrame: canRetainFrame, allowsInteraction: allowsInteraction,
                     isFavorite: model.isFavorite(series),
                     onToggleFavorite: { model.toggleFavorite(media.series) },
@@ -301,6 +306,9 @@ struct RecommendationPreviewView: View {
                               !model.recommendationPreferences.isNotInterested(seriesID: series.id) else { return }
                         model.markPreviewed(series)
                     },
+                    onPositionSnapshot: { snapshot in
+                        preview.rememberPreviewPosition(snapshot, contextID: sessionContextID)
+                    },
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
                     recommendationReason: recommendationReason(for: series.id),
                     discoverySourceLabel: preview.sourceLabelByID[series.id],
@@ -308,7 +316,7 @@ struct RecommendationPreviewView: View {
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { hide(series) },
                     onViewDetails: { openEntireSeries(media.series) },
-                    onOpenSeries: { snapshot in startFollowing(media.series, snapshot: snapshot) })
+                    onOpenSeries: { snapshot, frame in startFollowing(media.series, snapshot: snapshot, frame: frame) })
                     .id(media.id)
             } else {
                 posterInformation(series)
@@ -427,6 +435,7 @@ struct RecommendationPreviewView: View {
     private func resetFeed() {
         cancelResize(); lastSettledID = nil
         playback.dismiss()
+        transitionFrame = nil
         fallbackSettle?.cancel(); fallbackSettle = nil
         scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil
         requiresManualResume = showingPreferences
@@ -620,17 +629,19 @@ struct RecommendationPreviewView: View {
         detailSeries = series
     }
 
-    private func startFollowing(_ series: Series, snapshot: PreviewPlaybackSnapshot) {
+    private func startFollowing(_ series: Series, snapshot: PreviewPlaybackSnapshot, frame: PlaybackTransitionFrame?) {
         guard playbackContext.permitsStart, alignedID == series.id, phaseIsIdle,
               snapshot.seriesID == series.id, playback.route == nil,
               playback.preparingSeriesID == nil, playback.pendingChoice == nil else { return }
+        transitionFrame = frame
         requiresManualResume = true; preview.suspend()
+        Task { await preview.saveSession() }
         do {
             playback.start(series: series, selection: .preview(snapshot), context: playbackContext,
                 service: try model.playbackService(), currentContext: { playbackContext },
                 latestRecord: { model.record(for: series) },
                 progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
-        } catch { playback.fail(error, seriesID: series.id) }
+        } catch { transitionFrame = nil; playback.fail(error, seriesID: series.id) }
     }
 
     private func continuationChoice(_ choice: ContinuePlaybackChoice) -> some View {

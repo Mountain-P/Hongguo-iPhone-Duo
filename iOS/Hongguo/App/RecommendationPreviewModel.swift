@@ -3,10 +3,14 @@ import Combine
 import HongguoCore
 
 struct RecommendationFeedMedia: Identifiable, Sendable {
-    let id = UUID()
+    let id: UUID
     let series: Series
     let episode: Episode
     let service: any CatalogService
+    let resumeSeconds: Double
+    init(id: UUID = UUID(), series: Series, episode: Episode, service: any CatalogService, resumeSeconds: Double = 0) {
+        self.id = id; self.series = series; self.episode = episode; self.service = service; self.resumeSeconds = resumeSeconds
+    }
 }
 
 
@@ -44,6 +48,15 @@ final class RecommendationPreviewModel: ObservableObject {
     private var metadataFlights: [String: MetadataFlight] = [:]
     private var activeMetadataOwner: MetadataOwner?
     private var adjacentMetadataOwner: MetadataOwner?
+    private let sessionStore: PreviewSessionStore?
+    private(set) var sessionContextID = UUID()
+    private(set) var sessionRestoreTask: Task<Void, Never>?
+    private var sessionSaveTask: Task<Void, Never>?
+    private var loadAfterRestore = false
+    private var restoredSession: PreviewSession?
+    private var savedPosition: PreviewPlaybackSnapshot?
+
+    init(sessionStore: PreviewSessionStore? = nil) { self.sessionStore = sessionStore }
 
     private struct MetadataFlight {
         let id: UUID
@@ -74,6 +87,7 @@ final class RecommendationPreviewModel: ObservableObject {
         self.revision = revision; self.filterRevision = filterRevision; self.preferences = preferences
         rankingScope = scope; rankingProfile = profile
         self.catalogue = catalogue; self.playback = playback
+        restoreSession(scope: scope, category: preferences.category)
     }
 
     func updatePreferences(_ preferences: RecommendationPreferences) { self.preferences = preferences }
@@ -93,6 +107,8 @@ final class RecommendationPreviewModel: ObservableObject {
             cancelAdjacentPrefetch()
         }
         pruneMedia(); refreshReasons()
+        if let snapshot = savedPosition, preferences.isNotInterested(seriesID: snapshot.seriesID) { savedPosition = nil }
+        scheduleSessionSave()
         if let lease, startedPreviewIDs.contains(lease.seriesID) { prepareAdjacent(to: lease) }
         return change
     }
@@ -118,12 +134,17 @@ final class RecommendationPreviewModel: ObservableObject {
     }
 
     func invalidateSource() {
+        sessionContextID = UUID()
+        sessionRestoreTask?.cancel(); sessionRestoreTask = nil
+        sessionSaveTask?.cancel(); sessionSaveTask = nil
+        loadAfterRestore = false; restoredSession = nil; savedPosition = nil
         suspend(); queue.reset(); media = [:]; recentMediaIDs = []; detailErrors = [:]; startedPreviewIDs = []
         revision = nil; filterRevision = nil; catalogue = nil; playback = nil; pageError = nil
         rankingScope = nil; rankingProfile = nil; reasonByID = [:]; sourceLabelByID = [:]
     }
 
     func suspend() {
+        loadAfterRestore = false
         cancelAdjacentPrefetch()
         activation.invalidate(); lease = nil
         cancelActivePreparation()
@@ -162,6 +183,7 @@ final class RecommendationPreviewModel: ObservableObject {
         lease = next
         guard let next else { return }
         queue.select(seriesID: next.seriesID)
+        scheduleSessionSave()
         prepare(next)
         loadMoreIfNeeded()
     }
@@ -174,13 +196,17 @@ final class RecommendationPreviewModel: ObservableObject {
     }
 
     func loadInitial() {
-        guard items.isEmpty, queue.hasMore else { return }
+        if sessionRestoreTask != nil { loadAfterRestore = true; return }
+        guard queue.hasMore, items.isEmpty || queue.page == 0 else { return }
         loadPage()
     }
 
     /// Only an explicit reload restarts a fully consumed empty catalogue.
     func reloadEmptyCatalogue() {
         guard items.isEmpty else { return }
+        sessionContextID = UUID()
+        sessionRestoreTask?.cancel(); sessionRestoreTask = nil
+        restoredSession = nil; savedPosition = nil
         suspend(); queue.reset(); pageError = nil
         loadInitial()
     }
@@ -274,7 +300,7 @@ final class RecommendationPreviewModel: ObservableObject {
                 try Task.checkCancellation()
                 guard self.activation.accepts(lease), self.detailGeneration == request,
                       self.isRetained(seriesID: lease.seriesID) else { return }
-                self.media[lease.seriesID] = prepared
+                self.media[lease.seriesID] = self.adoptingSessionPosition(prepared)
                 self.touch(lease.seriesID)
             } catch is CancellationError { return }
             catch {
@@ -289,6 +315,75 @@ final class RecommendationPreviewModel: ObservableObject {
         recentMediaIDs.removeAll { $0 == id }; recentMediaIDs.append(id)
         while recentMediaIDs.count > 3 { media.removeValue(forKey: recentMediaIDs.removeFirst()) }
         pruneMedia()
+    }
+
+    /// Callers capture contextID when creating the card. Late callbacks cannot save into a replacement scope.
+    func rememberPreviewPosition(_ snapshot: PreviewPlaybackSnapshot, contextID: UUID) {
+        guard !Task.isCancelled, contextID == sessionContextID, rankingScope != nil,
+              current?.id == snapshot.seriesID, let prepared = media[snapshot.seriesID],
+              prepared.episode.number == 1, prepared.episode.isAvailable, prepared.episode.id == snapshot.episodeID,
+              !preferences.isNotInterested(seriesID: snapshot.seriesID),
+              snapshot.position.isFinite, snapshot.position >= 0, snapshot.duration.isFinite,
+              snapshot.duration > 0, snapshot.duration <= 4 * 60 * 60 else { return }
+        savedPosition = .init(seriesID: snapshot.seriesID, episodeID: snapshot.episodeID,
+                              position: min(snapshot.position, snapshot.duration), duration: snapshot.duration)
+        scheduleSessionSave()
+    }
+
+    func saveSession() async {
+        sessionSaveTask?.cancel(); sessionSaveTask = nil
+        await persistSession(contextID: sessionContextID)
+    }
+
+    private func scheduleSessionSave() {
+        guard sessionStore != nil, sessionSaveTask == nil, sessionRestoreTask == nil, current != nil else { return }
+        let contextID = sessionContextID
+        sessionSaveTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            guard let self, self.sessionContextID == contextID else { return }
+            defer { if self.sessionContextID == contextID { self.sessionSaveTask = nil } }
+            await self.persistSession(contextID: contextID)
+        }
+    }
+
+    private func persistSession(contextID: UUID) async {
+        guard !Task.isCancelled, contextID == sessionContextID, sessionRestoreTask == nil,
+              let store = sessionStore, let scope = rankingScope else { return }
+        let category = preferences.category, rows = items, currentID = current?.id, snapshot = savedPosition
+        do {
+            if let currentID {
+                try await store.save(scope: scope, category: category, items: rows, currentStableID: currentID, snapshot: snapshot)
+            } else { try await store.remove(scope: scope, category: category) }
+        } catch { /* This disposable cache never changes formal history or blocks playback. */ }
+    }
+
+    private func restoreSession(scope: LibraryScope, category: DirectWebService.Category) {
+        guard let store = sessionStore else { return }
+        let contextID = sessionContextID
+        sessionRestoreTask = Task { [weak self] in
+            let restored = try? await store.load(scope: scope, category: category, preferences: self?.preferences ?? .init(category: category))
+            guard !Task.isCancelled, let self, self.sessionContextID == contextID,
+                  self.rankingScope == scope, self.preferences.category == category else { return }
+            if let restored, self.items.isEmpty,
+               (try? self.queue.restoreLocalPrefix(items: restored.items, currentStableID: restored.currentStableID,
+                                                   preferences: self.preferences)) == true {
+                self.restoredSession = restored
+                self.savedPosition = self.current?.id == restored.currentStableID ? restored.snapshot : nil
+                self.refreshReasons()
+            }
+            self.sessionRestoreTask = nil
+            if self.loadAfterRestore { self.loadAfterRestore = false; self.loadInitial() }
+        }
+    }
+
+    private func adoptingSessionPosition(_ prepared: RecommendationFeedMedia) -> RecommendationFeedMedia {
+        guard let restored = restoredSession, restored.currentStableID == prepared.series.id else { return prepared }
+        restoredSession = nil
+        let detail = SeriesDetail(series: prepared.series, episodes: [prepared.episode])
+        let seconds = restored.resumeSeconds(in: detail)
+        if seconds == 0 { savedPosition = nil }
+        return .init(id: prepared.id, series: prepared.series, episode: prepared.episode,
+                     service: prepared.service, resumeSeconds: seconds)
     }
 
     private func pruneMedia() {
@@ -405,7 +500,7 @@ final class RecommendationPreviewModel: ObservableObject {
                     media = try await joined.task.value
                     try Task.checkCancellation()
                     guard self.acceptsPrefetch(request, seriesID: next.id, generation: generation) else { return }
-                    self.media[next.id] = media; self.touch(next.id)
+                    self.media[next.id] = self.adoptingSessionPosition(media); self.touch(next.id)
                 }
                 try Task.checkCancellation()
                 guard self.acceptsPrefetch(request, seriesID: next.id, generation: generation) else { return }

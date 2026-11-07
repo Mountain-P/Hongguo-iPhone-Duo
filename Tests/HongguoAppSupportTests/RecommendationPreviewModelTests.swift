@@ -365,8 +365,147 @@ struct RecommendationPreviewModelTests {
         #expect(await source.detailRequests == ["10", "20"])
     }
 
-    private func configured(_ source: PreviewCatalogueGate) -> RecommendationPreviewModel {
-        let model = RecommendationPreviewModel()
+    @Test func restoredNonFirstCardSurvivesBothSuccessfulAndFailedRealPageOneWithoutDuplicateLoads() async throws {
+        for shouldFail in [false, true] {
+            let fixture = try PreviewSessionFixture(); defer { fixture.clear() }
+            try await seedSession(fixture.store, scope: scope, ids: ["10", "20", "30"], current: "20", seconds: 35)
+            let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+            defer { model.invalidateSource(); cleanUp(model, source) }
+            model.loadInitial(); model.loadInitial()
+            let restore = try #require(model.sessionRestoreTask)
+            await restore.value
+            #expect(model.current?.id == "20" && model.queue.page == 0 && model.media.isEmpty && model.lease == nil)
+            try await wait { await source.hasHome(1) }
+            let page = try #require(model.catalogueTask)
+            if shouldFail { await source.failHome(1) }
+            else { await source.releaseHome(1, ids: ["20", "30", "40"]) }
+            await page.value
+            #expect(model.current?.id == "20")
+            #expect(model.queue.page == (shouldFail ? 0 : 1))
+            #expect(model.items.map(\.id) == (shouldFail ? ["10", "20", "30"] : ["10", "20", "30", "40"]))
+            #expect((model.pageError != nil) == shouldFail)
+            #expect(await source.homeRequests == [1])
+            #expect(await source.playbackRequests.isEmpty)
+        }
+    }
+
+    @Test func savingAndReopeningPreviewPreservesPositionOnlyAfterFreshFirstEpisodeVerification() async throws {
+        let fixture = try PreviewSessionFixture(); defer { fixture.clear() }
+        let formal = Data("formal library untouched".utf8)
+        fixture.defaults.set(formal, forKey: "library.v1.synthetic")
+        let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, source) }
+        await model.sessionRestoreTask?.value
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("20", model, source)
+        model.rememberPreviewPosition(.init(seriesID: "20", episodeID: "201", position: 35, duration: 90), contextID: model.sessionContextID)
+        await model.saveSession()
+        model.invalidateSource()
+        let reopenedSource = PreviewCatalogueGate(), reopened = configured(reopenedSource, sessionStore: fixture.store)
+        defer { reopened.invalidateSource(); cleanUp(reopened, reopenedSource) }
+        await reopened.sessionRestoreTask?.value
+        #expect(reopened.current?.id == "20" && reopened.media.isEmpty)
+        try await loadFirst(reopened, reopenedSource, ids: ["10", "20", "30"])
+        try await prepare("20", reopened, reopenedSource)
+        let media = try #require(reopened.media["20"])
+        #expect(media.episode.id == "201" && media.resumeSeconds == 35)
+        reopened.beginPaging(); activate("20", reopened)
+        #expect(reopened.media["20"]?.id == media.id && reopened.media["20"]?.resumeSeconds == 35)
+        #expect(await reopenedSource.detailRequests == ["20"])
+        #expect(fixture.defaults.data(forKey: "library.v1.synthetic") == formal)
+    }
+
+    @Test func aChangedFirstEpisodeCannotInheritTheSavedEpisodePosition() async throws {
+        let fixture = try PreviewSessionFixture(); defer { fixture.clear() }
+        try await seedSession(fixture.store, scope: scope, ids: ["20"], current: "20", seconds: 35)
+        let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, source) }
+        await model.sessionRestoreTask?.value
+        try await loadFirst(model, source, ids: ["20"])
+        activate("20", model)
+        try await wait { await source.hasDetail("20") }
+        let task = try #require(model.detailTask)
+        await source.releaseDetail("20", episodeID: "299")
+        await task.value
+        #expect(model.media["20"]?.episode.id == "299" && model.media["20"]?.resumeSeconds == 0)
+        model.rememberPreviewPosition(.init(seriesID: "20", episodeID: "201", position: 40, duration: 90), contextID: model.sessionContextID)
+        await model.saveSession()
+        #expect(try await fixture.store.load(scope: scope, category: .realDrama, preferences: .init())?.snapshot == nil)
+    }
+
+    @Test func aLateExclusionWhileRestoringNeverRestoresItsOldCurrentCardOrPosition() async throws {
+        let clock = PreviewSessionClockGate(), fixture = try PreviewSessionFixture(clock: clock)
+        defer { clock.release(); fixture.clear() }
+        try await seedSession(fixture.store, scope: scope, ids: ["10", "20", "30"], current: "20", seconds: 35)
+        clock.arm()
+        let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, source) }
+        let restore = try #require(model.sessionRestoreTask)
+        try await wait { clock.entered }
+        model.excludeNotInterested(try hidden(["20"]))
+        clock.release(); await restore.value
+        #expect(model.current?.id == "30" && model.items.map(\.id) == ["10", "30"])
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("30", model, source)
+        #expect(model.media["30"]?.resumeSeconds == 0 && model.media["20"] == nil)
+    }
+
+    @Test func lateSourceRestoreAndOldPositionCallbacksCannotOverwriteANewAccountsSession() async throws {
+        let clock = PreviewSessionClockGate(), fixture = try PreviewSessionFixture(clock: clock)
+        defer { clock.release(); fixture.clear() }
+        let account = LibraryScope(owner: .account(id: "42"), sourceID: "replacement-source")
+        try await seedSession(fixture.store, scope: scope, ids: ["10", "20"], current: "20", seconds: 30)
+        try await seedSession(fixture.store, scope: account, ids: ["20", "30"], current: "20", seconds: 70)
+        clock.arm()
+        let oldSource = PreviewCatalogueGate(), source = PreviewCatalogueGate()
+        let model = configured(oldSource, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, oldSource); Task { await source.finishAll() } }
+        model.loadInitial()
+        let old = try #require(model.sessionRestoreTask), oldContext = model.sessionContextID
+        try await wait { clock.entered }
+        model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
+                        profile: .init(scope: account, favorites: [], history: []), scope: account, catalogue: source, playback: source)
+        model.loadInitial()
+        let replacement = try #require(model.sessionRestoreTask)
+        clock.release(); await old.value; await replacement.value
+        #expect(model.items.map(\.id) == ["20", "30"] && model.current?.id == "20")
+        #expect(model.rankingScope == account && model.sessionContextID != oldContext)
+        #expect(await oldSource.homeRequests.isEmpty)
+        try await wait { await source.hasHome(1) }
+        let page = try #require(model.catalogueTask)
+        await source.releaseHome(1, ids: ["20", "30"]); await page.value
+        try await prepare("20", model, source)
+        #expect(model.media["20"]?.resumeSeconds == 70)
+        model.rememberPreviewPosition(.init(seriesID: "20", episodeID: "201", position: 5, duration: 90), contextID: oldContext)
+        await model.saveSession()
+        #expect(try await fixture.store.load(scope: account, category: .realDrama, preferences: .init())?.snapshot?.position == 70)
+        #expect(try await fixture.store.load(scope: scope, category: .realDrama, preferences: .init())?.snapshot?.position == 30)
+    }
+
+    @Test func leavingDuringLocalRestoreDoesNotStartBackgroundCatalogueWorkAndReentryStillLoadsPageOne() async throws {
+        let clock = PreviewSessionClockGate(), fixture = try PreviewSessionFixture(clock: clock)
+        defer { clock.release(); fixture.clear() }
+        try await seedSession(fixture.store, scope: scope, ids: ["10", "20"], current: "20", seconds: 35)
+        clock.arm()
+        let source = PreviewCatalogueGate(), model = configured(source, sessionStore: fixture.store)
+        defer { model.invalidateSource(); cleanUp(model, source) }
+        model.loadInitial()
+        let restore = try #require(model.sessionRestoreTask)
+        try await wait { clock.entered }
+        model.suspend(); clock.release(); await restore.value
+        #expect(model.current?.id == "20" && model.lease == nil && model.catalogueTask == nil)
+        #expect(await source.homeRequests.isEmpty)
+        try await loadFirst(model, source, ids: ["10", "20"])
+        #expect(model.current?.id == "20" && model.queue.page == 1)
+    }
+
+    private func seedSession(_ store: PreviewSessionStore, scope: LibraryScope, ids: [String], current: String, seconds: Double) async throws {
+        try await store.save(scope: scope, category: .realDrama, items: ids.map { .init(id: $0, title: "劇\($0)") },
+                             currentStableID: current, snapshot: .init(seriesID: current, episodeID: current + "1", position: seconds, duration: 90))
+    }
+
+    private func configured(_ source: PreviewCatalogueGate, sessionStore: PreviewSessionStore? = nil) -> RecommendationPreviewModel {
+        let model = RecommendationPreviewModel(sessionStore: sessionStore)
         model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
                         profile: .init(scope: scope, favorites: [], history: []), scope: scope,
                         catalogue: source, playback: source)
@@ -455,10 +594,11 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
     func releaseHome(_ page: Int, ids: [String], more: Bool = false) {
         homes.removeValue(forKey: page)?.resume(returning: .init(items: ids.map { .init(id: $0, title: "劇\($0)") }, page: page, hasMore: more))
     }
-    func releaseDetail(_ id: String) {
+    func releaseDetail(_ id: String, episodeID: String? = nil) {
         details.removeValue(forKey: id)?.resume(returning: .init(series: .init(id: id, title: "劇\(id)"),
-            episodes: [.init(id: "\(id)1", number: 1, title: "第1集")]))
+            episodes: [.init(id: episodeID ?? "\(id)1", number: 1, title: "第1集")]))
     }
+    func failHome(_ page: Int) { homes.removeValue(forKey: page)?.resume(throwing: CatalogError.network) }
     func releasePlayback(_ id: String) {
         playbacks.removeValue(forKey: id)?.resume(returning: .init(url: URL(string: "https://example.invalid/test.mp4")!))
     }
@@ -470,6 +610,35 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
         for continuation in detail { continuation.resume(throwing: CancellationError()) }
         for continuation in playback { continuation.resume(throwing: CancellationError()) }
     }
+}
+
+private final class PreviewSessionClockGate: @unchecked Sendable {
+    private let lock = NSLock(), semaphore = DispatchSemaphore(value: 0)
+    private var armed = false, blocked = false
+    var entered: Bool { lock.withLock { blocked } }
+    func arm() { lock.withLock { armed = true; blocked = false } }
+    func release() { semaphore.signal() }
+    func now() -> Date {
+        let shouldBlock = lock.withLock { () -> Bool in
+            guard armed else { return false }
+            armed = false; blocked = true; return true
+        }
+        if shouldBlock { semaphore.wait() }
+        return Date(timeIntervalSince1970: 10_000)
+    }
+}
+
+@MainActor
+private final class PreviewSessionFixture {
+    let name: String
+    let defaults: UserDefaults
+    let store: PreviewSessionStore
+    init(clock: PreviewSessionClockGate? = nil) throws {
+        name = "Hongguo.PreviewModelSessionTests.\(UUID().uuidString)"
+        defaults = try #require(UserDefaults(suiteName: name))
+        store = PreviewSessionStore(defaults: defaults, storageKey: "synthetic.preview-session", now: { clock?.now() ?? Date() })
+    }
+    func clear() { defaults.removePersistentDomain(forName: name) }
 }
 
 private final class PreviewDetailCancellations: @unchecked Sendable {

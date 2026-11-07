@@ -67,7 +67,7 @@ for configuration in ["Debug", "Release"]:
         "CODE_SIGN_STYLE": "Automatic", "DEVELOPMENT_TEAM": "", "GENERATE_INFOPLIST_FILE": "NO",
         "INFOPLIST_FILE": "Info.plist", "TARGETED_DEVICE_FAMILY": "1",
         "SUPPORTED_PLATFORMS": "iphoneos iphonesimulator", "SUPPORTS_MACCATALYST": "NO",
-        "MARKETING_VERSION": VERSION, "CURRENT_PROJECT_VERSION": "25",
+        "MARKETING_VERSION": VERSION, "CURRENT_PROJECT_VERSION": "26",
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
         "ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME": "AccentColor",
         "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
