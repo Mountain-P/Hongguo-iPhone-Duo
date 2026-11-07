@@ -62,7 +62,7 @@ final class PlayerModel: ObservableObject {
     }
 
     func beginSpeedBoost() {
-        guard hasStarted, !isLoading, errorMessage == nil else { return }
+        guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
         playbackSpeed.beginHold()
         applyPlaybackRate()
     }
@@ -73,7 +73,7 @@ final class PlayerModel: ObservableObject {
     }
 
     func lockSpeedBoost() {
-        guard hasStarted, !isLoading, errorMessage == nil else { return }
+        guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
         playbackSpeed.lock()
         applyPlaybackRate()
     }
@@ -99,7 +99,7 @@ final class PlayerModel: ObservableObject {
     }
 
     private func resumePlayback() {
-        guard hasStarted, sceneActive, !isLoading, errorMessage == nil else { return }
+        guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
         playbackSpeed.requestPlayback()
         applyPlaybackRate()
         player.playImmediately(atRate: effectiveSpeed)
@@ -120,6 +120,10 @@ final class PlayerModel: ObservableObject {
     private var progressObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var stalledObserver: NSObjectProtocol?
+    private var audioInterruptionObserver: NSObjectProtocol?
+    private var audioRouteObserver: NSObjectProtocol?
+    private var audioObserverGeneration = UUID()
+    private var audioPolicy = PlaybackInterruptionPolicy()
     private var hasStarted = false
     private var preparingGeneration: UUID?
     private var didStart = false
@@ -156,6 +160,7 @@ final class PlayerModel: ObservableObject {
     func start() {
         guard !didStart else { return }
         didStart = true
+        observeAudioEvents()
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try AVAudioSession.sharedInstance().setActive(true)
@@ -236,6 +241,7 @@ final class PlayerModel: ObservableObject {
     func togglePlayback() {
         guard hasStarted, !isLoading, errorMessage == nil else { return }
         if canPausePlayback { pauseAndSave() }
+        else if !audioPolicy.permitsPlayback(sceneActive: sceneActive) { return }
         else if PlaybackReplay.shouldRestart(position: elapsed, duration: duration, reachedEnd: reachedEnd) {
             restartFromBeginning()
         } else { resumePlayback() }
@@ -294,6 +300,8 @@ final class PlayerModel: ObservableObject {
     }
 
     func stop() {
+        removeAudioObservers()
+        audioPolicy = PlaybackInterruptionPolicy()
         cancelNextEpisodePrefetch()
         finishDiagnostics(outcome: .cancelled)
         saveProgress()
@@ -322,7 +330,7 @@ final class PlayerModel: ObservableObject {
         let requestGeneration = UUID()
         generation = requestGeneration
         player.pause()
-        clearItem(autoplay: autoplay && sceneActive)
+        clearItem(autoplay: autoplay && audioPolicy.permitsPlayback(sceneActive: sceneActive))
         currentEpisode = episode
         pendingResume = position.isFinite ? max(0, position) : 0
         elapsed = pendingResume
@@ -374,9 +382,11 @@ final class PlayerModel: ObservableObject {
                 }
             }
         }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.generation == requestGeneration else { return }
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self, weak item] _ in
+            Task { @MainActor [weak self, weak item] in
+                guard let self, let item, self.generation == requestGeneration, self.player.currentItem === item else { return }
+                let shouldAdvance = self.audioPolicy.shouldAdvanceAfterEnd(sceneActive: self.sceneActive,
+                    wantsPlayback: self.playbackSpeed.wantsPlayback, autoNext: self.autoNext)
                 self.updateDuration()
                 self.elapsed = self.duration
                 self.saveProgress(completed: true)
@@ -385,7 +395,7 @@ final class PlayerModel: ObservableObject {
                 self.playbackSpeed.pause()
                 self.isPlaying = false
                 self.isBuffering = false
-                if self.autoNext { self.playNext() }
+                if shouldAdvance { self.playNext() }
             }
         }
         stalledObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] notification in
@@ -452,6 +462,47 @@ final class PlayerModel: ObservableObject {
         guard let id = diagnosticsID else { return }
         PlaybackDiagnostics.shared.finish(id: id, outcome: outcome)
         diagnosticsID = nil
+    }
+
+    private func observeAudioEvents() {
+        removeAudioObservers()
+        let token = audioObserverGeneration
+        audioInterruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] notification in
+                guard let raw = (notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue,
+                      let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+                let event: PlaybackInterruptionPolicy.Event
+                switch type {
+                case .began: event = .began
+                case .ended: event = .ended
+                @unknown default: return
+                }
+                Task { @MainActor [weak self] in
+                    guard let self, self.audioObserverGeneration == token, self.didStart else { return }
+                    self.handleAudioEvent(event)
+                }
+            }
+        audioRouteObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] notification in
+                guard let raw = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? NSNumber)?.uintValue,
+                      let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+                let event: PlaybackInterruptionPolicy.Event = reason == .oldDeviceUnavailable ? .oldDeviceUnavailable : .otherRouteChange
+                Task { @MainActor [weak self] in
+                    guard let self, self.audioObserverGeneration == token, self.didStart else { return }
+                    self.handleAudioEvent(event)
+                }
+            }
+    }
+
+    private func removeAudioObservers() {
+        audioObserverGeneration = UUID()
+        if let observer = audioInterruptionObserver { NotificationCenter.default.removeObserver(observer) }
+        if let observer = audioRouteObserver { NotificationCenter.default.removeObserver(observer) }
+        audioInterruptionObserver = nil; audioRouteObserver = nil
+    }
+
+    private func handleAudioEvent(_ event: PlaybackInterruptionPolicy.Event) {
+        if audioPolicy.receive(event) == .pause { pauseAndSave() }
     }
 
     private func updateNextEpisodePrefetch() {
