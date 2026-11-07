@@ -173,7 +173,10 @@ struct RecommendationPreviewView: View {
             if scrollID == nil || !ids.contains(scrollID ?? "") { scrollID = preview.current?.id ?? ids.first }
             refreshEligibility()
         }
-        .onChange(of: scrollID) { _, _ in refreshEligibility() }
+        .onChange(of: scrollID) { _, id in
+            if let failed = playback.failedSeriesID, id != failed { playback.cancelPending() }
+            refreshEligibility()
+        }
         .onChange(of: detailSeries) { _, detail in
             if detail != nil { requiresManualResume = true; preview.suspend(); playback.cancelPending() }
             refreshEligibility()
@@ -195,9 +198,20 @@ struct RecommendationPreviewView: View {
         .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
         .overlay(alignment: .bottom) {
             if let message = playback.errorMessage {
-                HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 12) {
                     Text(message).font(.footnote)
-                    Button("關閉") { playback.cancelPending() }
+                    HStack(spacing: 20) {
+                        Spacer(minLength: 0)
+                        if playback.canRetry {
+                            Button("重試") {
+                                guard alignedID == playback.failedSeriesID, phaseIsIdle else { playback.cancelPending(); return }
+                                playback.retry()
+                            }
+                                .disabled(!playbackContext.permitsStart || alignedID != playback.failedSeriesID || !phaseIsIdle)
+                                .accessibilityIdentifier("preview.retryFollowing")
+                        }
+                        Button("關閉") { playback.cancelPending() }
+                    }.font(.subheadline.weight(.semibold))
                 }
                 .padding(16).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                 .padding(18).padding(.bottom, max(bottomControlInset, 0))

@@ -18,7 +18,7 @@ struct ContinuePlaybackRoute: Identifiable {
     let onProgress: (Episode, Double, Double) -> Void
 }
 
-private enum ContinuePlaybackError: Error, LocalizedError {
+private enum ContinuePlaybackError: Error, LocalizedError, Equatable {
     case recordRemoved, recordChanged
     var errorDescription: String? {
         switch self {
@@ -51,27 +51,36 @@ final class ContinuePlaybackModel: ObservableObject {
     @Published private(set) var failedSeriesID: String?
     @Published private(set) var errorMessage: String?
     @Published private(set) var pendingChoice: ContinuePlaybackChoice?
+    @Published private(set) var canRetry = false
     private let loadDetail: @Sendable (any CatalogService, String) async throws -> SeriesDetail
     private var context: ContinuePlaybackContext?
     private var generation = UUID()
     private(set) var operation: Task<Void, Never>?
-    private struct PendingPreview {
-        let request: UUID
+    private struct LaunchIntent {
+        let series: Series
+        let requiresRecord: Bool
+        let selection: ContinuePlaybackSelection
         let context: ContinuePlaybackContext
-        let detail: SeriesDetail
         let service: any CatalogService
-        let snapshot: PreviewPlaybackSnapshot
-        let record: WatchRecord?
         let currentContext: @MainActor () -> ContinuePlaybackContext
         let latestRecord: @MainActor () -> WatchRecord?
         let progressFactory: @MainActor (SeriesDetail) -> ProgressHandler
     }
+    private struct PendingPreview {
+        let request: UUID
+        let intent: LaunchIntent
+        let detail: SeriesDetail
+        let record: WatchRecord?
+    }
+    private var launchIntent: LaunchIntent?
     private var pendingPreview: PendingPreview?
 
     init(loadDetail: @escaping @Sendable (any CatalogService, String) async throws -> SeriesDetail = { service, id in
         if let bridge = service as? BridgeService { return try await bridge.verifiedDetail(id: id) }
         return try await service.detail(id: id)
     }) { self.loadDetail = loadDetail }
+
+    deinit { operation?.cancel() }
 
     func updateContext(_ value: ContinuePlaybackContext) {
         guard context != value else { return }
@@ -88,75 +97,115 @@ final class ContinuePlaybackModel: ObservableObject {
                currentContext: @escaping @MainActor () -> ContinuePlaybackContext,
                latestRecord: @escaping @MainActor () -> WatchRecord?,
                progressFactory: @escaping @MainActor (SeriesDetail) -> ProgressHandler) {
-        guard !Task.isCancelled, value.permitsStart, currentContext() == value else { return }
-        updateContext(value)
-        guard route == nil else { return }
+        guard !Task.isCancelled, route == nil else { return }
         cancelPending()
+        guard value.permitsStart, currentContext() == value else { return }
+        updateContext(value)
+        begin(.init(series: series, requiresRecord: requiresRecord, selection: selection, context: value,
+                    service: service, currentContext: currentContext, latestRecord: latestRecord, progressFactory: progressFactory))
+    }
+
+    /// Explicit, read-only re-preparation. The original preview snapshot is never recaptured.
+    func retry() {
+        guard canRetry, operation == nil, preparingSeriesID == nil, pendingChoice == nil, route == nil,
+              let intent = launchIntent else { return }
+        guard !Task.isCancelled, context == intent.context, intent.context.permitsStart,
+              intent.currentContext() == intent.context else { cancelPending(); return }
+        begin(intent)
+    }
+
+    private func begin(_ intent: LaunchIntent) {
+        cancelPending()
+        launchIntent = intent
         let request = generation
-        preparingSeriesID = series.id
+        let loader = loadDetail
+        preparingSeriesID = intent.series.id
         operation = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.generation == request { self.preparingSeriesID = nil; self.operation = nil }
-            }
+            // Do not retain the model across an uncooperative transport suspension.
+            defer { self?.finish(request: request) }
             do {
-                let detail = try await self.loadDetail(service, series.id)
+                let detail = try await loader(intent.service, intent.series.id)
                 try Task.checkCancellation()
-                guard self.generation == request, self.context == value, currentContext() == value else { return }
-                guard detail.series.id == series.id else { throw CatalogError.malformedResponse }
-                let record = latestRecord()
-                if requiresRecord, record?.series.id != series.id { throw ContinuePlaybackError.recordRemoved }
-                if case .preview(let snapshot) = selection {
-                    guard snapshot.seriesID == series.id, let preview = snapshot.continuation(in: detail) else {
-                        throw CatalogError.unavailablePlayback
-                    }
-                    if let record, record.series.id == series.id,
-                       detail.episodes.contains(where: { $0.id == record.episode.id && $0.isAvailable }),
-                       let saved = PlaybackContinuation.preferred(seriesID: series.id, episodes: detail.episodes, record: record),
-                       !PreviewPlaybackEquivalence.canContinueWithoutChoice(snapshot: snapshot, record: record, detail: detail) {
-                        self.pendingPreview = .init(request: request, context: value, detail: detail, service: service,
-                            snapshot: snapshot, record: record, currentContext: currentContext,
-                            latestRecord: latestRecord, progressFactory: progressFactory)
-                        self.pendingChoice = .init(seriesID: series.id, saved: saved, preview: preview)
-                    } else {
-                        self.present(detail: detail, continuation: preview, service: service, progressFactory: progressFactory)
-                    }
-                    return
-                }
-                guard let continuation = PlaybackContinuation.preferred(seriesID: series.id, episodes: detail.episodes,
-                                                                        record: record) else {
-                    throw CatalogError.unavailablePlayback
-                }
-                // No suspension between the live context check and creating the
-                // captured-scope progress handler.
-                self.present(detail: detail, continuation: continuation, service: service, progressFactory: progressFactory)
-            } catch is CancellationError { return }
+                try self?.accept(detail: detail, intent: intent, request: request)
+            } catch is CancellationError { self?.discardCancelled(request: request) }
             catch {
-                guard self.generation == request, self.context == value, currentContext() == value, !Task.isCancelled else { return }
-                self.failedSeriesID = series.id; self.errorMessage = error.localizedDescription
+                self?.recordFailure(error, intent: intent, request: request)
             }
         }
+    }
+
+    private func accepts(_ intent: LaunchIntent, request: UUID) -> Bool {
+        generation == request && context == intent.context && intent.context.permitsStart
+            && intent.currentContext() == intent.context
+    }
+
+    private func accept(detail: SeriesDetail, intent: LaunchIntent, request: UUID) throws {
+        guard accepts(intent, request: request) else { discardCancelled(request: request); return }
+        guard detail.series.id == intent.series.id else { throw CatalogError.malformedResponse }
+        let record = intent.latestRecord()
+        if intent.requiresRecord, record?.series.id != intent.series.id { throw ContinuePlaybackError.recordRemoved }
+        if case .preview(let snapshot) = intent.selection {
+            guard snapshot.seriesID == intent.series.id, let preview = snapshot.continuation(in: detail) else {
+                throw CatalogError.unavailablePlayback
+            }
+            if let record, record.series.id == intent.series.id,
+               detail.episodes.contains(where: { $0.id == record.episode.id && $0.isAvailable }),
+               let saved = PlaybackContinuation.preferred(seriesID: intent.series.id, episodes: detail.episodes, record: record),
+               !PreviewPlaybackEquivalence.canContinueWithoutChoice(snapshot: snapshot, record: record, detail: detail) {
+                pendingPreview = .init(request: request, intent: intent, detail: detail, record: record)
+                pendingChoice = .init(seriesID: intent.series.id, saved: saved, preview: preview)
+            } else {
+                present(detail: detail, continuation: preview, service: intent.service, progressFactory: intent.progressFactory)
+            }
+            return
+        }
+        guard let continuation = PlaybackContinuation.preferred(seriesID: intent.series.id, episodes: detail.episodes, record: record) else {
+            throw CatalogError.unavailablePlayback
+        }
+        // No suspension between the live context check and capturing the original-scope handler.
+        present(detail: detail, continuation: continuation, service: intent.service, progressFactory: intent.progressFactory)
+    }
+
+    private func finish(request: UUID) {
+        guard generation == request else { return }
+        preparingSeriesID = nil; operation = nil
+    }
+
+    private func discardCancelled(request: UUID) {
+        guard generation == request else { return }
+        cancelPending()
+    }
+
+    private func recordFailure(_ error: any Error, intent: LaunchIntent, request: UUID) {
+        guard !Task.isCancelled, accepts(intent, request: request) else { discardCancelled(request: request); return }
+        let retryable = (error as? ContinuePlaybackError) == .recordChanged
+            || PlaybackRecovery.shouldRetry(error, attempt: 0)
+        finish(request: request)
+        pendingChoice = nil; pendingPreview = nil
+        launchIntent = retryable ? intent : nil
+        failedSeriesID = intent.series.id; errorMessage = error.localizedDescription
+        canRetry = retryable
     }
 
     /// A dialog is only an offer. Recheck the live scope and saved record when it is accepted.
     func choose(_ selection: ContinuePlaybackChoiceSelection, choiceID: UUID) {
         guard let choice = pendingChoice, choice.id == choiceID, let pending = pendingPreview else { return }
-        guard !Task.isCancelled, generation == pending.request, context == pending.context,
-              pending.context.permitsStart, pending.currentContext() == pending.context else {
+        guard !Task.isCancelled, accepts(pending.intent, request: pending.request) else {
             cancelPending(); return
         }
-        guard pending.latestRecord() == pending.record else {
-            fail(ContinuePlaybackError.recordChanged, seriesID: pending.detail.series.id)
+        guard pending.intent.latestRecord() == pending.record else {
+            recordFailure(ContinuePlaybackError.recordChanged, intent: pending.intent, request: pending.request)
             return
         }
         let continuation = selection == .saved ? choice.saved : choice.preview
         pendingChoice = nil; pendingPreview = nil
-        present(detail: pending.detail, continuation: continuation, service: pending.service, progressFactory: pending.progressFactory)
+        present(detail: pending.detail, continuation: continuation, service: pending.intent.service, progressFactory: pending.intent.progressFactory)
     }
 
     private func present(detail: SeriesDetail, continuation: PlaybackContinuation, service: any CatalogService,
                          progressFactory: @MainActor (SeriesDetail) -> ProgressHandler) {
         let progress = progressFactory(detail)
+        launchIntent = nil; canRetry = false
         route = .init(detail: detail, continuation: continuation, service: service, onProgress: progress)
     }
 
@@ -165,6 +214,7 @@ final class ContinuePlaybackModel: ObservableObject {
     }
 
     func cancelPending() {
+        canRetry = false; launchIntent = nil
         generation = UUID(); operation?.cancel(); operation = nil
         preparingSeriesID = nil; failedSeriesID = nil; errorMessage = nil
         pendingChoice = nil; pendingPreview = nil

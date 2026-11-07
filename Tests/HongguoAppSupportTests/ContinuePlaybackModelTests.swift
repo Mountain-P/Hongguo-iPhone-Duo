@@ -316,6 +316,211 @@ struct ContinuePlaybackModelTests {
         }
     }
 
+    @Test func explicitRetryPreservesTheOriginalSnapshotReadsTheLatestRecordAndCoalescesDoubleTaps() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+        var snapshot = preview(position: 20)
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(snapshot))
+        let first = try #require(launcher.operation)
+        await service.waitForCalls(1); await service.fail("100"); await first.value
+        #expect(launcher.canRetry && launcher.operation == nil && launcher.preparingSeriesID == nil)
+        #expect(launcher.pendingChoice == nil && launcher.route == nil && box.factories == 0)
+        #expect(await service.detailCalls == 1)
+        snapshot = preview(position: 80)
+        launcher.retry(); launcher.retry()
+        let retry = try #require(launcher.operation)
+        #expect(!launcher.canRetry && launcher.errorMessage == nil && launcher.preparingSeriesID == "100")
+        await service.waitForCalls(2); box.record = record(seconds: 55)
+        await service.release("100", detail: detail()); await retry.value
+        let choice = try #require(launcher.pendingChoice)
+        #expect(choice.saved.seconds == 55 && choice.preview.seconds == 20 && snapshot.position == 80)
+        #expect(await service.detailCalls == 2)
+        launcher.choose(.preview, choiceID: choice.id)
+        #expect(launcher.route?.continuation.seconds == 20 && !launcher.canRetry)
+        #expect(box.progressOwners.isEmpty && box.factories == 1)
+    }
+
+    @Test func aChangedChoiceCanRetryWithFreshDetailAndRecordWithoutReusingItsOldDecision() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 20)))
+        let first = try #require(launcher.operation)
+        await service.waitForCalls(1); await service.release("100", detail: detail()); await first.value
+        let oldChoice = try #require(launcher.pendingChoice)
+        box.record = record(seconds: 55)
+        launcher.choose(.saved, choiceID: oldChoice.id)
+        #expect(launcher.canRetry && launcher.pendingChoice == nil && launcher.route == nil && box.factories == 0)
+        launcher.retry()
+        let retry = try #require(launcher.operation)
+        launcher.choose(.preview, choiceID: oldChoice.id)
+        #expect(launcher.route == nil && launcher.preparingSeriesID == "100")
+        await service.waitForCalls(2); box.record = record(seconds: 70)
+        let freshDetail = SeriesDetail(series: .init(id: "100", title: "Fresh fixture"), episodes: [
+            .init(id: "900", number: 1, title: "Updated episode"), .init(id: "903", number: 4, title: "New episode")])
+        await service.release("100", detail: freshDetail); await retry.value
+        let updated = try #require(launcher.pendingChoice)
+        #expect(updated.id != oldChoice.id && updated.saved.seconds == 70 && updated.preview.seconds == 20)
+        #expect(updated.preview.episode.title == "Updated episode" && !launcher.canRetry)
+        launcher.choose(.saved, choiceID: oldChoice.id)
+        #expect(launcher.route == nil && launcher.pendingChoice?.id == updated.id)
+        launcher.choose(.preview, choiceID: updated.id)
+        let route = try #require(launcher.route)
+        #expect(route.detail.series.title == "Fresh fixture" && route.continuation.seconds == 20)
+        box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+        launcher.updateContext(box.context)
+        route.onProgress(route.continuation.episode, 25, 90)
+        #expect(box.progressOwners == [.guest] && launcher.route == nil)
+    }
+
+    @Test func retryIsOffForDenialMalformedUnsupportedUnknownAndCancellationButOnForKnownTransientFailures() async throws {
+        let failures: [(any Error, Bool)] = [
+            (CatalogError.network, true), (CatalogError.httpStatus(500), true), (CatalogError.httpStatus(503), true),
+            (URLError(.timedOut), true), (URLError(.notConnectedToInternet), true),
+            (CatalogError.unauthorized, false), (CatalogError.httpStatus(401), false), (CatalogError.httpStatus(403), false),
+            (CatalogError.invalidConfiguration, false), (CatalogError.malformedResponse, false),
+            (CatalogError.incompatibleBridge, false), (CatalogError.unavailablePlayback, false),
+            (CatalogError.unsafePlaybackURL, false), (NSError(domain: "UnknownFixtureError", code: 1), false),
+            (CancellationError(), false), (URLError(.cancelled), false)
+        ]
+        for (error, retryable) in failures {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.fail("100", error: error); await operation.value
+            #expect(launcher.canRetry == retryable)
+            #expect(launcher.operation == nil && launcher.preparingSeriesID == nil && launcher.pendingChoice == nil && launcher.route == nil)
+            #expect(await service.detailCalls == 1)
+            #expect(box.factories == 0)
+        }
+    }
+
+    @Test func cancelDismissNewStartAndContextChangesDiscardFailedRetryIntents() async throws {
+        for change in 0..<8 {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.fail("100"); await operation.value
+            #expect(launcher.canRetry)
+            switch change {
+            case 0: launcher.cancelPending()
+            case 1: launcher.dismiss()
+            case 2: box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+            case 3: box.context = .init(owner: .guest, revision: UUID(), sceneActive: true)
+            case 4: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: false)
+            case 5: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: true, parentActive: false)
+            case 6: launcher.fail(CatalogError.invalidConfiguration, seriesID: "200")
+            default:
+                box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: false)
+                launch(launcher, seriesID: "200", service: service, box: box, requiresRecord: false)
+            }
+            if (2...5).contains(change) { launcher.updateContext(box.context) }
+            launcher.retry()
+            #expect(!launcher.canRetry && launcher.operation == nil && launcher.route == nil)
+            #expect(await service.detailCalls == 1)
+        }
+    }
+
+    @Test func retryRechecksTheLiveContextEvenIfTheViewHasNotReportedItsChangeYet() async throws {
+        for change in 0..<4 {
+            let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+            launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher.operation)
+            await service.waitForCalls(1); await service.fail("100"); await operation.value
+            switch change {
+            case 0: box.context = .init(owner: .account(id: "42"), revision: box.context.revision, sceneActive: true)
+            case 1: box.context = .init(owner: .guest, revision: UUID(), sceneActive: true)
+            case 2: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: false)
+            default: box.context = .init(owner: .guest, revision: box.context.revision, sceneActive: true, parentActive: false)
+            }
+            launcher.retry()
+            #expect(!launcher.canRetry && launcher.errorMessage == nil && launcher.operation == nil)
+            #expect(await service.detailCalls == 1)
+        }
+    }
+
+    @Test func repeatedTransientFailuresWaitForEachExplicitRetryAndEventuallyUseTheOriginalSnapshot() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 25)))
+        let first = try #require(launcher.operation)
+        await service.waitForCalls(1); await service.fail("100"); await first.value
+        launcher.retry()
+        let second = try #require(launcher.operation)
+        await service.waitForCalls(2); await service.fail("100", error: CatalogError.httpStatus(503)); await second.value
+        #expect(launcher.canRetry && launcher.operation == nil && launcher.route == nil)
+        #expect(await service.detailCalls == 2)
+        launcher.retry()
+        let third = try #require(launcher.operation)
+        await service.waitForCalls(3); await service.release("100", detail: detail()); await third.value
+        #expect(launcher.route?.continuation.seconds == 25 && !launcher.canRetry && launcher.errorMessage == nil)
+        #expect(await service.detailCalls == 3)
+    }
+
+    @Test func anOldCancelledReplyCannotClearANewerRetryOrMakeItsErrorRetryable() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+        launch(launcher, service: service, box: box, requiresRecord: false)
+        let old = try #require(launcher.operation)
+        await service.waitForCalls(1)
+        launch(launcher, seriesID: "200", service: service, box: box, requiresRecord: false)
+        let replacement = try #require(launcher.operation)
+        await service.waitForCalls(2); await service.fail("200"); await replacement.value
+        #expect(launcher.canRetry && launcher.failedSeriesID == "200")
+        launcher.retry()
+        let retry = try #require(launcher.operation)
+        await service.waitForCalls(3)
+        await service.release("100", detail: detail()); await old.value
+        #expect(!launcher.canRetry && launcher.preparingSeriesID == "200" && launcher.operation != nil && launcher.errorMessage == nil)
+        await service.release("200", detail: detail(seriesID: "200")); await retry.value
+        #expect(launcher.route?.detail.series.id == "200" && !launcher.canRetry)
+    }
+
+    @Test func aCancelledStaleStartCannotCancelAFreshPendingLaunch() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
+        launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 25)))
+        let fresh = try #require(launcher.operation)
+        await service.waitForCalls(1)
+        let stale = Task { @MainActor in
+            #expect(Task.isCancelled)
+            launch(launcher, seriesID: "200", service: service, box: box, requiresRecord: false)
+        }
+        stale.cancel()
+        await stale.value
+        #expect(launcher.preparingSeriesID == "100" && launcher.operation != nil && !launcher.canRetry)
+        #expect(await service.detailCalls == 1)
+        await service.release("100", detail: detail()); await fresh.value
+        #expect(launcher.route?.detail.series.id == "100" && launcher.route?.continuation.seconds == 25)
+        #expect(box.factories == 1)
+    }
+
+    @Test func retryStillRequiresTheHistoryRecordWhenTheOriginalEntryPointRequiredIt() async throws {
+        let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+        launch(launcher, service: service, box: box, selection: .preview(preview()))
+        let first = try #require(launcher.operation)
+        await service.waitForCalls(1); await service.fail("100"); await first.value
+        launcher.retry()
+        let retry = try #require(launcher.operation)
+        await service.waitForCalls(2); box.record = nil
+        await service.release("100", detail: detail()); await retry.value
+        #expect(launcher.route == nil && launcher.pendingChoice == nil && !launcher.canRetry && launcher.errorMessage != nil)
+        #expect(box.factories == 0)
+    }
+
+    @Test func aSuspendedTransportAndAnIdleRetryIntentDoNotRetainTheLauncher() async throws {
+        for failFirst in [false, true] {
+            let service = ContinueServiceProbe(), box = ContinueBox(record: nil)
+            var launcher: ContinuePlaybackModel? = ContinuePlaybackModel()
+            let weakLauncher = WeakContinueLauncher(launcher)
+            launch(try #require(launcher), service: service, box: box, requiresRecord: false, selection: .preview(preview()))
+            let operation = try #require(launcher?.operation)
+            await service.waitForCalls(1)
+            if failFirst {
+                await service.fail("100"); await operation.value
+                #expect(launcher?.canRetry == true)
+            }
+            launcher = nil
+            #expect(weakLauncher.value == nil)
+            if !failFirst { await service.release("100", detail: detail()); await operation.value }
+            #expect(box.factories == 0)
+        }
+    }
+
     private func preview(episodeID: String = "900", position: Double = 20) -> PreviewPlaybackSnapshot {
         .init(seriesID: "100", episodeID: episodeID, position: position, duration: 90)
     }
@@ -337,6 +542,12 @@ struct ContinuePlaybackModelTests {
     private func record(id: String = "900", number: Int = 1, seconds: Double = 30) -> WatchRecord {
         .init(series: .init(id: "100", title: "Fixture"), episode: .init(id: id, number: number, title: "Saved"), seconds: seconds, duration: 90)
     }
+}
+
+@MainActor
+private final class WeakContinueLauncher {
+    weak var value: ContinuePlaybackModel?
+    init(_ value: ContinuePlaybackModel?) { self.value = value }
 }
 
 @MainActor
@@ -364,7 +575,7 @@ private actor ContinueServiceProbe: CatalogService {
         await withCheckedContinuation { waiters.append((count, $0)) }
     }
     func release(_ id: String, detail: SeriesDetail) { gates.removeValue(forKey: id)?.resume(returning: detail) }
-    func fail(_ id: String) { gates.removeValue(forKey: id)?.resume(throwing: CatalogError.network) }
+    func fail(_ id: String, error: any Error = CatalogError.network) { gates.removeValue(forKey: id)?.resume(throwing: error) }
     func home(page: Int) async throws -> SeriesPage { throw CatalogError.network }
     func search(query: String, page: Int) async throws -> SeriesPage { throw CatalogError.network }
     func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
