@@ -1,8 +1,10 @@
 # 內容核心驗證
 
-`HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。核心測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
+`HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.4.4／build 14。已執行完整核心回歸：**199 項、23 個 suites，198 項通過、1 項可選 `currentWebsiteSnapshot` 略過**，記錄於 `build/core-0.4.4-tests.log`。UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 9、RecommendationFeedActivation 7 均參與並通過；簽署裝置建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以核心測試替代實機帳號驗證或同頁 feed 的實際手勢驗收。
+當前程式版本為 0.5.0／build 15。已執行最終完整回歸：**Core 245 項／29 個 suites，244 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 8 項／1 個 suite，全部通過**。合計登錄 253 項，252 通過、1 略過，記錄於 `build/core-0.5.0-validated-tests.log`。AppSupport 測試使用合成片庫、隔離的 defaults 與注入儲存／metadata，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以這些測試替代實機帳號、手勢或掉幀／耗電量測。
+
+歷史 0.4.4／build 14 完整核心回歸為 199 項、23 個 suites，198 通過、1 項可選快照略過，記錄於 `build/core-0.4.4-tests.log`。該版包含 UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 9 與 RecommendationFeedActivation 7。
 
 歷史 0.4.3／build 13 最終完整核心回歸為 190 項、22 個 suites，189 項通過、1 項可選快照略過，記錄於 `build/core-0.4.3-tests-final.log`。該版包含 UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7 與當時 7 項 RecommendationPreviewQueue；同頁 feed 的新增資格與穩定 ID 測試屬後續 0.4.4。
 
@@ -20,7 +22,9 @@ Discovery 測試涵蓋公開分類與動態題材、四榜單 alias、inline／d
 
 PlaybackSpeed 共 15 項，涵蓋選定速度、暫時長按／放開、鎖定／解除、背景取消、手動選速、無效輸入、等待中的速率更新與等速回饋抑制，以及暫停／換集／錯誤重載的播放意圖。暫停時改速不應啟播，自動重載不能把先前的暫停改成播放。手勢命中、AVPlayer 的實際等待與 seek 時序仍由獨立 UI 驗收確認，結果見 [TESTING.md](TESTING.md)。
 
-PlaybackContinuation 共 7 項，驗證續播目標與進度判斷。RecommendationPreviewQueue 現為 9 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源與可播放的第 1 集；0.4.4 新增穩定 ID 任意選卡、未知 ID 不移動游標，以及裁除舊頁後保留目前 ID、不把失效位置錯認成其他劇集。
+PlaybackContinuation 共 7 項，驗證續播目標與進度判斷。RecommendationPreviewQueue 現為 10 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源與可播放的第 1 集；0.4.4 新增穩定 ID 任意選卡、未知 ID 不移動游標，以及裁除舊頁後保留目前 ID、不把失效位置錯認成其他劇集。
+
+0.5.0 額外驗證已取消的舊分頁 Task 不能佔用重設後片單；正常的新 Task 仍可要求第 1 頁。
 
 RecommendationFeedActivation 共 7 項，驗證只有停穩、可見且分頁／場景有效的卡片取得唯一啟播 lease；重複 idle 不重啟，滑動／減速、離頁、背景與詳情會撤銷資格，A→B→A 舊回覆無法套用，來源重設與空選取不能保留舊工作，詳情返回可維持暫停直到明確繼續。這是純狀態政策測試，不證明 AVPlayer 音訊交接、拖曳保留影格、海報銜接、播放按鈕命中或同頁詳情導航已在 GUI 通過。
 
@@ -37,6 +41,8 @@ swift test --disable-sandbox --disable-xctest --filter RecommendationFeedActivat
 ```sh
 swift test --disable-sandbox --disable-xctest
 ```
+
+同一條命令會分別執行 Core 與 AppSupport 的測試程式；結果應分別核對，不能只讀第一個測試程式的總數。
 
 ## 帳號與片庫測試
 
@@ -61,6 +67,24 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryTests
 `AccountLibraryTests` 檢查分頁覆蓋、欄位／大整數與毫秒單位、精確路由及 Cookie 範圍、待同步操作的重複與失敗處理、兩段進度寫入的部分成功，以及帳號切換／取消。它們確認程式按契約處理合成回應，不能證明真人 App 會話已獲官方收藏／進度寫入授權。
 
 原生 API 實際手機發碼／登入、來源挑戰、Keychain 真機保存／還原、真人帳號讀寫與跨裝置續播，另依 [ACCOUNT.md](ACCOUNT.md) 及 [TESTING.md](TESTING.md) 記錄；本輪未以真實 Cookie 或驗證碼執行上述 focused 測試。
+
+## 0.5.0 保存與 Controller 整合測試
+
+下列三組合計 22 項，均已參與最終完整測試，可分別重現：
+
+```sh
+swift test --disable-sandbox --disable-xctest --filter MetadataHydrationTests
+swift test --disable-sandbox --disable-xctest --filter LibrarySnapshotStoreTests
+swift test --disable-sandbox --disable-xctest --filter AccountLibraryControllerTests
+```
+
+`MetadataHydrationTests` 6 項驗證前 50 筆持續失敗不擋住其後未試項目、失敗退避、每輪上限與去重、舊 batch lease／換 scope 失效，以及詳情快取的 TTL、LRU、部數與總集數上限。實際流程仍維持每輪最多 50 部、4 筆並行與 45 秒期限。
+
+`LibrarySnapshotStoreTests` 8 項使用可控的磁碟屏障與臨時目錄，驗證 20 個版本合併為 2 次寫入、舊版本不可覆寫新快照、重試標記落盤前不能繼續雲端寫入、儲存失敗阻擋請求、scope 隔離與同版本衝突、損壞主檔只回復有效且同 scope 的備份、備份寫入失敗／超限／損壞遷移不覆空，以及 1,500 部作品的保存與重新開啟。編碼、讀備份及原子 IO 在串行背景執行；測試沒有證明所有真機大型片庫均不掉幀。
+
+`AccountLibraryControllerTests` 8 項直接執行 `HongguoAppSupport` 中的正式 Controller／LibraryPersistence：延遲載入期間的收藏與進度先排隊；較早進度不能在稍後清除之後復活；切來源後舊載入／進度留在原 scope；載入失敗不以空片庫覆檔；flush 等待尚未完成寫入之後更新的最後進度；舊 metadata 任務的 defer 不能清除替代任務；換來源拒絕舊回覆；第二輪補資料能到達前 50 筆失敗之後的有效作品。
+
+整合測試以注入初始化避開正式 Keychain，使用隔離的 UserDefaults、合成片庫與 metadata 載入器；沒有真實手機號碼、驗證碼、Cookie 或官方片庫寫入。App 的暫停／離開／背景 flush 觸發與有限背景執行時間仍需對應 GUI／裝置驗收，不能把合成落盤屏障測試當作強制終止或斷電零遺失證據。
 
 ## 選劇 metadata 實網探針
 

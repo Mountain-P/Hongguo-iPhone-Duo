@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.4.4／build 14，試看採同頁連續垂直影片卡片；保留原生手機簡訊登入、分帳號片庫、公開選劇 metadata、原生工具列與漸進 Range 播放。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.5.0／build 15，試看採同頁連續垂直影片卡片，加入本機推薦偏好、直接收藏、受限預載與快速選集；保留原生手機簡訊登入、分帳號片庫、公開選劇 metadata、原生工具列與漸進 Range 播放。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
@@ -24,7 +24,7 @@ sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
 2026-11-06 已在 `/Applications/Xcode.app` 安裝完整 Xcode 27.2，完成授權與開發工具路徑切換。初版使用 iOS 27.2 SDK 的 generic iOS Simulator 建置成功，包含 arm64 與 x86_64。0.2.0 已完成原生漸進取源、84 項核心測試與指定 Duo 的原生工具列建置；這些是版本對應的既有記錄。0.3.0 的完整核心與來源探針見 [TESTING-CORE.md](TESTING-CORE.md)，簽署安裝、UI 驗收及 Release 產出狀態見 [TESTING.md](TESTING.md)。
 
-0.2.0／build 3 已以開發者身分完成真機簽署安裝與播放畫面檢查，使用者確認有聲音。0.2.1／build 4 也已安裝，但點播入口出現 scrollPosition 取消競態；0.2.2／build 5 已安裝，其首頁屬中間版。0.2.4 的既有版面、0.3.0 的選劇驗收、0.4.0 的帳號／片庫初版與 0.4.4 當前建置／裝置狀態分別記於 [TESTING.md](TESTING.md)。歷史產物保留，當前程式版號由根目錄 `VERSION` 決定。
+0.2.0／build 3 已以開發者身分完成真機簽署安裝與播放畫面檢查，使用者確認有聲音。0.2.1／build 4 也已安裝，但點播入口出現 scrollPosition 取消競態；0.2.2／build 5 已安裝，其首頁屬中間版。0.2.4 的既有版面、0.3.0 的選劇驗收、0.4.0 的帳號／片庫初版與 0.4.4 歷史建置／裝置狀態分別記於 [TESTING.md](TESTING.md)。歷史產物保留，當前程式版號由根目錄 `VERSION` 決定。
 
 iOS 27.2 的一般 runtime 24B8117 與 Duo 專用 runtime 24B91016s 均已安裝。一般 runtime 明確排除 Duo 的裝置型號，因此不能只以版本號 27.2 判斷相容性。Duo 專用 runtime identifier 為 `com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4`。需要安裝相同版本時，可執行：
 
@@ -92,7 +92,7 @@ sh scripts/build-ios.sh archive
 
 `simulator` 透過 `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM=` 讓 Xcode 產生本機 ad hoc 簽署與 simulated app identity；不需個人開發團隊，可正常測試 Keychain。產生的模擬器 `.app` 不能裝到 iPhone。`device` 產生未簽署實機 Release，`package-ipa.sh` 將它包成未簽署 IPA，供側載工具重新簽署；`package-source.py` 另產生原始碼 ZIP。檔名依根目錄 `VERSION` 產生，規則為 `dist/Hongguo-iPhone-<VERSION>-unsigned.ipa` 與 `dist/Hongguo-iPhone-<VERSION>-source.zip`，當次產出與驗證狀態見 [TESTING.md](TESTING.md)。`archive` 使用 Xcode 工程內設定的開發團隊建立 `build/Hongguo.xcarchive`，可在 Xcode Organizer 依自己的分發方式匯出、簽署與安裝。實機安裝仍需適合該裝置的簽署與描述檔。
 
-既有 0.2.0、0.3.0、0.4.2、0.4.3 Release 與 IPA 檢查屬各版歷史記錄。本輪 0.4.4 的 Release／重新打包狀態及對應驗收集中記於 [TESTING.md](TESTING.md)。
+既有 0.2.0、0.3.0、0.4.2、0.4.3 Release 與 IPA 檢查屬各版歷史記錄。歷史 0.4.4 的 Release／重新打包狀態及各版驗收集中記於 [TESTING.md](TESTING.md)。
 
 建置腳本保留已有工程的簽署設定。新增／刪除 Swift 檔案後，可執行 `python3 scripts/generate_project.py` 重建工程；**重建會覆蓋工程內手動修改的 build settings**，之後需重新選擇 Team。圖示已包含在原始碼包；若修改圖示生成器，從專案根目錄執行 `swift scripts/generate_icon.swift`。
 
@@ -113,3 +113,9 @@ Duo 的原生列使用 TabView／NavigationStack 與帶名稱、symbol 的 toolb
 歷史 0.4.3／build 13 已通過本機 Duo 模擬器最終建置，記錄為 `build/ios-0.4.3-build13-simulator-final.log`；完整 Core 為 190 項、22 個 suites，189 項通過、1 項可選快照略過，記錄為 `build/core-0.4.3-tests-final.log`。該版模擬器曾觀察第一集試播、切劇、暫停／倍速、正確 96 集詳情與返回；四秒合成三集影片也完成兩次自動銜接。這些結果保留為該版歷史驗收。
 
 0.4.4／build 14 的完整同頁試看已通過模擬器建置，記錄為 `build/ios-0.4.4-build14-simulator-final-ui.log`；Core 為 199 項、23 個 suites，198 項通過、1 項可選快照略過，記錄為 `build/core-0.4.4-tests.log`，包含 7 項 feed activation 與 9 項片單測試。建置和純狀態測試不等於新介面 GUI 或本版真機驗收；最後增量修正、畫面／手勢、部署與帳號實測統一依 [TESTING.md](TESTING.md) 更新。
+
+## 0.5.0 體驗與片庫改善
+
+試看類型、略過已試看與不感興趣只存在本機；收藏沿用目前選取的片庫。詳情提供每 30 集分組、輸入集數定位及上次觀看定位，定位不會自動播放。預取僅在內建播放、非昂貴／非受限網路且未開啟低耗電時進行；只準備下一部的首段，不建立額外播放器。快取與一次網路重試界線見 [NATIVE-PLAYBACK.md](NATIVE-PLAYBACK.md)。
+
+片庫的 JSON 編碼及檔案寫入改由背景串行儲存器處理，取消／切換來源仍保留分帳號順序。`HongguoAppSupport` 測試 target 直接編譯正式片庫控制器，以注入儲存器驗證載入、切換、最後進度 flush 與同步前落盤；App 建置仍只連結原本的 Core／Playback，沒有額外的套件依賴。完整測試指令與結果見 [TESTING-CORE.md](TESTING-CORE.md)，本版模擬器與實機界線見 [TESTING.md](TESTING.md)。
