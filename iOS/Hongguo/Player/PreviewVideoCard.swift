@@ -15,7 +15,8 @@ struct RecommendationPreviewMediaCard: View {
     var allowsInteraction: Bool = true
     var isFavorite: Bool = false
     var onToggleFavorite: (() -> Void)? = nil
-    var onPreviewStarted: (() -> Void)? = nil
+    var onPlaybackStarted: (() -> Void)? = nil
+    var onPreviewQualified: (() -> Void)? = nil
     var recommendationTitle: String? = nil
     var recommendationReason: String? = nil
     var bottomControlInset: CGFloat = 0
@@ -28,7 +29,8 @@ struct RecommendationPreviewMediaCard: View {
         PreviewVideoContent(series: series, episode: episode, service: service,
                             isActive: isActive, retainsFrame: retainsFrame,
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
-                            onToggleFavorite: onToggleFavorite, onPreviewStarted: onPreviewStarted,
+                            onToggleFavorite: onToggleFavorite, onPlaybackStarted: onPlaybackStarted,
+                            onPreviewQualified: onPreviewQualified,
                             recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
                             bottomControlInset: bottomControlInset,
                             onShowPreferences: onShowPreferences,
@@ -53,7 +55,8 @@ private struct PreviewVideoContent: View {
     let allowsInteraction: Bool
     let isFavorite: Bool
     let onToggleFavorite: (() -> Void)?
-    let onPreviewStarted: (() -> Void)?
+    let onPlaybackStarted: (() -> Void)?
+    let onPreviewQualified: (() -> Void)?
     let recommendationTitle: String?
     let recommendationReason: String?
     let bottomControlInset: CGFloat
@@ -69,11 +72,15 @@ private struct PreviewVideoContent: View {
     @State private var resumeAfterPaging = false
     @State private var lastBoostEndAt = Date.distantPast
     @State private var firstFrameReady = false
-    @State private var reportedPreviewStarted = false
+    @State private var reportedPlaybackStarted = false
+    @State private var reportedPreviewQualified = false
+    @State private var watchQualification = PreviewWatchQualification()
+    @State private var qualificationTask: Task<Void, Never>?
 
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
-         onToggleFavorite: (() -> Void)?, onPreviewStarted: (() -> Void)?, recommendationTitle: String?, recommendationReason: String?,
+         onToggleFavorite: (() -> Void)?, onPlaybackStarted: (() -> Void)?, onPreviewQualified: (() -> Void)?,
+         recommendationTitle: String?, recommendationReason: String?,
          bottomControlInset: CGFloat,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
          onOpenSeries: @escaping (PreviewPlaybackSnapshot) -> Void) {
@@ -82,7 +89,8 @@ private struct PreviewVideoContent: View {
         self.allowsInteraction = allowsInteraction
         self.isFavorite = isFavorite
         self.onToggleFavorite = onToggleFavorite
-        self.onPreviewStarted = onPreviewStarted
+        self.onPlaybackStarted = onPlaybackStarted
+        self.onPreviewQualified = onPreviewQualified
         self.recommendationTitle = recommendationTitle
         self.recommendationReason = recommendationReason
         self.bottomControlInset = bottomControlInset
@@ -106,7 +114,7 @@ private struct PreviewVideoContent: View {
                     NativePlayerSurface(player: model.player, fillsScreen: true, onReadyForDisplayChange: { ready in
                         if ready { model.recordFirstFrame() }
                         firstFrameReady = ready
-                        reportPreviewStarted()
+                        updatePreviewQualification()
                     })
                         .opacity(firstFrameReady && model.player.currentItem != nil && !model.isLoading && model.errorMessage == nil ? 1 : 0)
                     touchSurface
@@ -145,14 +153,19 @@ private struct PreviewVideoContent: View {
         .background(.black)
         .foregroundStyle(.white)
         .accessibilityHidden(!allowsInteraction)
-        .task { synchronizeActivation() }
-        .onChange(of: isActive) { _, _ in synchronizeActivation() }
-        .onChange(of: retainsFrame) { _, _ in synchronizeActivation() }
-        .onChange(of: scenePhase) { _, _ in synchronizeActivation() }
-        .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); reportPreviewStarted() }
-        .onChange(of: model.isLoading) { _, loading in if loading { firstFrameReady = false }; scheduleAutoHide() }
-        .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
-        .onChange(of: model.errorMessage) { _, _ in revealControls() }
+        .task { synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: isActive) { _, _ in synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: allowsInteraction) { _, _ in updatePreviewQualification() }
+        .onChange(of: scenePhase) { _, _ in synchronizeActivation(); updatePreviewQualification() }
+        .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
+        .onChange(of: model.isLoading) { _, loading in
+            if loading { firstFrameReady = false }
+            scheduleAutoHide(); updatePreviewQualification()
+        }
+        .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide(); updatePreviewQualification() }
+        .onChange(of: model.duration) { _, _ in updatePreviewQualification() }
+        .onChange(of: model.errorMessage) { _, _ in revealControls(); updatePreviewQualification() }
         .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
         .onDisappear { deactivate() }
     }
@@ -214,6 +227,7 @@ private struct PreviewVideoContent: View {
         }
         .accessibilityLabel("播放速度")
         .accessibilityValue(String(format: "%g 倍速", Double(model.effectiveSpeed)))
+        .simultaneousGesture(TapGesture().onEnded { revealControls() })
         .disabled(!isActive), in: Capsule())
     }
 
@@ -285,16 +299,43 @@ private struct PreviewVideoContent: View {
                 Label(recommendationTitle ?? "推薦選項", systemImage: "ellipsis")
                     .font(.caption.weight(.semibold)).lineLimit(1)
                     .padding(.horizontal, 12).frame(minHeight: 44)
-            }.simultaneousGesture(TapGesture().onEnded { revealControls() })
+            }
+            .simultaneousGesture(TapGesture().onEnded { revealControls() })
             .disabled(!allowsInteraction), in: Capsule())
         }
     }
 
-    private func reportPreviewStarted() {
-        guard !reportedPreviewStarted, firstFrameReady, model.isPlaying,
-              isActive, scenePhase == .active else { return }
-        reportedPreviewStarted = true
-        onPreviewStarted?()
+    private func updatePreviewQualification() {
+        let validContext = isActive && allowsInteraction && scenePhase == .active && firstFrameReady
+        let eligible = validContext && model.isPlaying && !model.isBuffering
+            && !model.isLoading && model.errorMessage == nil
+        if eligible, !reportedPlaybackStarted {
+            reportedPlaybackStarted = true
+            onPlaybackStarted?()
+        }
+        watchQualification.update(isEligible: eligible, duration: model.duration)
+        // The closing eligible interval can qualify at natural EOF or pause.
+        if validContext, watchQualification.isQualified, !reportedPreviewQualified {
+            reportedPreviewQualified = true
+            onPreviewQualified?()
+        }
+        guard eligible, !reportedPreviewQualified else {
+            qualificationTask?.cancel(); qualificationTask = nil
+            return
+        }
+        guard qualificationTask == nil else { return }
+        qualificationTask = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                guard !Task.isCancelled else { return }
+                updatePreviewQualification()
+            }
+        }
+    }
+
+    private func stopPreviewQualification() {
+        watchQualification.update(isEligible: false, duration: model.duration)
+        qualificationTask?.cancel(); qualificationTask = nil
     }
 
     @ViewBuilder
@@ -363,6 +404,7 @@ private struct PreviewVideoContent: View {
     }
 
     private func deactivate() {
+        stopPreviewQualification()
         hideTask?.cancel()
         cancelBoost(reveal: false)
         suspendedForPaging = false

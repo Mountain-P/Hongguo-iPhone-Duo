@@ -240,10 +240,8 @@ struct RecommendationPreviewView: View {
                     retainsFrame: canRetainFrame, allowsInteraction: allowsInteraction,
                     isFavorite: model.isFavorite(series),
                     onToggleFavorite: { model.toggleFavorite(media.series) },
-                    onPreviewStarted: {
-                        model.markPreviewed(series)
-                        preview.didStartPreview(seriesID: series.id)
-                    },
+                    onPlaybackStarted: { preview.didStartPreview(seriesID: series.id) },
+                    onPreviewQualified: { model.markPreviewed(series) },
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
                     recommendationReason: recommendationReason(for: series.id),
                     bottomControlInset: bottomControlInset,
