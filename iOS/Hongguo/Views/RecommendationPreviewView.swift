@@ -3,8 +3,8 @@ import HongguoCore
 import Network
 
 private struct RecommendationFeedFrames: PreferenceKey {
-    static let defaultValue: [String: CGFloat] = [:]
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
     }
 }
@@ -46,7 +46,12 @@ struct RecommendationPreviewView: View {
     @StateObject private var networkPolicy = PreviewNetworkPolicy()
     @StateObject private var playback = ContinuePlaybackModel()
     @State private var scrollID: String?
-    @State private var frames: [String: CGFloat] = [:]
+    @State private var frames: [String: CGRect] = [:]
+    @State private var viewportSize: CGSize = .zero
+    @State private var lastSettledID: String?
+    @State private var resizeTargetID: String?
+    @State private var resizeGeneration = UUID()
+    @State private var resizeTask: Task<Void, Never>?
     @State private var viewportHeight: CGFloat = 1
     @State private var contentOffset: CGFloat?
     @State private var pendingScrollTarget: String?
@@ -75,44 +80,7 @@ struct RecommendationPreviewView: View {
     var body: some View {
         let activation = Activation(revision: model.revision, preferences: model.recommendationFilterRevision,
                                     scope: model.recommendationScope, active: isActive)
-        return GeometryReader { geometry in
-            Group {
-                if preview.items.isEmpty {
-                    emptyFeed
-                } else {
-                    ScrollView(.vertical) {
-                        LazyVStack(spacing: 0) {
-                            ForEach(preview.items) { series in
-                                feedCard(series)
-                                    .frame(width: max(geometry.size.width, 1), height: max(geometry.size.height, 1))
-                                    .clipped()
-                                    .background {
-                                        GeometryReader { card in
-                                            Color.clear.preference(key: RecommendationFeedFrames.self,
-                                                value: [series.id: card.frame(in: .named("recommendationFeed")).minY])
-                                        }
-                                    }
-                                    .id(series.id)
-                            }
-                        }
-                        .scrollTargetLayout()
-                    }
-                    .coordinateSpace(name: "recommendationFeed")
-                    .contentMargins(.vertical, 0, for: .scrollContent)
-                    .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
-                    .scrollPosition(id: $scrollID, anchor: .top)
-                    .scrollIndicators(.hidden)
-                    .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged,
-                        offsetChanged: offsetChanged))
-                    .onPreferenceChange(RecommendationFeedFrames.self, perform: framesChanged)
-                }
-            }
-            .onAppear { viewportHeight = max(geometry.size.height, 1) }
-            .onChange(of: geometry.size.height) { _, height in
-                viewportHeight = max(height, 1)
-                refreshEligibility()
-            }
-        }
+        return feedViewport
         .allowsHitTesting(playback.pendingChoice == nil && playback.route == nil && playback.preparingSeriesID == nil)
         .accessibilityHidden(playback.preparingSeriesID != nil || playback.pendingChoice != nil || playback.route != nil)
         .clipped().background(Color.black).foregroundStyle(.white)
@@ -133,6 +101,7 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onDisappear {
+            cancelResize()
             // Our own player cover hides the feed too; keep that presentation alive.
             if playback.route == nil { isVisible = false; playback.cancelPending() }
             fallbackSettle?.cancel(); fallbackSettle = nil
@@ -141,11 +110,11 @@ struct RecommendationPreviewView: View {
         .onChange(of: isActive) { _, active in
             tabIsActive = active
             if active { activateSource() }
-            else { preview.suspend(); playback.dismiss() }
+            else { cancelResize(); preview.suspend(); playback.dismiss() }
             refreshEligibility()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { preview.suspend() }
+            if phase != .active { cancelResize(); preview.suspend() }
             else if tabIsActive, isVisible { preview.loadInitial() }
             refreshEligibility()
         }
@@ -178,11 +147,11 @@ struct RecommendationPreviewView: View {
             refreshEligibility()
         }
         .onChange(of: detailSeries) { _, detail in
-            if detail != nil { requiresManualResume = true; preview.suspend(); playback.cancelPending() }
+            if detail != nil { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending() }
             refreshEligibility()
         }
         .onChange(of: showingPreferences) { _, presented in
-            if presented { requiresManualResume = true; preview.suspend(); playback.cancelPending() }
+            if presented { cancelResize(); requiresManualResume = true; preview.suspend(); playback.cancelPending() }
             refreshEligibility()
         }
         .sheet(isPresented: $showingPreferences) {
@@ -192,32 +161,98 @@ struct RecommendationPreviewView: View {
             DetailView(series: series).toolbar(.visible, for: .navigationBar)
         }
         .onChange(of: playback.route?.id) { _, routeID in
-            if routeID != nil { requiresManualResume = true; preview.suspend() }
+            if routeID != nil { cancelResize(); requiresManualResume = true; preview.suspend() }
             refreshEligibility()
         }
         .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
-        .overlay(alignment: .bottom) {
-            if let message = playback.errorMessage {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(message).font(.footnote)
-                    HStack(spacing: 20) {
-                        Spacer(minLength: 0)
-                        if playback.canRetry {
-                            Button("重試") {
-                                guard alignedID == playback.failedSeriesID, phaseIsIdle else { playback.cancelPending(); return }
-                                playback.retry()
-                            }
-                                .disabled(!playbackContext.permitsStart || alignedID != playback.failedSeriesID || !phaseIsIdle)
-                                .accessibilityIdentifier("preview.retryFollowing")
-                        }
-                        Button("關閉") { playback.cancelPending() }
-                    }.font(.subheadline.weight(.semibold))
-                }
-                .padding(16).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-                .padding(18).padding(.bottom, max(bottomControlInset, 0))
-            }
-        }
+        .overlay(alignment: .bottom) { followingError }
         .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset)
+    }
+
+    private var feedViewport: some View {
+        GeometryReader { geometry in
+            resizeAwareFeed(size: geometry.size)
+        }
+    }
+
+    private func resizeAwareFeed(size: CGSize) -> some View {
+        ScrollViewReader { proxy in
+            feedContents(size: size)
+                .onAppear { viewportSize = size; viewportHeight = max(size.height, 1) }
+                .onChange(of: size) { _, newSize in
+                    reanchorAfterResize(size: newSize, proxy: proxy)
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func feedContents(size: CGSize) -> some View {
+        Group {
+            if preview.items.isEmpty { emptyFeed }
+            else { pagingFeed(size: size) }
+        }
+    }
+
+    private var feedScrollPosition: Binding<String?> {
+        Binding(get: { resizeTargetID ?? scrollID }, set: {
+            if resizeTargetID == nil { scrollID = $0 }
+        })
+    }
+
+    private func pagingFeed(size: CGSize) -> some View {
+        ScrollView(.vertical) {
+            LazyVStack(spacing: 0) {
+                ForEach(preview.items) { series in
+                    feedPage(series, size: size)
+                }
+            }
+            .scrollTargetLayout()
+        }
+        .coordinateSpace(name: "recommendationFeed")
+        .contentMargins(.vertical, 0, for: .scrollContent)
+        .scrollTargetBehavior(.viewAligned(limitBehavior: .always))
+        .scrollPosition(id: feedScrollPosition, anchor: .top)
+        .scrollIndicators(.hidden)
+        .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged,
+            offsetChanged: offsetChanged))
+        .onPreferenceChange(RecommendationFeedFrames.self, perform: framesChanged)
+    }
+
+    private func feedPage(_ series: Series, size: CGSize) -> some View {
+        feedCard(series, resizing: size != viewportSize)
+            .frame(width: max(size.width, 1), height: max(size.height, 1))
+            .clipped()
+            .background {
+                GeometryReader { card in
+                    let frame: CGRect = card.frame(in: .named("recommendationFeed"))
+                    let preference: [String: CGRect] = [series.id: frame]
+                    Color.clear.preference(key: RecommendationFeedFrames.self, value: preference)
+                }
+            }
+            .id(series.id)
+    }
+
+    @ViewBuilder
+    private var followingError: some View {
+        if let message = playback.errorMessage {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(message).font(.footnote)
+                HStack(spacing: 20) {
+                    Spacer(minLength: 0)
+                    if playback.canRetry {
+                        Button("重試") {
+                            guard alignedID == playback.failedSeriesID, phaseIsIdle else { playback.cancelPending(); return }
+                            playback.retry()
+                        }
+                            .disabled(!playbackContext.permitsStart || alignedID != playback.failedSeriesID || !phaseIsIdle)
+                            .accessibilityIdentifier("preview.retryFollowing")
+                    }
+                    Button("關閉") { playback.cancelPending() }
+                }.font(.subheadline.weight(.semibold))
+            }
+            .padding(12).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .padding(14).padding(.bottom, max(bottomControlInset, 0))
+        }
     }
 
     private var emptyFeed: some View {
@@ -241,16 +276,18 @@ struct RecommendationPreviewView: View {
         .padding(28).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func feedCard(_ series: Series) -> some View {
-        let canRetainFrame = isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && playback.route == nil && intersectsViewport(series.id)
-        let allowsInteraction = alignedID == series.id && isVisible && tabIsActive
+    private func feedCard(_ series: Series, resizing: Bool) -> some View {
+        let preservedID = resizeTargetID ?? (resizing ? lastSettledID : nil)
+        let canRetainFrame = isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && playback.route == nil
+            && (intersectsViewport(series.id) || preservedID == series.id)
+        let allowsInteraction = !resizing && resizeTargetID == nil && alignedID == series.id && isVisible && tabIsActive
             && scenePhase == .active && detailSeries == nil && !showingPreferences && phaseIsIdle
             && playback.preparingSeriesID == nil && playback.pendingChoice == nil && playback.route == nil
         return ZStack {
             Poster(series: series, contentMode: .fill).allowsHitTesting(false)
             if let media = preview.media[series.id] {
                 RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
-                    isActive: preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
+                    isActive: !resizing && preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
                     retainsFrame: canRetainFrame, allowsInteraction: allowsInteraction,
                     isFavorite: model.isFavorite(series),
                     onToggleFavorite: { model.toggleFavorite(media.series) },
@@ -348,7 +385,7 @@ struct RecommendationPreviewView: View {
     }
 
     private var effectivePlaybackAllowed: Bool {
-        isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && !requiresManualResume && phaseIsIdle
+        resizeTargetID == nil && isVisible && tabIsActive && scenePhase == .active && detailSeries == nil && !showingPreferences && !requiresManualResume && phaseIsIdle
             && playback.route == nil && playback.pendingChoice == nil && playback.preparingSeriesID == nil
     }
 
@@ -362,14 +399,14 @@ struct RecommendationPreviewView: View {
         // rotation independently of the outer GeometryReader. Measured card
         // origins share the actual viewport coordinates used by viewAligned.
         let known = Set(preview.items.map(\.id))
-        guard let closest = frames.filter({ known.contains($0.key) }).min(by: { abs($0.value) < abs($1.value) }),
-              abs(closest.value) <= 2 else { return nil }
+        guard let closest = frames.filter({ known.contains($0.key) }).min(by: { abs($0.value.minY) < abs($1.value.minY) }),
+              abs(closest.value.minY) <= 2 else { return nil }
         return closest.key
     }
 
     private func intersectsViewport(_ id: String) -> Bool {
-        guard let top = frames[id] else { return false }
-        return top > -viewportHeight && top < viewportHeight
+        guard let frame = frames[id] else { return false }
+        return frame.maxY > 0 && frame.minY < viewportHeight
     }
 
     private func activateSource() {
@@ -388,6 +425,7 @@ struct RecommendationPreviewView: View {
     }
 
     private func resetFeed() {
+        cancelResize(); lastSettledID = nil
         playback.dismiss()
         fallbackSettle?.cancel(); fallbackSettle = nil
         scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil
@@ -405,6 +443,8 @@ struct RecommendationPreviewView: View {
         let change = preview.excludeNotInterested(model.recommendationPreferences,
             preferredCurrentID: preferredCurrentID ?? alignedID ?? scrollID)
         guard !change.removedIDs.isEmpty else { return }
+        if let target = resizeTargetID, change.removedIDs.contains(target) { cancelResize() }
+        if let settled = lastSettledID, change.removedIDs.contains(settled) { lastSettledID = change.currentID }
         frames = frames.filter { !change.removedIDs.contains($0.key) }
         if change.currentChanged {
             fallbackSettle?.cancel(); fallbackSettle = nil
@@ -424,32 +464,42 @@ struct RecommendationPreviewView: View {
         let commandHasArrived = pendingScrollTarget == nil || pendingScrollTarget == aligned
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-preview-layout-diagnostics") {
-            let nearest = frames.values.min(by: { abs($0) < abs($1) }) ?? -9999
+            let nearest = frames.values.map(\.minY).min(by: { abs($0) < abs($1) }) ?? -9999
             NSLog("PreviewLayout height=%.2f offset=%.2f nearest=%.2f idle=%d pending=%d aligned=%d",
                   Double(viewportHeight), Double(contentOffset ?? -9999), Double(nearest),
                   phaseIsIdle ? 1 : 0, pendingScrollTarget == nil ? 0 : 1,
                   aligned.flatMap { id in preview.items.firstIndex(where: { $0.id == id }) } ?? -1)
         }
         #endif
-        if commandHasArrived { pendingScrollTarget = nil }
-        preview.update(selectedID: commandHasArrived ? aligned : nil, isIdle: phaseIsIdle,
+        if commandHasArrived, resizeTargetID == nil { pendingScrollTarget = nil }
+        if resizeTargetID == nil, commandHasArrived, phaseIsIdle, tabIsActive, isVisible, let aligned,
+           resizeFrameAligned(aligned) {
+            lastSettledID = aligned
+        }
+        preview.update(selectedID: commandHasArrived && resizeTargetID == nil ? aligned : nil, isIdle: phaseIsIdle,
             isActive: isVisible && tabIsActive && sourceMatches && !showingPreferences && !requiresManualResume
                 && playback.route == nil && playback.pendingChoice == nil && playback.preparingSeriesID == nil,
             isSceneActive: scenePhase == .active, isDetailPresented: detailSeries != nil)
     }
 
     private func phaseChanged(_ idle: Bool, _ userInitiated: Bool) {
+        if userInitiated { cancelResize() }
         phaseIsIdle = idle
         fallbackDragging = userInitiated
         if userInitiated { pendingScrollTarget = nil }
         if userInitiated, detailSeries == nil { requiresManualResume = false }
         if idle || userInitiated { fallbackSettle?.cancel(); fallbackSettle = nil }
         refreshEligibility()
-        if !idle, !userInitiated { scheduleFallbackSettle() }
+        if !idle, !userInitiated, resizeTargetID == nil { scheduleFallbackSettle() }
     }
 
-    private func framesChanged(_ next: [String: CGFloat]) {
+    private func framesChanged(_ next: [String: CGRect]) {
         frames = next
+        if let target = resizeTargetID {
+            if phaseIsIdle, !fallbackDragging, resizeFrameAligned(target) { finishResize(target) }
+            else { refreshEligibility() }
+            return
+        }
         if #available(iOS 18.0, *) {
             refreshEligibility()
         }
@@ -459,12 +509,13 @@ struct RecommendationPreviewView: View {
     private func offsetChanged(_ offset: CGFloat) {
         contentOffset = offset
         refreshEligibility()
-        if !phaseIsIdle, !fallbackDragging { scheduleFallbackSettle() }
+        if !phaseIsIdle, !fallbackDragging, resizeTargetID == nil { scheduleFallbackSettle() }
     }
 
     private func fallbackDragChanged(_ dragging: Bool) {
         fallbackDragging = dragging
         if dragging {
+            cancelResize()
             fallbackSettle?.cancel(); phaseIsIdle = false
             if detailSeries == nil { requiresManualResume = false }
             refreshEligibility()
@@ -484,7 +535,65 @@ struct RecommendationPreviewView: View {
         }
     }
 
+    private func reanchorAfterResize(size: CGSize, proxy: ScrollViewProxy) {
+        viewportSize = size; viewportHeight = max(size.height, 1)
+        let ids = Set(preview.items.map(\.id))
+        guard tabIsActive, isVisible, scenePhase == .active, detailSeries == nil, !showingPreferences,
+              playback.route == nil,
+              let target = [resizeTargetID, lastSettledID, preview.current?.id, scrollID].compactMap({ $0 }).first(where: ids.contains) else {
+            refreshEligibility(); return
+        }
+        resizeTask?.cancel(); fallbackSettle?.cancel(); fallbackSettle = nil
+        let request = UUID(); resizeGeneration = request; resizeTargetID = target
+        pendingScrollTarget = target; phaseIsIdle = false; fallbackDragging = false
+        preview.beginPaging(); refreshEligibility()
+        resizeTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(100))
+                for _ in 0..<3 {
+                    guard !Task.isCancelled, resizeGeneration == request, resizeTargetID == target else { return }
+                    var transaction = Transaction(); transaction.disablesAnimations = true
+                    withTransaction(transaction) { scrollID = target; proxy.scrollTo(target, anchor: .top) }
+                    var alignedSamples = 0
+                    for _ in 0..<8 {
+                        try await Task.sleep(for: .milliseconds(50))
+                        guard !Task.isCancelled, resizeGeneration == request, resizeTargetID == target else { return }
+                        alignedSamples = resizeFrameAligned(target) && !fallbackDragging ? alignedSamples + 1 : 0
+                        if alignedSamples >= 2 { finishResize(target); return }
+                    }
+                }
+                // Stop issuing scroll commands. A late aligned frame can still finish,
+                // and an explicit drag cancels this recovery without changing pause intent.
+                if resizeGeneration == request { resizeTask = nil; phaseIsIdle = true; refreshEligibility() }
+            } catch { }
+        }
+    }
+
+    private func resizeFrameAligned(_ id: String) -> Bool {
+        guard let frame = frames[id] else { return false }
+        return abs(frame.minY) <= 2 && abs(frame.width - viewportSize.width) <= 2
+            && abs(frame.height - viewportSize.height) <= 2
+    }
+
+    private func finishResize(_ target: String) {
+        guard resizeTargetID == target else { return }
+        resizeTask?.cancel(); resizeTask = nil; resizeTargetID = nil
+        if pendingScrollTarget == target { pendingScrollTarget = nil }
+        phaseIsIdle = true; fallbackDragging = false; scrollID = target; lastSettledID = target
+        refreshEligibility()
+    }
+
+    private func cancelResize() {
+        resizeGeneration = UUID(); resizeTask?.cancel(); resizeTask = nil
+        if let target = resizeTargetID {
+            if pendingScrollTarget == target { pendingScrollTarget = nil }
+            phaseIsIdle = true; fallbackDragging = false
+        }
+        resizeTargetID = nil
+    }
+
     private func scroll(by offset: Int, from id: String) {
+        cancelResize()
         guard let index = preview.items.firstIndex(where: { $0.id == id }),
               preview.items.indices.contains(index + offset) else {
             preview.loadMoreIfNeeded(force: true)
