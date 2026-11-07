@@ -340,7 +340,6 @@ struct PlayerScreen: View {
                 cancelBoostGesture()
                 if model.isSpeedBoostLocked { model.unlockSpeedBoost() }
                 else { model.lockSpeedBoost() }
-                showControls()
             }
         if onSeriesSwipe != nil {
             touch
@@ -362,6 +361,7 @@ struct PlayerScreen: View {
     private func updateHover(_ phase: HoverPhase) {
         switch phase {
         case .active(let location):
+            guard !holdingBoost, !boostStarted else { return }
             // Global coordinates stay stable as native bars resize the safe
             // viewport. Only actual pointer movement reveals the controls.
             if let previous = lastHoverLocation {
@@ -475,7 +475,7 @@ struct PlayerScreen: View {
                     boostStarted = true
                     boostCommitted = false
                     boostStartedLocked = model.isSpeedBoostLocked
-                    showControls()
+                    hideTask?.cancel()
                     model.beginSpeedBoost()
                 }
                 guard !boostCommitted, let drag else { return }
@@ -510,7 +510,6 @@ struct PlayerScreen: View {
             Button {
                 cancelBoostGesture()
                 model.unlockSpeedBoost()
-                showControls()
             } label: {
                 Label("2 倍速已鎖定 · 長按下滑解除", systemImage: "lock.fill")
                     .font(.caption.weight(.semibold))

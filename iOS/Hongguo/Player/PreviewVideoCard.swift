@@ -129,11 +129,6 @@ private struct PreviewVideoContent: View {
                     VStack {
                         HStack {
                             preferenceMenu
-                            if model.isSpeedBoosting {
-                                glass(Text("2 倍速").font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 14).frame(minHeight: 44), in: Capsule())
-                                .allowsHitTesting(false)
-                            }
                             Spacer(minLength: 0)
                             speedMenu.accessibilityHidden(!isActive)
                         }
@@ -147,6 +142,14 @@ private struct PreviewVideoContent: View {
                     .accessibilityHidden(!controlsVisible && isActive)
                 }
                 .frame(width: region.width, height: region.height)
+                .overlay(alignment: .top) {
+                    if isActive, model.isSpeedBoosting {
+                        glass(Text("2 倍速").font(.caption.weight(.semibold))
+                            .padding(.horizontal, 14).frame(minHeight: 44), in: Capsule())
+                            .padding(.top, region.height < 400 ? 12 : 20)
+                            .allowsHitTesting(false)
+                    }
+                }
                 .clipped()
                 .position(x: region.midX, y: region.midY)
             }
@@ -188,9 +191,15 @@ private struct PreviewVideoContent: View {
                       scenePhase == .active, !model.isLoading,
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
-                revealControls()
+                hideTask?.cancel()
                 model.beginSpeedBoost()
-            }, onHoldEnded: { endBoost() })
+            }, onHoldEnded: { cancelled in
+                let wasBoosting = boostStarted
+                endBoost(reveal: false)
+                if wasBoosting, !cancelled, controlsVisible, isActive, scenePhase == .active {
+                    scheduleAutoHide()
+                }
+            })
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("第 1 集試看影片")
             .accessibilityAddTraits(.isButton)
@@ -511,7 +520,7 @@ private struct PreviewGestureSurface: UIViewRepresentable {
     let isEnabled: Bool
     let onTap: () -> Void
     let onHoldBegan: () -> Void
-    let onHoldEnded: () -> Void
+    let onHoldEnded: (_ cancelled: Bool) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -570,16 +579,18 @@ private struct PreviewGestureSurface: UIViewRepresentable {
                 guard parent.isEnabled else { return }
                 isHolding = true
                 parent.onHoldBegan()
-            case .ended, .cancelled, .failed:
-                finishHold()
+            case .ended:
+                finishHold(cancelled: false)
+            case .cancelled, .failed:
+                finishHold(cancelled: true)
             default: break
             }
         }
 
-        func finishHold() {
+        func finishHold(cancelled: Bool = true) {
             guard isHolding else { return }
             isHolding = false
-            parent.onHoldEnded()
+            parent.onHoldEnded(cancelled)
         }
     }
 }
