@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.9.2／build 24，將長按及鎖速提示與整組 HUD 顯隱分離；0.9.1 的換劇交接、試看候選、人工重試、影片滿版、畫質偏好與原生手機簡訊登入持續保留。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.9.3／build 25，一般播放器加入上下滑換緊鄰分集；0.9.2 的獨立倍速提示、0.9.1 的換劇交接、試看候選、人工重試、影片滿版、畫質偏好與原生手機簡訊登入持續保留。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
@@ -101,6 +101,8 @@ sh scripts/build-ios.sh archive
 Duo 的原生列使用 TabView／NavigationStack 與帶名稱、symbol 的 toolbar items。外螢幕與內螢幕橫向可使用側欄，內螢幕直向則使用上下列；位置由系統依姿態處理。播放器點影片空白處顯示／隱藏控制，使用中央按鈕播放／暫停；控制列透明覆蓋影片，播放時可閒置隱藏，影片畫布保持不縮小。實作依據見 Apple [Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/) 與 [Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo)。
 
 0.9.2 的長按 2 倍速開始／放開，以及一般播放器鎖定／解除鎖定，都不再喚回整組 HUD；頂部提示獨立呈現，試看提示也移出 HUD opacity，保留操作前的控制列顯隱。點空白、中央播放及手動速度選單維持原有行為，不新增建置需求。當版測試、建置、GUI 與手機結果以 [TESTING.md](TESTING.md) 為準。
+
+0.9.3 在一般播放器加入明確上滑下一集、下滑上一集，成功換緊鄰分集時從零播放；短距離不觸發，邊界或鄰集未開放只顯示約 2 秒頂部提示，不跳過未開放集、不喚 HUD。長按後上下滑優先鎖速，試看仍上下換劇。建置方式不變，當版驗證見 [TESTING.md](TESTING.md)。
 
 ## 區域網路測試
 
