@@ -167,6 +167,8 @@ struct RecommendationPreviewView: View {
             else if playback.preparingSeriesID == nil && playback.pendingChoice == nil { transitionFrame = nil }
             refreshEligibility()
         }
+        .onChange(of: playback.preparingSeriesID) { _, _ in discardFinishedTransition() }
+        .onChange(of: playback.pendingChoice?.id) { _, _ in discardFinishedTransition() }
         .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
         .overlay(alignment: .bottom) { followingError }
         .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset, transitionFrame: transitionFrame)
@@ -642,6 +644,12 @@ struct RecommendationPreviewView: View {
                 latestRecord: { model.record(for: series) },
                 progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
         } catch { transitionFrame = nil; playback.fail(error, seriesID: series.id) }
+    }
+
+    private func discardFinishedTransition() {
+        if playback.preparingSeriesID == nil, playback.pendingChoice == nil, playback.route == nil {
+            transitionFrame = nil
+        }
     }
 
     private func continuationChoice(_ choice: ContinuePlaybackChoice) -> some View {

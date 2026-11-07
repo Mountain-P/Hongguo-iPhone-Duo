@@ -452,7 +452,8 @@ struct PlayerScreen: View {
                 Image(systemName: direction == .next ? "arrow.up" : "arrow.down")
                 VStack(alignment: .leading, spacing: 3) {
                     Text(swipeTitle(feedback)).font(.subheadline.weight(.semibold))
-                    Text(feedback.isArmed ? "放開切換" : "繼續滑動，放開可返回")
+                    Text(feedback.blockedReason != nil ? "放開保留目前分集" :
+                        (feedback.isArmed ? "放開切換" : "繼續滑動，放開可返回"))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ProgressView(value: feedback.progress).frame(width: 45).tint(Theme.accent)
