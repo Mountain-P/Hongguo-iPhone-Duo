@@ -8,7 +8,9 @@
 
 新增回歸涵蓋分頁取消、偏好去重／清單上限／還原、長劇及稀疏集數定位、原生暫時錯誤恢復、同區塊共用與取消隔離、首段快取／預取上限，以及大型片庫補資料的公平輪替與失敗退避。實際 Controller 測試覆蓋延遲載入後收藏／進度、清除順序、跨來源隔離、載入失敗不覆空、最後進度 flush 等待最新版本，以及舊 metadata 任務不能清掉新工作。
 
-本機 Xcode 27.2 的 Duo 模擬器 Debug 最終建置成功，使用 Xcode ad hoc 簽署，開發團隊保持空白；已安裝並啟動 0.5.0／build 15。最終建置記錄為 `build/ios-0.5.0-build15-layout-fixed.log`。未在本輪覆蓋安裝實體 iPhone，也未另產生新的 Release IPA；手機最後已確認安裝的版本仍屬下方 0.4.4 歷史交付。
+本機 Xcode 27.2 的 Duo 模擬器 Debug 最終建置成功，使用 Xcode ad hoc 簽署，開發團隊保持空白；已安裝並啟動 0.5.0／build 15。最終建置記錄為 `build/ios-0.5.0-build15-layout-fixed.log`。開發驗證階段只使用模擬器，未另產生新的 Release IPA；後續實機交付另記如下。
+
+2026-11-07 依使用者要求，以 `ec55beb` 的已驗原碼重新建置 iPhoneOS／arm64 Debug，沿用既有開發簽署，嚴格簽章檢查通過；115 個原碼雜湊與模擬器驗證清單一致。手機透過 `localNetwork` 無線通道完成覆蓋安裝，App 清單從 0.4.4／build 14 更新為 0.5.0／build 15。第一次啟動被 iOS 鎖定狀態拒絕，使用者解鎖後再次啟動成功，隨後程序查詢確認有 Hongguo 執行中。未解除配對、刪除 App 或重新登入；這是簽署、安裝、版本及啟動證據，沒有重做本版真機手勢、長時間播放或帳號同步驗收。公開專案的開發團隊設定仍留空。證據保存在本機 `build/ios-real-device-0.5.0-build15-build.log`、`build/ios-real-device-0.5.0-build15-install.json`、`build/ios-real-device-0.5.0-build15-app.json`、`build/ios-real-device-0.5.0-build15-launch-unlocked.json`、`build/ios-real-device-0.5.0-build15-processes.json` 與 `build/ios-real-device-0.5.0-build15-validation.json`；裝置與簽署識別不放入公開倉庫。
 
 當次模擬器觀察：
 
