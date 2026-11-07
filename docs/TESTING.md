@@ -35,9 +35,9 @@
 
 ### 手機部署
 
-同一份 build 23 已覆蓋安裝，App 清單讀回 0.9.1／23。初次啟動由 iOS 明確以 Locked 拒絕；已請使用者解鎖，後續啟動結果待確認。安裝與版號不當作真機換劇手勢或首幀速度驗收。
+同一份 build 23 已覆蓋安裝，App 清單讀回 0.9.1／23。初次啟動由 iOS 明確以 Locked 拒絕；2026-11-07 使用者解鎖後重新啟動成功，程序清單確認同一個 Hongguo 程序仍在執行，App 清單再次讀回 0.9.1／23。這是安裝、版號、啟動與程序驗證，不當作真機換劇手勢或首幀速度驗收。
 
-本機記錄為 `build/ios-real-device-0.9.1-build23-install.json`、`…-app.json`、`…-launch.json`。裝置及簽署識別只保留本機。
+本機記錄為 `build/ios-real-device-0.9.1-build23-install.json`、`…-app.json`、`…-launch.json`；解鎖後為 `…-launch-unlocked.json`、`…-processes-unlocked.json` 與 `…-app-unlocked.json`。裝置及簽署識別只保留本機。
 
 ## 0.9.0 候選擴源與原地重試
 
