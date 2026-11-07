@@ -9,11 +9,19 @@ private struct RecommendationFeedFrames: PreferenceKey {
     }
 }
 
+private struct RecommendationFeedScrollGeometry: Equatable {
+    let offset: CGFloat
+    let containerHeight: CGFloat
+    let contentHeight: CGFloat
+    let topInset: CGFloat
+    let bottomInset: CGFloat
+}
+
 @MainActor
 private struct RecommendationFeedScrollPhase: ViewModifier {
     let changed: (Bool, Bool) -> Void
     let fallbackDrag: (Bool) -> Void
-    let offsetChanged: (CGFloat) -> Void
+    let geometryChanged: (RecommendationFeedScrollGeometry) -> Void
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -24,10 +32,11 @@ private struct RecommendationFeedScrollPhase: ViewModifier {
                 guard phase != .tracking else { return }
                 changed(phase == .idle, phase == .interacting)
             }
-            .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                // Keep offsets in the same content coordinates as page origins.
-                max(geometry.contentOffset.y, 0)
-            } action: { _, offset in offsetChanged(offset) }
+            .onScrollGeometryChange(for: RecommendationFeedScrollGeometry.self) { geometry in
+                .init(offset: geometry.contentOffset.y, containerHeight: geometry.containerSize.height,
+                      contentHeight: geometry.contentSize.height, topInset: geometry.contentInsets.top,
+                      bottomInset: geometry.contentInsets.bottom)
+            } action: { _, value in geometryChanged(value) }
         } else {
             content.simultaneousGesture(DragGesture(minimumDistance: 4)
                 .onChanged { _ in fallbackDrag(true) }
@@ -54,6 +63,7 @@ struct RecommendationPreviewView: View {
     @State private var resizeTask: Task<Void, Never>?
     @State private var viewportHeight: CGFloat = 1
     @State private var contentOffset: CGFloat?
+    @State private var scrollGeometry: RecommendationFeedScrollGeometry?
     @State private var pendingScrollTarget: String?
     @State private var phaseIsIdle = true
     @State private var fallbackDragging = false
@@ -214,7 +224,19 @@ struct RecommendationPreviewView: View {
     private func resizeAwareFeed(size: CGSize) -> some View {
         ScrollViewReader { proxy in
             feedContents(size: size)
-                .onAppear { viewportSize = size; viewportHeight = max(size.height, 1) }
+                .onAppear {
+                    viewportSize = size; viewportHeight = max(size.height, 1)
+                    if let currentID = preview.current?.id {
+                        reanchorAfterResize(size: size, proxy: proxy, preferredTarget: currentID)
+                    }
+                }
+                .onChange(of: preview.items.map(\.id)) { previous, current in
+                    // Restored pages arrive after the scroll view's first layout. Claim
+                    // their stable target before scrollPosition can settle on page zero.
+                    if previous.isEmpty, !current.isEmpty, let currentID = preview.current?.id {
+                        reanchorAfterResize(size: size, proxy: proxy, preferredTarget: currentID)
+                    }
+                }
                 .onChange(of: size) { _, newSize in
                     reanchorAfterResize(size: newSize, proxy: proxy)
                 }
@@ -244,10 +266,14 @@ struct RecommendationPreviewView: View {
     }
 
     private func pagingFeed(size: CGSize) -> some View {
-        ScrollView(.vertical) {
-            LazyVStack(spacing: 0) {
+        let rendered = renderedSeriesIDs
+        return ScrollView(.vertical) {
+            // Every page has an immediately updated fixed pitch. LazyVStack can retain
+            // old heights for offscreen pages across Duo safe-area/expanded transitions.
+            // Only the small window below creates poster/media views; the rest are shells.
+            VStack(spacing: 0) {
                 ForEach(preview.items) { series in
-                    feedPage(series, size: size)
+                    feedPage(series, size: size, rendersContent: rendered.contains(series.id))
                 }
             }
             .scrollTargetLayout()
@@ -258,19 +284,39 @@ struct RecommendationPreviewView: View {
         .scrollPosition(id: feedScrollPosition, anchor: .top)
         .scrollIndicators(.hidden)
         .modifier(RecommendationFeedScrollPhase(changed: phaseChanged, fallbackDrag: fallbackDragChanged,
-            offsetChanged: offsetChanged))
+            geometryChanged: geometryChanged))
         .onPreferenceChange(RecommendationFeedFrames.self, perform: framesChanged)
     }
 
-    private func feedPage(_ series: Series, size: CGSize) -> some View {
-        feedCard(series, resizing: abs(size.height - viewportSize.height) > 2)
+    private var renderedSeriesIDs: Set<String> {
+        let items = preview.items
+        var result: Set<String> = []
+        // Never derive the window from transient/stale frame preferences. Stable queue
+        // and scroll commands keep the current player mounted while its size changes.
+        let seeds = [preview.current?.id, resizeTargetID, pendingScrollTarget, lastSettledID, scrollID].compactMap { $0 }
+        for id in Set(seeds) {
+            guard let index = items.firstIndex(where: { $0.id == id }) else { continue }
+            let lower = max(index - 2, 0), upper = min(index + 2, items.count - 1)
+            for position in lower...upper { result.insert(items[position].id) }
+        }
+        if result.isEmpty { result.formUnion(items.prefix(3).map(\.id)) }
+        return result
+    }
+
+    private func feedPage(_ series: Series, size: CGSize, rendersContent: Bool) -> some View {
+        Group {
+            if rendersContent { feedCard(series, resizing: abs(size.height - viewportSize.height) > 2) }
+            else { Color.black }
+        }
             .frame(width: max(size.width, 1), height: max(size.height, 1))
             .clipped()
             .background {
-                GeometryReader { card in
-                    let frame: CGRect = card.frame(in: .named("recommendationFeed"))
-                    let preference: [String: CGRect] = [series.id: frame]
-                    Color.clear.preference(key: RecommendationFeedFrames.self, value: preference)
+                if rendersContent {
+                    GeometryReader { card in
+                        let frame: CGRect = card.frame(in: .named("recommendationFeed"))
+                        let preference: [String: CGRect] = [series.id: frame]
+                        Color.clear.preference(key: RecommendationFeedFrames.self, value: preference)
+                    }
                 }
             }
             .id(series.id)
@@ -490,7 +536,7 @@ struct RecommendationPreviewView: View {
         playback.dismiss()
         clearPendingHandoff()
         fallbackSettle?.cancel(); fallbackSettle = nil
-        scrollID = nil; frames = [:]; contentOffset = nil; pendingScrollTarget = nil
+        scrollID = nil; frames = [:]; contentOffset = nil; scrollGeometry = nil; pendingScrollTarget = nil
         requiresManualResume = showingPreferences
         preview.invalidateSource()
         if tabIsActive { activateSource() }
@@ -531,10 +577,18 @@ struct RecommendationPreviewView: View {
                   Double(viewportHeight), Double(contentOffset ?? -9999), Double(nearest),
                   phaseIsIdle ? 1 : 0, pendingScrollTarget == nil ? 0 : 1,
                   aligned.flatMap { id in preview.items.firstIndex(where: { $0.id == id }) } ?? -1)
+            if let geometry = scrollGeometry {
+                NSLog("PreviewScroll container=%.2f content=%.2f insets=%.2f,%.2f expectedContent=%.2f",
+                      Double(geometry.containerHeight), Double(geometry.contentHeight), Double(geometry.topInset),
+                      Double(geometry.bottomInset), Double(CGFloat(preview.items.count) * viewportHeight))
+            }
             if let target = resizeTargetID {
                 let frame = frames[target] ?? .zero
                 NSLog("PreviewResize viewport=%.2fx%.2f page=%.2fx%.2f top=%.2f",
                       Double(viewportSize.width), Double(viewportSize.height), Double(frame.width), Double(frame.height), Double(frame.minY))
+                if let index = preview.items.firstIndex(where: { $0.id == target }) {
+                    NSLog("PreviewResizeTarget index=%d expectedOrigin=%.2f", index, Double(CGFloat(index) * viewportHeight))
+                }
             }
         }
         #endif
@@ -575,8 +629,9 @@ struct RecommendationPreviewView: View {
         else { scheduleFallbackSettle() }
     }
 
-    private func offsetChanged(_ offset: CGFloat) {
-        contentOffset = offset
+    private func geometryChanged(_ value: RecommendationFeedScrollGeometry) {
+        scrollGeometry = value
+        contentOffset = value.offset
         refreshEligibility()
         if !phaseIsIdle, !fallbackDragging, resizeTargetID == nil { scheduleFallbackSettle() }
     }
