@@ -252,7 +252,7 @@ struct RecommendationPreviewView: View {
 
     private func refreshEligibility() {
         let sourceMatches = preview.revision == model.revision
-        preview.update(selectedID: alignedID, isIdle: phaseIsIdle,
+        preview.update(selectedID: alignedID == scrollID ? alignedID : nil, isIdle: phaseIsIdle,
             isActive: isVisible && tabIsActive && sourceMatches && !requiresManualResume,
             isSceneActive: scenePhase == .active, isDetailPresented: detailSeries != nil)
     }
@@ -298,8 +298,10 @@ struct RecommendationPreviewView: View {
             return
         }
         requiresManualResume = false
-        phaseIsIdle = false
-        refreshEligibility()
+        // Geometry alignment and the system's scroll phase gate activation.
+        // A binding-driven accessibility scroll does not always emit a phase
+        // transition, so do not leave it waiting for an idle callback forever.
+        preview.suspend()
         withAnimation { scrollID = preview.items[index + offset].id }
     }
 
