@@ -126,7 +126,7 @@ struct PlayerScreen: View {
             model.setSceneActive(phase == .active)
             if phase != .active { cancelBoostGesture(); showControls() }
         }
-        .onChange(of: model.isPlaying) { _, _ in showControls() }
+        .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide() }
         .onChange(of: prefetchNetworkPolicy.allowsPrefetch) { _, allowed in
             model.setPrefetchNetworkAllowed(!isPreview && allowed)
         }
@@ -135,9 +135,9 @@ struct PlayerScreen: View {
         }
         .onChange(of: model.isLoading) { _, loading in
             if loading { cancelBoostGesture() }
-            showControls()
+            scheduleAutoHide()
         }
-        .onChange(of: model.isBuffering) { _, _ in showControls() }
+        .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
         .onChange(of: model.errorMessage) { _, _ in showControls() }
         .onChange(of: showingEpisodes) { _, _ in showControls() }
         .onChange(of: voiceOverEnabled) { _, _ in showControls() }
@@ -202,6 +202,7 @@ struct PlayerScreen: View {
             }
         } label: { Label("播放速度", systemImage: "speedometer") }
             .accessibilityValue(String(format: "%g 倍速", Double(model.effectiveSpeed)))
+            .simultaneousGesture(TapGesture().onEnded { showControls() })
     }
 
     private var moreMenu: some View {
@@ -220,6 +221,7 @@ struct PlayerScreen: View {
                 showControls()
             }))
         } label: { Label("更多", systemImage: "ellipsis") }
+            .simultaneousGesture(TapGesture().onEnded { showControls() })
     }
 
     private func viewingRegion(_ geometry: GeometryProxy) -> CGRect {
@@ -449,7 +451,7 @@ struct PlayerScreen: View {
 
     private func scheduleAutoHide() {
         hideTask?.cancel()
-        guard model.isPlaying, !model.isLoading, !model.isBuffering, model.errorMessage == nil,
+        guard controlsVisible, model.isPlaying, !model.isLoading, !model.isBuffering, model.errorMessage == nil,
               !showingEpisodes, !isScrubbing, !voiceOverEnabled, !boostStarted, scenePhase == .active else { return }
         hideTask = Task { @MainActor in
             do { try await Task.sleep(for: .seconds(3)) }
@@ -473,7 +475,7 @@ struct PlayerScreen: View {
                     boostStarted = true
                     boostCommitted = false
                     boostStartedLocked = model.isSpeedBoostLocked
-                    hideTask?.cancel()
+                    showControls()
                     model.beginSpeedBoost()
                 }
                 guard !boostCommitted, let drag else { return }

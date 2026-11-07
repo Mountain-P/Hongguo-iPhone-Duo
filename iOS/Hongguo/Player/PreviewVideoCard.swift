@@ -149,9 +149,9 @@ private struct PreviewVideoContent: View {
         .onChange(of: isActive) { _, _ in synchronizeActivation() }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation() }
         .onChange(of: scenePhase) { _, _ in synchronizeActivation() }
-        .onChange(of: model.isPlaying) { _, _ in revealControls(); reportPreviewStarted() }
-        .onChange(of: model.isLoading) { _, loading in if loading { firstFrameReady = false } }
-        .onChange(of: model.isBuffering) { _, _ in revealControls() }
+        .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide(); reportPreviewStarted() }
+        .onChange(of: model.isLoading) { _, loading in if loading { firstFrameReady = false }; scheduleAutoHide() }
+        .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
         .onChange(of: model.errorMessage) { _, _ in revealControls() }
         .onChange(of: voiceOverEnabled) { _, _ in revealControls() }
         .onDisappear { deactivate() }
@@ -285,7 +285,8 @@ private struct PreviewVideoContent: View {
                 Label(recommendationTitle ?? "推薦選項", systemImage: "ellipsis")
                     .font(.caption.weight(.semibold)).lineLimit(1)
                     .padding(.horizontal, 12).frame(minHeight: 44)
-            }.disabled(!allowsInteraction), in: Capsule())
+            }.simultaneousGesture(TapGesture().onEnded { revealControls() })
+            .disabled(!allowsInteraction), in: Capsule())
         }
     }
 
@@ -412,7 +413,7 @@ private struct PreviewVideoContent: View {
 
     private func scheduleAutoHide() {
         hideTask?.cancel()
-        guard isActive, scenePhase == .active, model.isPlaying,
+        guard controlsVisible, isActive, scenePhase == .active, model.isPlaying,
               !model.isBuffering, model.errorMessage == nil,
               !boostStarted, !voiceOverEnabled else { return }
         hideTask = Task { @MainActor in
