@@ -219,7 +219,7 @@ struct RecommendationPreviewView: View {
     }
 
     private func feedPage(_ series: Series, size: CGSize) -> some View {
-        feedCard(series, resizing: size != viewportSize)
+        feedCard(series, resizing: abs(size.height - viewportSize.height) > 2)
             .frame(width: max(size.width, 1), height: max(size.height, 1))
             .clipped()
             .background {
