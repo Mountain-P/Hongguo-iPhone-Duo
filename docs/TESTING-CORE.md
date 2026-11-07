@@ -2,9 +2,11 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。核心測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.4.3／build 13。已執行最終完整核心回歸：**190 項、22 個 suites，189 項通過、1 項可選 `currentWebsiteSnapshot` 略過**，記錄於 `build/core-0.4.3-tests-final.log`。UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 7 均參與並通過；簽署裝置建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以核心測試替代實機帳號驗證。
+當前程式版本為 0.4.4／build 14。已執行完整核心回歸：**199 項、23 個 suites，198 項通過、1 項可選 `currentWebsiteSnapshot` 略過**，記錄於 `build/core-0.4.4-tests.log`。UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 9、RecommendationFeedActivation 7 均參與並通過；簽署裝置建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以核心測試替代實機帳號驗證或同頁 feed 的實際手勢驗收。
 
-歷史 0.4.2／build 12 完整核心回歸為 162 項、20 個 suites，161 項通過、1 項可選快照略過，記錄於 `build/core-0.4.2-tests.log`。該版 AccountSession 11、NativePhoneAuth 12、NativePhoneRuntime 4、UserLibrary 19、AccountLibrary 9 均通過；其真人登入、會話還原與片庫讀寫證據屬該次歷史實機紀錄，不能視為 0.4.3 已重新驗證帳號網路或硬體。
+歷史 0.4.3／build 13 最終完整核心回歸為 190 項、22 個 suites，189 項通過、1 項可選快照略過，記錄於 `build/core-0.4.3-tests-final.log`。該版包含 UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7 與當時 7 項 RecommendationPreviewQueue；同頁 feed 的新增資格與穩定 ID 測試屬後續 0.4.4。
+
+歷史 0.4.2／build 12 完整核心回歸為 162 項、20 個 suites，161 項通過、1 項可選快照略過，記錄於 `build/core-0.4.2-tests.log`。該版 AccountSession 11、NativePhoneAuth 12、NativePhoneRuntime 4、UserLibrary 19、AccountLibrary 9 均通過；其真人登入、會話還原與片庫讀寫證據屬該次歷史實機紀錄，不能視為後續版本已重新驗證帳號網路或硬體。
 
 歷史 0.3.0／build 9 完整核心驗證共 107 項、15 個 suites：**106 項通過、1 項可選 `currentWebsiteSnapshot` 略過**。已以 `swift test --disable-sandbox --disable-xctest` 執行，記錄：`build/core-0.3.0-tests.log`。該輪新增 Discovery 9 項、NewRelease 7 項、Artist 7 項，全部參與該次完整驗證。
 
@@ -18,7 +20,15 @@ Discovery 測試涵蓋公開分類與動態題材、四榜單 alias、inline／d
 
 PlaybackSpeed 共 15 項，涵蓋選定速度、暫時長按／放開、鎖定／解除、背景取消、手動選速、無效輸入、等待中的速率更新與等速回饋抑制，以及暫停／換集／錯誤重載的播放意圖。暫停時改速不應啟播，自動重載不能把先前的暫停改成播放。手勢命中、AVPlayer 的實際等待與 seek 時序仍由獨立 UI 驗收確認，結果見 [TESTING.md](TESTING.md)。
 
-PlaybackContinuation 共 7 項，驗證續播目標與進度判斷；RecommendationPreviewQueue 共 7 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源，以及只能選可播放的第 1 集。Core 不取代「試看不寫歷史」、中央播放按鈕命中、關閉試看後才進入整劇詳情等畫面整合驗收。
+PlaybackContinuation 共 7 項，驗證續播目標與進度判斷。RecommendationPreviewQueue 現為 9 項，驗證推薦片單的分頁、去重、有界容量、取消／替換來源與可播放的第 1 集；0.4.4 新增穩定 ID 任意選卡、未知 ID 不移動游標，以及裁除舊頁後保留目前 ID、不把失效位置錯認成其他劇集。
+
+RecommendationFeedActivation 共 7 項，驗證只有停穩、可見且分頁／場景有效的卡片取得唯一啟播 lease；重複 idle 不重啟，滑動／減速、離頁、背景與詳情會撤銷資格，A→B→A 舊回覆無法套用，來源重設與空選取不能保留舊工作，詳情返回可維持暫停直到明確繼續。這是純狀態政策測試，不證明 AVPlayer 音訊交接、拖曳保留影格、海報銜接、播放按鈕命中或同頁詳情導航已在 GUI 通過。
+
+```sh
+swift test --disable-sandbox --disable-xctest --filter PlaybackContinuationTests
+swift test --disable-sandbox --disable-xctest --filter RecommendationPreviewQueueTests
+swift test --disable-sandbox --disable-xctest --filter RecommendationFeedActivationTests
+```
 
 0.2.0 的實網基準以 `swift run NativePlaybackCheck 7701935931787316286 4` 驗證 progressive 路徑：完整解碼第 4 集全部 89.79 秒、2,244 影片影格、825 個音訊 buffer；首幀約 1.98 秒、全流程約 7.9 秒，記錄於 `build/native-progressive-full-decode.log`。獨立 startup 檢查為準備 2.82 秒、首幀 3.10 秒；直接 seek 至 70% 為準備 1.66 秒、首幀 2.09 秒。均未使用播放服務。這些是分次 macOS 核心／解碼量測；版本對應的 Duo、真機與最新點播入口驗收見 [TESTING.md](TESTING.md)。
 
