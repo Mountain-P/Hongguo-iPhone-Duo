@@ -21,6 +21,7 @@ enum PlaybackMode: String, CaseIterable, Identifiable {
 final class AppModel: ObservableObject {
     @Published private(set) var catalogSource: CatalogSource
     @Published private(set) var playbackMode: PlaybackMode
+    @Published private(set) var nativePlaybackQuality: NativePlaybackQuality
     @Published private(set) var serverURL: String
     @Published private(set) var revision = UUID()
     @Published var searchHistory: [String]
@@ -55,6 +56,7 @@ final class AppModel: ObservableObject {
     init() {
         let initialPlayback = UserDefaults.standard.string(forKey: "playbackMode").flatMap(PlaybackMode.init(rawValue:)) ?? .native
         playbackMode = initialPlayback
+        nativePlaybackQuality = NativePlaybackQualityStore.shared.load()
         let savedCatalog = UserDefaults.standard.string(forKey: "catalogSource")
         let legacyMode = UserDefaults.standard.string(forKey: "contentMode")
         catalogSource = savedCatalog.flatMap(CatalogSource.init(rawValue:))
@@ -80,17 +82,17 @@ final class AppModel: ObservableObject {
     var isPlaybackConfigured: Bool { playbackMode == .native || !serverURL.isEmpty }
 
     func catalogService() throws -> any CatalogService {
-        if catalogSource == .website { return NativeCatalogService() }
+        if catalogSource == .website { return NativeCatalogService(quality: nativePlaybackQuality) }
         return try playbackService()
     }
 
     func previewCatalogService() throws -> any CatalogService {
-        if catalogSource == .website { return NativeCatalogService(category: recommendationPreferences.category) }
+        if catalogSource == .website { return NativeCatalogService(category: recommendationPreferences.category, quality: nativePlaybackQuality) }
         return try playbackService()
     }
 
     func playbackService() throws -> any CatalogService {
-        if playbackMode == .native { return NativeCatalogService() }
+        if playbackMode == .native { return NativeCatalogService(quality: nativePlaybackQuality) }
         guard !serverURL.isEmpty else { throw AppError.message("請先設定播放服務，才能查詢可選集數與播放影片。") }
         return BridgeService(configuration: try ServerConfiguration(baseURL: serverURL, token: token(for: serverURL)))
     }
@@ -128,6 +130,14 @@ final class AppModel: ObservableObject {
         defaults.set(PlaybackMode.native.rawValue, forKey: "playbackMode")
         defaults.set(CatalogSource.website.rawValue, forKey: "catalogSource")
         restoreLibrary()
+        revision = UUID()
+    }
+
+    func setNativePlaybackQuality(_ quality: NativePlaybackQuality) {
+        guard nativePlaybackQuality != quality else { return }
+        nativePlaybackQuality = quality
+        NativePlaybackQualityStore.shared.save(quality)
+        // Existing players keep their captured service; the next load uses a new context.
         revision = UUID()
     }
 

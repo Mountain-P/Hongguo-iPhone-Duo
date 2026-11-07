@@ -13,6 +13,7 @@ public actor NativeProgressiveMedia {
         let codec: String
         let userAgent: String
         let quality: String
+        let preference: NativePlaybackQuality
     }
     private struct Cached {
         let stream: NativeMediaStream
@@ -40,7 +41,7 @@ public actor NativeProgressiveMedia {
         try NativeMediaPolicy.validate(source)
         try Task.checkCancellation()
         let key = Key(episodeID: episodeID, url: source.url, key: source.contentKey,
-                      codec: source.codec, userAgent: source.userAgent, quality: source.quality)
+                      codec: source.codec, userAgent: source.userAgent, quality: source.quality, preference: source.preference)
         reusable = reusable.filter { $0.value.expires > now() }
         if !fresh, var cached = reusable[key], await cached.stream.isReusable,
            cached.expires > now(), reusable[key]?.stream.id == cached.stream.id {
@@ -116,7 +117,8 @@ public actor NativeProgressiveMedia {
                 try Task.checkCancellation()
                 let clearPrefix = try plan.decrypt(data: prefix, offset: 0)
                 return NativeMediaStream(totalLength: first.totalLength, fetcher: fetcher, plan: plan,
-                    validators: first.validators, prefix: clearPrefix, preparationByteCount: clearPrefix.count + auxiliaryBytes)
+                    validators: first.validators, prefix: clearPrefix, preparationByteCount: clearPrefix.count + auxiliaryBytes,
+                    variant: NativeMediaVariant(source: source))
             } catch let requirements as NativeMP4StreamRequirements {
                 guard round < 3, !requirements.ranges.isEmpty, requirements.ranges.count <= 512 else { throw NativeProgressiveError.auxiliaryLimit }
                 for range in requirements.ranges {
@@ -176,6 +178,7 @@ public actor NativeMediaStream: Hashable {
     public nonisolated let id: UUID
     public nonisolated let totalLength: Int
     public nonisolated let preparationByteCount: Int
+    public nonisolated let variant: NativeMediaVariant
     public nonisolated var assetURL: URL { URL(string: "hongguo-native://\(id.uuidString.lowercased())/video.mp4")! }
     private let fetcher: any NativeRangeFetching
     private let plan: NativeMP4StreamPlan
@@ -195,9 +198,11 @@ public actor NativeMediaStream: Hashable {
     private let chunkSize = 512 * 1024
     private let cacheLimit = 8 * 1024 * 1024
 
-    init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil) {
+    init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil,
+         variant: NativeMediaVariant) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
         self.preparationByteCount = preparationByteCount ?? prefix.count
+        self.variant = variant
     }
 
     deinit { (fetcher as? NativeRangeHTTP)?.close() }

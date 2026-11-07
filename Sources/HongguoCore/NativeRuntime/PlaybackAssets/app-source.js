@@ -535,6 +535,8 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
 
 function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata = inline, minimumPixels = 0) {
     const requestedQuality = normalizeDownloadQuality(options.quality);
+    // Local iOS policy: choose from actual compatible model rows, not invented resolutions.
+    const dataSaver = options.playbackQuality === 'dataSaver';
     const allowLowerQuality = options.allowLowerQuality === true && requestedQuality !== 'auto';
     if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
     const compatibleRows = Object.values(info?.video_list || {}).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
@@ -549,7 +551,13 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     }).filter(row => row.codecRank < 3 && (!minimumPixels || Math.min(row.width, row.height) >= minimumPixels)
         && (row.codecRank !== 2 || (row.width > 0 && row.height > 0 && typeof info.video_id === 'string'
             && info.video_id.trim() && Number.isFinite(Number(info.video_duration)) && Number(info.video_duration) > 0)));
-    const rows = compatibleRows.filter(row => allowLowerQuality || meetsDownloadQuality(row, requestedQuality)).sort((a, b) => {
+    const rows = compatibleRows.filter(row => (!dataSaver || row.codecRank < 2)
+        && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
+        if (dataSaver) {
+            const aKnown = a.width > 0 && a.height > 0, bKnown = b.width > 0 && b.height > 0;
+            if (aKnown !== bKnown) return Number(bKnown) - Number(aKnown);
+            return (aKnown ? a.pixels - b.pixels : 0) || a.codecRank - b.codecRank;
+        }
         if (requestedQuality === 'auto') return a.codecRank - b.codecRank || b.pixels - a.pixels;
         const aMeets = meetsDownloadQuality(a, requestedQuality), bMeets = meetsDownloadQuality(b, requestedQuality);
         if (aMeets !== bMeets) return Number(bMeets) - Number(aMeets);
@@ -574,7 +582,8 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     // Auto means "best available". Keep every compatible encoding at the same
     // resolution tier, but never silently fall through to a lower rendition.
     const bestPixels = rows[0].pixels;
-    const selectedRows = requestedQuality === 'auto'
+    const saverTiers = [...new Set(rows.filter(row => row.width > 0 && row.height > 0).map(row => row.pixels))];
+    const selectedRows = requestedQuality === 'auto' && !dataSaver
         ? (bestPixels > 0 ? rows.filter(row => row.pixels === bestPixels) : rows.slice(0, 1))
         : rows;
     for (const selected of selectedRows) {
@@ -600,6 +609,11 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
                     variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, source: 'app', vid,
                         userAgent: inline ? PLAYBACK_UA : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
                         ...(requestedQuality === 'auto' ? {} : { width: selected.width, height: selected.height }) });
+                    if (options.playbackQuality) Object.assign(variants[variants.length - 1], {
+                        width: selected.width || undefined, height: selected.height || undefined,
+                        qualityFallback: dataSaver && (saverTiers.length < 2 || !selected.width || !selected.height
+                            || selected.pixels > Math.min(...saverTiers)),
+                    });
                     if (selected.codec === 'bytevc2') Object.assign(variants[variants.length - 1], {
                         width: selected.width, height: selected.height, duration: Number(info.video_duration),
                     });

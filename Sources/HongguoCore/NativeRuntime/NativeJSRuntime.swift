@@ -44,8 +44,8 @@ final class NativeJSRuntime: @unchecked Sendable {
         return try NativeNewReleaseParser.parse(raw)
     }
 
-    func resolve(episodeID: String, contentType: String) async throws -> NativeMediaSource {
-        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType])
+    func resolve(episodeID: String, contentType: String, quality preference: NativePlaybackQuality = .automatic) async throws -> NativeMediaSource {
+        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.rawValue])
         let raw = try await run(script: "__startResolve(..." + String(decoding: arguments, as: UTF8.self) + ")")
         try Task.checkCancellation()
         guard let data = raw.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NativeSourceError(code: "INVALID_RESPONSE") }
@@ -53,7 +53,8 @@ final class NativeJSRuntime: @unchecked Sendable {
         guard let address = object["url"] as? String, let url = URL(string: address), Self.allowedMediaURL(url),
               let userAgent = object["userAgent"] as? String, userAgent.utf8.count < 1024, !userAgent.contains("\n"), !userAgent.contains("\r"),
               let codec = object["codec"] as? String, ["h264", "avc", "avc1", "hevc", "h265", "hvc1", "hev1"].contains(codec),
-              let quality = object["quality"] as? String else { throw NativeSourceError(code: "NO_COMPATIBLE_SOURCE") }
+              let quality = object["quality"] as? String, quality.utf8.count <= 128,
+              object["preference"] as? String == preference.rawValue else { throw NativeSourceError(code: "NO_COMPATIBLE_SOURCE") }
         let key: Data?
         if let hex = object["contentKey"] as? String, !hex.isEmpty {
             guard hex.range(of: #"^[0-9a-fA-F]{32}$"#, options: .regularExpression) != nil else { throw NativeSourceError(code: "INVALID_RESPONSE") }
@@ -62,7 +63,13 @@ final class NativeJSRuntime: @unchecked Sendable {
                 return UInt8(hex[first..<last], radix: 16)!
             })
         } else { key = nil }
-        return NativeMediaSource(url: url, contentKey: key, userAgent: userAgent, codec: codec, quality: quality)
+        func dimension(_ key: String) -> Int? {
+            guard let number = object[key] as? NSNumber, (1...16_384).contains(number.intValue) else { return nil }
+            return number.intValue
+        }
+        return NativeMediaSource(url: url, contentKey: key, userAgent: userAgent, codec: codec, quality: quality,
+            preference: preference, qualityFallback: object["qualityFallback"] as? Bool ?? false,
+            width: dimension("width"), height: dimension("height"))
     }
 
     static func allowedMediaURL(_ url: URL) -> Bool {
@@ -122,7 +129,7 @@ final class NativeJSRuntime: @unchecked Sendable {
                        "app-source": "app-source", "playback-device": "playback-device", "playback-recovery": "playback-recovery", "sm3": "sm3", "download-quality": "download-quality", "new-releases": "new-releases", "account-library": "account-library", "native-phone-auth": "native-phone-auth"]
         var sources: [String: String] = [:]
         for (name, path) in modules { sources[name] = try resource(path) }
-        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest };" }
+        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest, parseAppPlayModel };" }
         context.setObject(sources, forKeyedSubscript: "__moduleSources" as NSString)
         context.evaluateScript(try resource("runtime"))
         guard context.exception == nil else { throw NativeSourceError(code: "RUNTIME_BOOTSTRAP") }

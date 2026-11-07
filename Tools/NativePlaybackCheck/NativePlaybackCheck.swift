@@ -11,11 +11,21 @@ import CoreVideo
 enum NativePlaybackCheck {
     static func main() async {
         var arguments = Array(CommandLine.arguments.dropFirst())
+        var quality = NativePlaybackQuality.automatic
+        if let index = arguments.firstIndex(of: "--quality") {
+            guard index + 1 < arguments.count,
+                  let selected = NativePlaybackQuality(rawValue: arguments[index + 1]) else {
+                print("--quality must be automatic or dataSaver")
+                exit(2)
+            }
+            quality = selected
+            arguments.removeSubrange(index...(index + 1))
+        }
         if arguments.count == 3, arguments[0] == "--resolve-only" {
             do {
                 let started = Date()
-                let source = try await NativeSourceResolver.shared.resolve(episodeID: arguments[1], contentType: arguments[2], fresh: true)
-                print("nativeSource=PASS codec=\(source.codec) quality=\(source.quality) encrypted=\(source.contentKey != nil) elapsed=\(String(format: "%.1f", Date().timeIntervalSince(started)))s")
+                let source = try await NativeSourceResolver.shared.resolve(episodeID: arguments[1], contentType: arguments[2], fresh: true, quality: quality)
+                print("nativeSource=PASS preference=\(quality.rawValue) codec=\(safeLabel(source.codec)) quality=\(safeLabel(source.quality)) width=\(source.width ?? 0) height=\(source.height ?? 0) fallback=\(source.qualityFallback) encrypted=\(source.contentKey != nil) elapsed=\(String(format: "%.1f", Date().timeIntervalSince(started)))s")
                 return
             } catch {
                 print("FAIL: \(error.localizedDescription)")
@@ -30,16 +40,21 @@ enum NativePlaybackCheck {
             print("       swift run NativePlaybackCheck --resolve-only EPISODE_ID CONTENT_TYPE")
             print("       swift run NativePlaybackCheck --startup SERIES_ID EPISODE_NUMBER")
             print("       swift run NativePlaybackCheck --seek SERIES_ID EPISODE_NUMBER")
+            print("       All commands accept --quality automatic|dataSaver (default: automatic)")
             exit(2)
         }
         do {
-            let service = NativeCatalogService()
+            let service = NativeCatalogService(quality: quality)
             let detail = try await service.detail(id: arguments[0])
             guard let episode = detail.episodes.first(where: { $0.number == number }) else { throw CatalogError.invalidID }
             print("catalogueEpisodes=\(detail.episodes.count) selected=\(episode.number)")
             let started = Date()
             let source = try await service.playback(seriesID: detail.series.id, episodeID: episode.id, fresh: true)
             let preparedSeconds = Date().timeIntervalSince(started)
+            if let stream = source.nativeStream {
+                let variant = stream.variant
+                print("selectedSource preference=\(variant.preference.rawValue) codec=\(safeLabel(variant.codec)) quality=\(safeLabel(variant.quality)) width=\(variant.width ?? 0) height=\(variant.height ?? 0) fallback=\(variant.qualityFallback) totalBytes=\(stream.totalLength)")
+            }
             let nativeLoader = source.nativeStream.map { NativeMediaAssetLoader(stream: $0) }
             guard nativeLoader != nil || source.url.isFileURL else { throw CatalogError.unsafePlaybackURL }
             defer {
@@ -103,6 +118,14 @@ enum NativePlaybackCheck {
             print("FAIL: \(error.localizedDescription)")
             exit(1)
         }
+    }
+
+    private static func safeLabel(_ value: String) -> String {
+        guard !value.isEmpty, value.utf8.count <= 32,
+              value.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || " ._-×".unicodeScalars.contains($0) }) else {
+            return "unspecified"
+        }
+        return value
     }
 }
 #else

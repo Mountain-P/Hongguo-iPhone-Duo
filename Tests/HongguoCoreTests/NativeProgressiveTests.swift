@@ -180,6 +180,27 @@ struct NativeProgressiveTests {
         #expect(await bytes.ranges.count == 7)
     }
 
+    @Test func reusablePrefixSeparatesQualityPoliciesWhenTheirExactMediaVariantMatches() async throws {
+        let fixture = streamFixture(payload: Data(repeating: 0x32, count: 2 * 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let media = NativeProgressiveMedia(makeFetcher: { _ in bytes })
+        let automatic = source()
+        let saverFallback = NativeMediaSource(url: automatic.url, contentKey: automatic.contentKey,
+            userAgent: automatic.userAgent, codec: automatic.codec, quality: automatic.quality,
+            preference: .dataSaver, qualityFallback: true)
+        let first = try await media.prepare(source: automatic, episodeID: "1")
+        let second = try await media.prepare(source: saverFallback, episodeID: "1")
+        #expect(first != second)
+        #expect(first.variant.preference == .automatic)
+        #expect(second.variant.preference == .dataSaver)
+        #expect(second.variant.quality == first.variant.quality)
+        #expect(second.variant.qualityFallback)
+        #expect(try await media.prepare(source: automatic, episodeID: "1") == first)
+        #expect(try await media.prepare(source: saverFallback, episodeID: "1") == second)
+        #expect(await bytes.ranges.count == 2)
+        #expect(await media.reusableEntryCount == 2)
+    }
+
     @Test func preparationBudgetStopsBeforeFetchingAnOversizedIndex() async throws {
         var size = UInt32(1_100_008).bigEndian
         let padding = withUnsafeBytes(of: &size) { Data($0) } + Data("free".utf8) + Data(count: 1_100_000)

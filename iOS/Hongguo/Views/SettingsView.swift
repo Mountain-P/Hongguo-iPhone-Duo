@@ -76,6 +76,12 @@ struct SettingsView: View {
             Label("直接在 iPhone 播放", systemImage: "iphone")
             Text("不需設定網址或啟動電腦服務。回到劇集選一集，即可開始準備影片。")
                 .font(.footnote).foregroundStyle(.secondary)
+            Picker("畫質與流量", selection: Binding(get: { model.nativePlaybackQuality },
+                                                    set: { model.setNativePlaybackQuality($0) })) {
+                ForEach(NativePlaybackQuality.allCases) { Text($0.title).tag($0) }
+            }
+            Text("下次取源時生效，不會即時切換目前影片。省流量優先選較低畫質；來源沒有較低版本時，仍使用可播放畫質。只作用於內建播放。")
+                .font(.footnote).foregroundStyle(.secondary)
         } else {
             Text("選用功能：連接你自行架設的相容服務。完成驗證後才會切換。")
                 .font(.footnote).foregroundStyle(.secondary)
