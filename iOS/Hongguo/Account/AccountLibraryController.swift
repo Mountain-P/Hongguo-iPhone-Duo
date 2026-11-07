@@ -24,6 +24,7 @@ final class AccountLibraryController: ObservableObject {
     private let clock: @Sendable () -> Date
     private let saveSession: @MainActor (AccountSession) throws -> Void
     private let removeSession: @MainActor () throws -> Void
+    private let makeCloud: @Sendable (AccountSession) throws -> NativeAccountLibraryService
     private var states: [LibraryScope: LibraryState] = [:]
     private var blockedScopes: Set<LibraryScope> = []
     private var sourceID = ""
@@ -45,6 +46,8 @@ final class AccountLibraryController: ObservableObject {
     private var revisions: [LibraryScope: UInt64] = [:]
     private var dirtyScopes: Set<LibraryScope> = []
     private var saveTasks: [LibraryScope: Task<Void, Never>] = [:]
+    private var favoriteRetryRotations: [LibraryScope: LibraryRetryRotation] = [:]
+    private var progressRetryRotations: [LibraryScope: LibraryRetryRotation] = [:]
 
     var showingAccountLibrary: Bool { if case .account = selectedOwner { true } else { false } }
     var pendingCount: Int {
@@ -74,9 +77,11 @@ final class AccountLibraryController: ObservableObject {
          metadataLoader: @escaping @Sendable (String) async throws -> SeriesDetail = { try await NativeCatalogService().detail(id: $0) },
          clock: @escaping @Sendable () -> Date = { Date() },
          saveSession: @escaping @MainActor (AccountSession) throws -> Void = { _ in },
-         removeSession: @escaping @MainActor () throws -> Void = {}) {
+         removeSession: @escaping @MainActor () throws -> Void = {},
+         makeCloud: @escaping @Sendable (AccountSession) throws -> NativeAccountLibraryService = { try NativeAccountLibraryService(session: $0) }) {
         self.persistence = persistence; self.defaults = defaults; self.metadataLoader = metadataLoader; self.clock = clock
         self.saveSession = saveSession; self.removeSession = removeSession
+        self.makeCloud = makeCloud
         session = initialSession
         if let restored = session, !restored.isNativeAppSession { session = nil; needsLogin = true }
         accountProfile = session?.profile
@@ -112,7 +117,7 @@ final class AccountLibraryController: ObservableObject {
     func accept(_ newSession: AccountSession) {
         do {
             _ = try NativePhoneAuthService.validateForLibrary(session: newSession)
-            let newService = try NativeAccountLibraryService(session: newSession)
+            let newService = try makeCloud(newSession)
             try saveSession(newSession)
             cancelSynchronization()
             session = newSession; accountProfile = newSession.profile; service = newService
@@ -252,7 +257,7 @@ final class AccountLibraryController: ObservableObject {
                 self.accountProfile = profile; self.needsLogin = false
                 let cloud: NativeAccountLibraryService
                 if let existing = self.service { cloud = existing }
-                else { cloud = try NativeAccountLibraryService(session: session); self.service = cloud }
+                else { cloud = try self.makeCloud(session); self.service = cloud }
 
                 var failures: [String] = []
                 var remoteHistory: AccountLibrarySnapshot?
@@ -288,11 +293,14 @@ final class AccountLibraryController: ObservableObject {
 
                 // Favorite operations are explicit desired states. Progress is uploaded only after a successful pull.
                 self.syncPhase = "正在同步收藏變更"
-                for selected in local.eligibleFavorites(manualRetry: userInitiated).prefix(20) {
+                let favorites = self.favoriteBatch(local, manualRetry: userInitiated, scope: context)
+                for selected in favorites {
                     try self.check(token, scope: context)
                     // Persist the gate before any await/write. A crash, cancellation,
                     // or lost reply must not turn this into an automatic resend.
                     guard let mutation = try await self.beginFavoriteAttempt(selected.operationID, manualRetry: userInitiated, scope: context) else { continue }
+                    try self.check(token, scope: context)
+                    if userInitiated { self.favoriteRetryRotations[context]?.didAttempt(mutation.operationID) }
                     do {
                         if userInitiated { _ = await cloud.resetFailedMutation(mutation.operationID) }
                         try self.check(token, scope: context)
@@ -312,10 +320,12 @@ final class AccountLibraryController: ObservableObject {
                 }
                 if remoteHistory != nil {
                     self.syncPhase = "正在同步觀看進度"
-                    let pending = try self.state(for: context).eligibleProgress(manualRetry: userInitiated)
-                    for selected in pending.prefix(10) {
+                    let pending = self.progressBatch(try self.state(for: context), manualRetry: userInitiated, scope: context)
+                    for selected in pending {
                         try self.check(token, scope: context)
                         guard let mutation = try await self.beginProgressAttempt(selected.operationID, manualRetry: userInitiated, scope: context) else { continue }
+                        try self.check(token, scope: context)
+                        if userInitiated { self.progressRetryRotations[context]?.didAttempt(mutation.operationID) }
                         do {
                             if userInitiated { _ = await cloud.resetFailedMutation(mutation.operationID) }
                             let progress = try await self.makeProgress(mutation.record!, token: token, scope: context)
@@ -352,6 +362,26 @@ final class AccountLibraryController: ObservableObject {
         }
         syncTask = task
         await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    }
+
+    private func favoriteBatch(_ state: LibraryState, manualRetry: Bool, scope context: LibraryScope) -> [FavoriteMutation] {
+        let eligible = state.eligibleFavorites(manualRetry: manualRetry)
+        guard manualRetry else { return Array(eligible.prefix(20)) }
+        var rotation = favoriteRetryRotations[context] ?? LibraryRetryRotation()
+        let selected = rotation.select(from: eligible.map(\.operationID), limit: 20)
+        favoriteRetryRotations[context] = rotation
+        let values = Dictionary(uniqueKeysWithValues: eligible.map { ($0.operationID, $0) })
+        return selected.compactMap { values[$0] }
+    }
+
+    private func progressBatch(_ state: LibraryState, manualRetry: Bool, scope context: LibraryScope) -> [ProgressMutation] {
+        let eligible = state.eligibleProgress(manualRetry: manualRetry)
+        guard manualRetry else { return Array(eligible.prefix(10)) }
+        var rotation = progressRetryRotations[context] ?? LibraryRetryRotation()
+        let selected = rotation.select(from: eligible.map(\.operationID), limit: 10)
+        progressRetryRotations[context] = rotation
+        let values = Dictionary(uniqueKeysWithValues: eligible.map { ($0.operationID, $0) })
+        return selected.compactMap { values[$0] }
     }
 
     private func beginFavoriteAttempt(_ id: UUID, manualRetry: Bool, scope context: LibraryScope) async throws -> FavoriteMutation? {

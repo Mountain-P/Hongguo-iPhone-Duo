@@ -220,6 +220,69 @@ struct AccountLibraryControllerTests {
         #expect(saved.pendingFavorites.first { $0.seriesID == "101" }?.isFavorite == false)
     }
 
+    @Test func manualFavoriteRetryRotatesPastPermanentFailuresWithoutAutomaticallyResendingBlockedOperations() async throws {
+        let session = try retrySession(), scope = LibraryScope(owner: .account(id: "100"), sourceID: a.sourceID)
+        let ids = (100..<130).map(String.init)
+        var original = try LibraryState(scope: scope)
+        for id in ids { try original.setFavorite(series(id), isFavorite: true) }
+        for mutation in original.pendingFavorites { original.markFavoriteAttempt(operationID: mutation.operationID) }
+        let io = ControllerStorageProbe(initial: [scope: original]), cloud = ManualRetryCloud(failedIDs: Set(ids.prefix(20)))
+        let controller = try retryController(io, session: session, cloud: cloud)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: true)
+        await controller.flush()
+        await controller.synchronize(userInitiated: true)
+        #expect(await cloud.favoriteIDs == Array(ids.prefix(20)))
+        await controller.synchronize(userInitiated: true)
+        let requests = await cloud.favoriteIDs
+        #expect(requests.count == 40)
+        #expect(Array(requests.dropFirst(20).prefix(10)) == Array(ids.suffix(10)))
+        #expect(controller.retryRequiredCount == 20)
+        await controller.synchronize(userInitiated: false)
+        #expect(await cloud.favoriteIDs.count == 40)
+        #expect(await io.value(scope)?.retryRequiredCount == 20)
+    }
+
+    @Test func manualProgressRetryUsesItsOwnTenItemRotationAndRetainsExactMutationGates() async throws {
+        let session = try retrySession(), scope = LibraryScope(owner: .account(id: "100"), sourceID: a.sourceID)
+        let ids = (100..<115).map(String.init)
+        var original = try LibraryState(scope: scope)
+        for id in ids {
+            try original.record(.init(series: series(id), episode: episode, seconds: 20, duration: 90,
+                                      updatedAt: Date(timeIntervalSince1970: 1_700_000_000)))
+        }
+        for mutation in original.pendingProgress { original.markProgressAttempt(operationID: mutation.operationID) }
+        let io = ControllerStorageProbe(initial: [scope: original]), cloud = ManualRetryCloud(failedIDs: Set(ids.prefix(10)))
+        let controller = try retryController(io, session: session, cloud: cloud)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: true)
+        await controller.flush()
+        await controller.synchronize(userInitiated: true)
+        #expect(await cloud.progressIDs == Array(ids.prefix(10)))
+        await controller.synchronize(userInitiated: true)
+        let requests = await cloud.progressIDs
+        #expect(requests.count == 20)
+        #expect(Array(requests.dropFirst(10).prefix(5)) == Array(ids.suffix(5)))
+        await controller.synchronize(userInitiated: false)
+        #expect(await cloud.progressIDs.count == 20)
+        #expect(controller.retryRequiredCount == 10)
+    }
+
+    private func retryController(_ io: ControllerStorageProbe, session: AccountSession, cloud: ManualRetryCloud) throws -> AccountLibraryController {
+        let defaults = UserDefaults(suiteName: "HongguoManualRetryTests.\(UUID())")!
+        defaults.set(true, forKey: "library.prefersAccount")
+        let identity = AccountLibraryIdentity(device_id: "7000000000000000001", iid: "7000000000000000002",
+                                              cdid: "00000000-0000-4000-8000-000000000001")
+        return AccountLibraryController(persistence: .init(store: .init(io: io)), defaults: defaults, initialSession: session,
+            metadataLoader: { id in .init(series: .init(id: id, title: "Fixture"), episodes: [.init(id: "900", number: 1, title: "1")]) },
+            makeCloud: { session in try NativeAccountLibraryService(session: session, register: { identity }, execute: { try await cloud.execute($0) }) })
+    }
+
+    private func retrySession() throws -> AccountSession {
+        let device = try AccountAppDevice(deviceID: "7000000000000000001", installID: "7000000000000000002",
+            cdid: "00000000-0000-4000-8000-000000000001", clientUDID: "00000000-0000-4000-8000-000000000002",
+            openUDID: "0011223344556677", createdAtMilliseconds: 1_700_000_000_000)
+        return try .init(profile: .init(id: "100", nickname: "Fixture"), cookies: [], token: "fixture-token", appDevice: device)
+    }
+
     private var episode: Episode { .init(id: "900", number: 1, title: "第1集") }
     private func series(_ id: String) -> Series { .init(id: id, title: "待補劇\(id)") }
     private func state(_ scope: LibraryScope, ids: [String]) throws -> LibraryState {
@@ -237,6 +300,24 @@ struct AccountLibraryControllerTests {
 }
 
 private actor ControllerCounter { private(set) var value = 0; func increment() { value += 1 } }
+private actor ManualRetryCloud {
+    let failedIDs: Set<String>
+    private(set) var favoriteIDs: [String] = []
+    private(set) var progressIDs: [String] = []
+    init(failedIDs: Set<String>) { self.failedIDs = failedIDs }
+    func execute(_ request: AccountLibraryRequest) throws -> AccountLibraryResponse {
+        switch request.operation {
+        case .history, .favorites: return .snapshot(.init(accountID: "100", items: [], isComplete: true, pagesRead: 1))
+        case .favorite:
+            let id = request.seriesID ?? ""; favoriteIDs.append(id)
+            if failedIDs.contains(id) { throw AccountLibraryError(code: "BUSINESS_REJECTED") }
+        case .progress:
+            let id = request.progress?.seriesID ?? ""; progressIDs.append(id)
+            if failedIDs.contains(id) { throw AccountLibraryError(code: "BUSINESS_REJECTED") }
+        }
+        return .acknowledged
+    }
+}
 private actor ControllerRequestRecorder { private(set) var ids: [String] = []; func append(_ id: String) { ids.append(id) } }
 
 private actor ControllerStorageProbe: LibrarySnapshotIO {
