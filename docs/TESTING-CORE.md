@@ -2,7 +2,9 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.9.1／build 23。最終完整回歸為 **Core 363 項／43 個 suites，362 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 89 項／6 個 suites，全部通過**。合計登錄 452 項，451 通過、1 略過，記錄於 `build/core-0.9.1-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、推薦 feed model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+當前程式版本為 0.9.2／build 24。本次只調整 App 的倍速提示與控制列顯示，未改 Core 或 AppSupport；`PlaybackSpeedTests` 15 項全部通過，記錄於 `build/core-0.9.2-speed-tests.log`，沒有新增鏡像 UI 的單元測試。實際顯示行為由模擬器操作核對，結果見 [TESTING.md](TESTING.md)。
+
+最近完整回歸為 0.9.1：**Core 363 項／43 個 suites，362 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 89 項／6 個 suites，全部通過**。合計登錄 452 項，451 通過、1 略過，記錄於 `build/core-0.9.1-validated-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄／片庫 model、推薦 feed model、海報管線與續播 launcher，使用合成資料、隔離 defaults 及注入傳輸，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
 
 0.9.1 新增 20 項測試：取源快取 suite 由 2 增至 14 項，驗證同 key 合併、單讀者及全部取消、晚回覆、強制刷新與快取寫入世代、producer／讀者上限，以及未回應取消的 worker 仍佔容量。正式推薦 model 由 8 增至 16 項，驗證 pending 詳情交接、不重啟已選 B、B 直接跳 C 的舊結果隔離、當次首幀後才準備鄰居、快取卡重入、scope 變動及分頁保留。完整回歸後僅強化一個測試 fixture 的 producer 啟動 barrier，取源 14 項重跑全通過；正式原碼未變。固定延遲效能對照另見 [TESTING.md](TESTING.md)，不把這些測試當成手機首幀驗收。
 
