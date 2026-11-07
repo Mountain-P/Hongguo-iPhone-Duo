@@ -46,6 +46,7 @@ private struct RecommendationFeedScrollPhase: ViewModifier {
 @MainActor
 struct RecommendationPreviewView: View {
     var isActive = false
+    var bottomControlInset: CGFloat = 0
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var preview = RecommendationPreviewModel()
@@ -124,6 +125,7 @@ struct RecommendationPreviewView: View {
         .clipped().background(Color.black).foregroundStyle(.white)
         .navigationTitle("推薦試看").navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
+        .toolbarBackground(isActive && detailSeries == nil ? .hidden : .automatic, for: .tabBar)
         .task(id: activation) {
             guard !Task.isCancelled, activation.revision == model.revision,
                   activation.preferences == model.recommendationFilterRevision,
@@ -201,10 +203,11 @@ struct RecommendationPreviewView: View {
                     Text(message).font(.footnote)
                     Button("關閉") { playback.cancelPending() }
                 }
-                .padding(16).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14)).padding(18)
+                .padding(16).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .padding(18).padding(.bottom, max(bottomControlInset, 0))
             }
         }
-        .continuePlaybackPresentation(playback, context: playbackContext)
+        .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset)
     }
 
     private var emptyFeed: some View {
@@ -230,7 +233,7 @@ struct RecommendationPreviewView: View {
             && scenePhase == .active && detailSeries == nil && !showingPreferences && phaseIsIdle
             && playback.preparingSeriesID == nil && playback.pendingChoice == nil && playback.route == nil
         return ZStack {
-            Poster(series: series, contentMode: .fit).allowsHitTesting(false)
+            Poster(series: series, contentMode: .fill).allowsHitTesting(false)
             if let media = preview.media[series.id] {
                 RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
                     isActive: preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
@@ -243,6 +246,7 @@ struct RecommendationPreviewView: View {
                     },
                     recommendationTitle: model.catalogSource == .website ? model.recommendationPreferences.category.previewTitle : "試看",
                     recommendationReason: recommendationReason(for: series.id),
+                    bottomControlInset: bottomControlInset,
                     onShowPreferences: { showingPreferences = true },
                     onNotInterested: { model.setNotInterested(series, value: true) },
                     onViewDetails: { openEntireSeries(media.series) },
@@ -308,7 +312,8 @@ struct RecommendationPreviewView: View {
                     .buttonStyle(.bordered).accessibilityLabel("試看選項")
             }.disabled(alignedID != series.id || !phaseIsIdle)
         }
-        .padding(24).frame(maxWidth: .infinity, alignment: .leading)
+        .padding(24).padding(.bottom, max(bottomControlInset, 0))
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(alignment: .bottom) {
             LinearGradient(colors: [.clear, .black.opacity(0.9)], startPoint: .center, endPoint: .bottom).allowsHitTesting(false)
         }

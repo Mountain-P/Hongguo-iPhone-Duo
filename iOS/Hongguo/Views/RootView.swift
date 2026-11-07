@@ -27,8 +27,12 @@ struct RootView: View {
             .tag(MainTab.home)
 
             NavigationStack {
-                RecommendationPreviewView(isActive: selectedTab == .preview)
-                    .toolbar(tabBarVisibility, for: .tabBar)
+                GeometryReader { safeGeometry in
+                    RecommendationPreviewView(isActive: selectedTab == .preview,
+                        bottomControlInset: safeGeometry.safeAreaInsets.bottom)
+                        .ignoresSafeArea(.container, edges: .bottom)
+                        .toolbar(tabBarVisibility, for: .tabBar)
+                }
             }
             .toolbar(tabBarVisibility, for: .tabBar)
             .tabItem { Label(MainTab.preview.rawValue, systemImage: "play.rectangle.fill") }

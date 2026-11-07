@@ -29,6 +29,7 @@ private struct ContinuePlaybackPresentation: ViewModifier {
     @ObservedObject var launcher: ContinuePlaybackModel
     let context: ContinuePlaybackContext
     var onSeriesSwipe: ((Int) -> Void)?
+    var bottomOverlayInset: CGFloat = 0
 
     func body(content: Content) -> some View {
         content
@@ -41,7 +42,7 @@ private struct ContinuePlaybackPresentation: ViewModifier {
                         Button("取消") { launcher.cancelPending() }.font(.subheadline.weight(.semibold))
                     }
                     .padding(13).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                    .padding(14)
+                    .padding(14).padding(.bottom, max(bottomOverlayInset, 0))
                 }
             }
             .onChange(of: context, initial: true) { _, value in launcher.updateContext(value) }
@@ -64,7 +65,9 @@ private struct ContinuePlaybackPresentation: ViewModifier {
 extension View {
     @MainActor
     func continuePlaybackPresentation(_ launcher: ContinuePlaybackModel, context: ContinuePlaybackContext,
-                                      onSeriesSwipe: ((Int) -> Void)? = nil) -> some View {
-        modifier(ContinuePlaybackPresentation(launcher: launcher, context: context, onSeriesSwipe: onSeriesSwipe))
+                                      onSeriesSwipe: ((Int) -> Void)? = nil,
+                                      bottomOverlayInset: CGFloat = 0) -> some View {
+        modifier(ContinuePlaybackPresentation(launcher: launcher, context: context,
+            onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset))
     }
 }

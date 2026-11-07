@@ -18,6 +18,7 @@ struct RecommendationPreviewMediaCard: View {
     var onPreviewStarted: (() -> Void)? = nil
     var recommendationTitle: String? = nil
     var recommendationReason: String? = nil
+    var bottomControlInset: CGFloat = 0
     var onShowPreferences: (() -> Void)? = nil
     var onNotInterested: (() -> Void)? = nil
     var onViewDetails: (() -> Void)? = nil
@@ -29,6 +30,7 @@ struct RecommendationPreviewMediaCard: View {
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
                             onToggleFavorite: onToggleFavorite, onPreviewStarted: onPreviewStarted,
                             recommendationTitle: recommendationTitle, recommendationReason: recommendationReason,
+                            bottomControlInset: bottomControlInset,
                             onShowPreferences: onShowPreferences,
                             onNotInterested: onNotInterested, onViewDetails: onViewDetails, onOpenSeries: onOpenSeries)
             .id(Identity(seriesID: series.id, episodeID: episode.id))
@@ -54,6 +56,7 @@ private struct PreviewVideoContent: View {
     let onPreviewStarted: (() -> Void)?
     let recommendationTitle: String?
     let recommendationReason: String?
+    let bottomControlInset: CGFloat
     let onShowPreferences: (() -> Void)?
     let onNotInterested: (() -> Void)?
     let onViewDetails: (() -> Void)?
@@ -71,6 +74,7 @@ private struct PreviewVideoContent: View {
     init(series: Series, episode: Episode, service: any CatalogService,
          isActive: Bool, retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
          onToggleFavorite: (() -> Void)?, onPreviewStarted: (() -> Void)?, recommendationTitle: String?, recommendationReason: String?,
+         bottomControlInset: CGFloat,
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
          onOpenSeries: @escaping (PreviewPlaybackSnapshot) -> Void) {
         self.isActive = isActive
@@ -81,6 +85,7 @@ private struct PreviewVideoContent: View {
         self.onPreviewStarted = onPreviewStarted
         self.recommendationTitle = recommendationTitle
         self.recommendationReason = recommendationReason
+        self.bottomControlInset = bottomControlInset
         self.onShowPreferences = onShowPreferences
         self.onNotInterested = onNotInterested
         self.onViewDetails = onViewDetails
@@ -124,6 +129,7 @@ private struct PreviewVideoContent: View {
                         footer
                     }
                     .padding(region.height < 400 ? 12 : 20)
+                    .padding(.bottom, max(bottomControlInset, 0))
                     .opacity(controlsVisible || !isActive ? 1 : 0)
                     .allowsHitTesting(controlsVisible || !isActive)
                     .accessibilityHidden(!controlsVisible && isActive)
@@ -133,6 +139,8 @@ private struct PreviewVideoContent: View {
                 .position(x: region.midX, y: region.midY)
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
+            .onAppear { traceLayout(geometry, region: region) }
+            .onChange(of: region) { _, value in traceLayout(geometry, region: value) }
         }
         .background(.black)
         .foregroundStyle(.white)
@@ -412,6 +420,16 @@ private struct PreviewVideoContent: View {
             guard !Task.isCancelled else { return }
             controlsVisible = false
         }
+    }
+
+    private func traceLayout(_ geometry: GeometryProxy, region: CGRect) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.arguments.contains("-preview-layout-diagnostics") else { return }
+        NSLog("PreviewCanvas bounds=%.1fx%.1f region=%.1f,%.1f,%.1f,%.1f safe=%.1f,%.1f,%.1f,%.1f controlsBottom=%.1f",
+              Double(geometry.size.width), Double(geometry.size.height), Double(region.minX), Double(region.minY),
+              Double(region.width), Double(region.height), Double(geometry.safeAreaInsets.top), Double(geometry.safeAreaInsets.bottom),
+              Double(geometry.safeAreaInsets.leading), Double(geometry.safeAreaInsets.trailing), Double(bottomControlInset))
+        #endif
     }
 
     private func viewingRegion(_ geometry: GeometryProxy) -> CGRect {
