@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.6.0／build 16，包含正式連播首段預備、手動倍速與連播偏好、搜尋繁簡補查、片庫多選整理及本機播放診斷；保留原生手機簡訊登入、分帳號片庫、公開選劇 metadata、原生工具列與漸進 Range 播放。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.6.1／build 17，改善音訊中斷與片尾銜接、詳情更新失敗保留、重複分頁續讀、片庫返回及人工同步重試；保留正式連播首段預備、手動倍速偏好、繁簡搜尋、片庫管理、播放診斷與原生手機簡訊登入。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。

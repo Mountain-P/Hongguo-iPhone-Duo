@@ -2,7 +2,16 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.6.0／build 16。已執行最終完整回歸：**Core 279 項／35 個 suites，278 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 12 項／1 個 suite，全部通過**。合計登錄 291 項，290 通過、1 略過，記錄於 `build/core-0.6.0-validated-tests.log`。AppSupport 測試使用合成片庫、隔離的 defaults 與注入儲存／metadata，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以這些測試替代當版片庫畫面、真人帳號批次操作、長播、手勢或掉幀／耗電量測。
+當前程式版本為 0.6.1／build 17。最終完整回歸為 **Core 286 項／37 個 suites，285 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 27 項／3 個 suites，全部通過**。合計登錄 313 項，312 通過、1 略過，記錄於 `build/core-0.6.1-tests.log`。AppSupport 直接編譯正式 Controller、保存流程、目錄與片庫查詢 model，測試使用合成片庫、隔離 defaults 及注入儲存／服務，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)。
+
+歷史 0.6.0／build 16 為 Core 279 項／35 個 suites（278 通過、1 略過）及 AppSupport 12 項／1 個 suite 全部通過，合計 291 項、290 通過、1 略過，記錄於 `build/core-0.6.0-validated-tests.log`。
+
+0.6.1 新增 Core `PlaybackInterruptionTests` 3 項及 `LibraryRetryRotationTests` 4 項；正式 AppSupport `CatalogModelTests` 7 項、`LibraryBrowserModelTests` 6 項，以及 Controller 的人工收藏／進度輪替 2 項。目錄使用真正連續請求驗證重複第二頁後的有效第三頁、錯誤重試同頁、錯頁拒絕、成功空頁返回、100 頁上限，以及已取消重設／舊來源回覆隔離。片庫使用可控制的 worker 驗證完成快取立即返回、pending 不命中、完整 context 失效、A→B→A 晚回覆與單一執行工作。Controller 以合成 Cloud 回應驗證首批永久失敗後，第二次人工重試可到後續項目，而自動同步不重送需人工處理的操作。
+
+```sh
+swift test --disable-sandbox --disable-xctest --filter 'PlaybackInterruptionTests|LibraryRetryRotationTests'
+swift test --disable-sandbox --disable-xctest --filter 'CatalogModelTests|LibraryBrowserModelTests|AccountLibraryControllerTests'
+```
 
 歷史 0.5.0／build 15 最終結果為 Core 245 項／29 個 suites（244 通過、1 略過），以及 AppSupport 8 項／1 個 suite（8 通過）；合計登錄 253 項，252 通過、1 略過，記錄於 `build/core-0.5.0-validated-tests.log`。
 
@@ -72,7 +81,7 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryTests
 
 ## 保存與 Controller 整合測試
 
-0.5.0 的下列三組原有 22 項；0.6.0 為 Controller 增加 4 項批次整理測試後，現合計 26 項，均已參與最終完整測試，可分別重現：
+0.5.0 的下列三組原有 22 項；0.6.0 增加 4 項批次整理，0.6.1 再增加 2 項人工重試輪替，現合計 28 項，均已參與最終完整測試，可分別重現：
 
 ```sh
 swift test --disable-sandbox --disable-xctest --filter MetadataHydrationTests
@@ -84,7 +93,7 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryControllerT
 
 `LibrarySnapshotStoreTests` 8 項使用可控的磁碟屏障與臨時目錄，驗證 20 個版本合併為 2 次寫入、舊版本不可覆寫新快照、重試標記落盤前不能繼續雲端寫入、儲存失敗阻擋請求、scope 隔離與同版本衝突、損壞主檔只回復有效且同 scope 的備份、備份寫入失敗／超限／損壞遷移不覆空，以及 1,500 部作品的保存與重新開啟。編碼、讀備份及原子 IO 在串行背景執行；測試沒有證明所有真機大型片庫均不掉幀。
 
-`AccountLibraryControllerTests` 現為 12 項，直接執行 `HongguoAppSupport` 中的正式 Controller／LibraryPersistence。原有 8 項涵蓋：延遲載入期間的收藏與進度先排隊；較早進度不能在稍後清除之後復活；切來源後舊載入／進度留在原 scope；載入失敗不以空片庫覆檔；flush 等待尚未完成寫入之後更新的最後進度；舊 metadata 任務的 defer 不能清除替代任務；換來源拒絕舊回覆；第二輪補資料能到達前 50 筆失敗之後的有效作品。新增 4 項批次整理範圍見下一節。
+`AccountLibraryControllerTests` 現為 14 項，直接執行 `HongguoAppSupport` 中的正式 Controller／LibraryPersistence。原有 8 項涵蓋：延遲載入期間的收藏與進度先排隊；較早進度不能在稍後清除之後復活；切來源後舊載入／進度留在原 scope；載入失敗不以空片庫覆檔；flush 等待尚未完成寫入之後更新的最後進度；舊 metadata 任務的 defer 不能清除替代任務；換來源拒絕舊回覆；第二輪補資料能到達前 50 筆失敗之後的有效作品。0.6.0 的 4 項批次整理範圍見下一節；0.6.1 的 2 項人工輪替另以注入服務驗證 30 筆收藏與 15 筆進度在首批永久失敗後仍能到達後續項目。
 
 整合測試以注入初始化避開正式 Keychain，使用隔離的 UserDefaults、合成片庫與 metadata 載入器；沒有真實手機號碼、驗證碼、Cookie 或官方片庫寫入。App 的暫停／離開／背景 flush 觸發與有限背景執行時間仍需對應 GUI／裝置驗收，不能把合成落盤屏障測試當作強制終止或斷電零遺失證據。
 

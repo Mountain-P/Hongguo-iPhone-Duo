@@ -1,6 +1,24 @@
 # 驗證紀錄
 
-更新：2026-11-07，當前版本 0.6.0／build 16。本輪加入片尾重播、正式播放下一集準備、手動倍速與連播偏好、繁簡補查、片庫整理及本機播放診斷。預設內建取源與 progressive Range 播放不使用帳號憑據。
+更新：2026-11-07，當前版本 0.6.1／build 17。本輪改善片尾與音訊中斷、更新失敗保留、分頁續讀、片庫返回及人工同步重試。預設內建取源與 progressive Range 播放不使用帳號憑據。
+
+## 0.6.1 播放與資料恢復
+
+最終完整回歸登錄 313 項：Core 286 項／37 個 suites，285 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 27 項／3 個 suites，全部通過。記錄為 `build/core-0.6.1-tests.log`。新測試直接執行正式目錄／片庫 model 與 Controller，涵蓋重複或空頁後繼續、錯頁拒絕、取消隔離、完整相同結果快取，以及首批永久失敗後人工重試可到後續項目；未操作真人帳號或官方片庫。
+
+正式 `PlayerModel.swift` 在 macOS 以真正 AVPlayer 與本機四秒合成 MP4 執行七組驗證，全部通過：音訊中斷暫停／保存／撤加速、中斷結束不自啟且一次按播放恢復、一般路由變化不誤停而舊裝置移除會暫停、先暫停再收到 EOF 不換集或取源、舊 item／排隊 EOF 世代隔離、真正 AVPlayer 自然播畢仍換下一集、背景 EOF 不換集／回前景不自啟，以及 stop／start 後舊音訊 callback 不污染新週期。相關分支合併為七組結果，見 `build/player-interruption-check/results.txt`。此 harness 的 AVAudioSession 與 UIKit 診斷 singleton 使用測試 shim，正式 Model、NotificationCenter 與 AVPlayer 實際執行；不能當成 iOS 系統中斷接線、真耳機拔除或真人來電驗收。兩平台正式建置另外核對 iOS API。
+
+Duo 模擬器與 iPhoneOS／arm64 Debug 均建置成功並通過嚴格簽章檢查。主要記錄為 `build/ios-0.6.1-build17-final.log`、`build/ios-real-device-0.6.1-build17-final.log`；最後的詳情收藏作用域防護另以 `build/ios-0.6.1-build17-source-guard.log`、`build/ios-real-device-0.6.1-build17-source-guard.log` 核對。公開工程團隊保持空白，個人簽署只經命令列指定；本輪未另產生 Release IPA。
+
+當次最終模擬器觀察：
+
+- 先從本機 fixture 成功讀到三集詳情，再停止該服務並按「更新劇集」，畫面明確顯示「更新未完成，顯示上次資料」及連線錯誤，原有三集資訊、選集與播放入口仍保留。恢復服務後再更新，錯誤提示消失。
+- 同一段四秒合成片正常從第 1 集自動銜接至第 3 集並於片尾停下；片尾重播回到零秒。接著點影片暫停，等待後進度與第 3 集保持不變，原生與中央按鈕均提供播放動作。晚到 EOF 的競態另由上述正式 Model 注入驗證。
+- 測後切回內建播放與原有本機片庫，原有第 8 集觀看紀錄仍在；來源切換即撤去舊詳情的選集與播放入口。收藏追加的 UI 與動作入口成功快照檢查，另經程式審查及兩平台建置核對，未對真人片庫試寫。最後覆蓋安裝的模擬器亦重新載入正常內建首頁。
+
+以上不是實網長時間播放或真機耗電量測；0.6.0 的 297 集合成長播保留為該版歷史證據，沒有冒稱本版重新完成同樣長測。真耳機／來電及真人帳號重試仍待對應實機驗收。
+
+0.6.1／build 17 已經既有 `localNetwork` 通道覆蓋安裝至手機，App 清單讀回相同版號；最後的收藏作用域防護也已再次安裝並讀回。啟動兩次均因 iOS 鎖定狀態拒絕，已請使用者解鎖，尚不能宣稱本輪真機啟動驗收。初次記錄為 `build/ios-real-device-0.6.1-build17-install.json`、`build/ios-real-device-0.6.1-build17-app.json`、`build/ios-real-device-0.6.1-build17-launch-locked.json`；最終覆蓋與讀回為 `build/ios-real-device-0.6.1-build17-source-guard-install.json`、`build/ios-real-device-0.6.1-build17-source-guard-app.json`、`build/ios-real-device-0.6.1-build17-source-guard-launch.json`。96 個 App 原碼檔的雜湊與兩種平台產物版號核對保存於 `build/ios-0.6.1-build17-validation.json`。裝置、簽署識別及私人產物只保留本機。
 
 ## 0.6.0 播放、搜尋與片庫整理
 
