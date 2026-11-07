@@ -234,8 +234,10 @@ struct ExploreView: View {
             StatusCard(icon: "wifi.exclamationmark", title: "暫時無法載入", message: error,
                        actionTitle: "再試一次", action: { Task { await load(reset: catalogue.items.isEmpty) } })
         } else if catalogue.items.isEmpty && !catalogue.isLoading {
-            StatusCard(icon: "film", title: "目前沒有符合的劇集",
-                       message: mode == .newReleases ? "來源近期片單暫時沒有這類新劇，稍後再重新整理。" : "試試其他分類或題材，或搜尋你想看的劇名。")
+            StatusCard(icon: "film", title: catalogue.hasMore ? "這頁暫時沒有新劇" : "目前沒有符合的劇集",
+                       message: catalogue.hasMore ? "來源仍有下一頁，可按「載入更多」繼續找劇。" : mode == .newReleases ? "來源近期片單暫時沒有這類新劇，稍後再重新整理。" : "試試其他分類或題材，或搜尋你想看的劇名。")
+        } else if let notice = catalogue.pageNotice, catalogue.error == nil {
+            Text(notice).font(.caption).foregroundStyle(Theme.muted).frame(maxWidth: .infinity)
         }
         if catalogue.isLoading {
             ProgressView(catalogue.items.isEmpty ? "正在載入劇集…" : "正在載入更多…")
@@ -305,6 +307,7 @@ private final class TheaterDiscoveryModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var hasMore = false
     @Published private(set) var error: String?
+    @Published private(set) var pageNotice: String?
     @Published private(set) var updatedText = ""
     private(set) var key: String?
     private var page = 0
@@ -315,6 +318,7 @@ private final class TheaterDiscoveryModel: ObservableObject {
     private let releases = NativeNewReleaseService()
 
     func load(query: TheaterQuery, key requestedKey: String, legacy: (any CatalogService)?, reset: Bool, fresh: Bool) async {
+        guard !Task.isCancelled else { return }
         if reset || key != requestedKey {
             cancel()
             key = requestedKey
@@ -324,7 +328,7 @@ private final class TheaterDiscoveryModel: ObservableObject {
         guard !isLoading else { return }
         let request = generation
         let next = page + 1
-        isLoading = true; error = nil
+        isLoading = true; error = nil; pageNotice = nil
         let website = self.website
         let releases = self.releases
         let task = Task<DiscoveryPage, any Error> {
@@ -359,7 +363,8 @@ private final class TheaterDiscoveryModel: ObservableObject {
             let additions = result.items.filter { existing.insert($0.id).inserted }
             items.append(contentsOf: additions)
             page = max(next, result.page)
-            hasMore = result.hasMore && !additions.isEmpty && page < 100
+            hasMore = result.hasMore && page < 100
+            if additions.isEmpty, hasMore { pageNotice = "這一頁沒有新增劇集，仍可手動載入下一頁。" }
             updatedText = result.updatedText
             if !query.usesBridge, query.mode == .recommended || query.mode == .categories, next == 1 || !result.genres.isEmpty {
                 knownGenres[query.category] = result.genres

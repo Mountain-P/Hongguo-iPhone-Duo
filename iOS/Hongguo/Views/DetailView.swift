@@ -16,6 +16,7 @@ struct DetailView: View {
     @EnvironmentObject private var model: AppModel
     @State private var detail: SeriesDetail?
     @State private var error: String?
+    @State private var refreshFailed = false
     @State private var isLoading = false
     @State private var loadID = UUID()
     @State private var lastLoadedKey = ""
@@ -32,8 +33,9 @@ struct DetailView: View {
     @ScaledMetric(relativeTo: .body) private var episodeMinimumWidth: CGFloat = 58
     @ScaledMetric(relativeTo: .body) private var episodeMinimumHeight: CGFloat = 46
     @State private var showingAllRelated = false
-    private var current: Series { detail?.series ?? series }
-    private var discovery: SeriesDiscoveryMetadata? { detail?.discovery }
+    private var hasCurrentSnapshot: Bool { detail != nil && lastLoadedKey == loadKey }
+    private var current: Series { hasCurrentSnapshot ? detail?.series ?? series : series }
+    private var discovery: SeriesDiscoveryMetadata? { hasCurrentSnapshot ? detail?.discovery : nil }
     private var loadKey: String { "\(series.id):\(model.revision.uuidString)" }
     private var related: [Series] {
         var seen: Set<String> = [series.id]
@@ -45,7 +47,7 @@ struct DetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 hero
-                if loadedService != nil, let start = startEpisode {
+                if hasCurrentSnapshot, loadedService != nil, let start = startEpisode {
                     Button { play(start) } label: {
                         Label(startLabel(for: start), systemImage: "play.fill")
                             .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
@@ -66,13 +68,13 @@ struct DetailView: View {
                 if let discovery, !discovery.artists.isEmpty { artistSection(discovery.artists) }
                 if isLoading { ProgressView("正在載入劇集…").frame(maxWidth: .infinity).padding() }
                 if let error {
-                    StatusCard(icon: "exclamationmark.circle", title: "無法取得劇集", message: error,
+                    StatusCard(icon: "exclamationmark.circle", title: refreshFailed && hasCurrentSnapshot ? "更新未完成，顯示上次資料" : "無法取得劇集", message: error,
                                actionTitle: "重新載入", action: { Task { await load() } })
                     if model.isPlaybackConfigured {
                         Button("播放設定") { showingPlaybackSetup = true }.buttonStyle(.bordered)
                     }
                 }
-                if let detail, loadedService != nil { episodeSection(detail, scroll: scroll) }
+                if let detail, hasCurrentSnapshot, loadedService != nil { episodeSection(detail, scroll: scroll) }
                 if !related.isEmpty { relatedSection }
                 if let url = URL(string: "https://hongguoduanju.com/player/\(series.id)") {
                     Link(destination: url) { Label("在紅果官網開啟", systemImage: "arrow.up.right.square").font(.subheadline) }
@@ -113,7 +115,7 @@ struct DetailView: View {
                 if !current.tags.isEmpty {
                     Text(current.tags.joined(separator: " · ")).font(.caption).foregroundStyle(Theme.muted)
                 }
-                if let detail { Text("共 \(detail.episodes.count) 集").font(.caption).foregroundStyle(Theme.muted) }
+                if let detail, hasCurrentSnapshot { Text("共 \(detail.episodes.count) 集").font(.caption).foregroundStyle(Theme.muted) }
                 Button { model.toggleFavorite(current) } label: {
                     Label(model.isFavorite(current) ? "已收藏" : "加入收藏", systemImage: model.isFavorite(current) ? "heart.fill" : "heart")
                         .font(.subheadline.weight(.semibold))
@@ -271,7 +273,7 @@ struct DetailView: View {
     }
 
     private func locate(_ episode: Episode, in index: EpisodeSelection, scroll: ScrollViewProxy) {
-        guard index.seriesID == detail?.series.id, let group = index.group(containing: episode.id) else { return }
+        guard hasCurrentSnapshot, index.seriesID == detail?.series.id, let group = index.group(containing: episode.id) else { return }
         locationTask?.cancel()
         selectedEpisodeGroupID = group.id; locatedEpisodeID = episode.id
         episodeJumpText = "\(episode.number)"; episodeJumpFocused = false
@@ -280,7 +282,7 @@ struct DetailView: View {
         locationTask = Task { @MainActor in
             // Let the newly selected group's cells enter the scroll view first.
             try? await Task.sleep(for: .milliseconds(60))
-            guard !Task.isCancelled, request == loadID, locatedEpisodeID == episode.id,
+            guard !Task.isCancelled, hasCurrentSnapshot, request == loadID, locatedEpisodeID == episode.id,
                   detail?.series.id == index.seriesID else { return }
             withAnimation(.easeInOut(duration: 0.2)) { scroll.scrollTo("episode-\(episode.id)", anchor: .center) }
         }
@@ -312,14 +314,19 @@ struct DetailView: View {
     }
 
     private func load() async {
+        guard !Task.isCancelled else { return }
         let request = UUID()
         let key = loadKey
+        let keepSnapshot = hasCurrentSnapshot
         loadID = request
         locationTask?.cancel(); locationTask = nil
-        episodeIndex = nil; selectedEpisodeGroupID = nil; locatedEpisodeID = nil
-        episodeJumpText = ""; episodeJumpMessage = nil; episodeJumpFocused = false
-        route = nil; loadedService = nil; detail = nil
-        isLoading = true; error = nil
+        episodeJumpFocused = false
+        if !keepSnapshot {
+            episodeIndex = nil; selectedEpisodeGroupID = nil; locatedEpisodeID = nil
+            episodeJumpText = ""; episodeJumpMessage = nil
+            route = nil; loadedService = nil; detail = nil
+        }
+        isLoading = true; error = nil; refreshFailed = false
         defer { if request == loadID { isLoading = false } }
         do {
             if model.isPlaybackConfigured {
@@ -330,21 +337,34 @@ struct DetailView: View {
                 try Task.checkCancellation()
                 guard request == loadID, key == loadKey else { return }
                 loadedService = service; detail = result; lastLoadedKey = key
-                episodeIndex = try? EpisodeSelection(seriesID: result.series.id, episodes: result.episodes)
+                updateEpisodeIndex(result)
             } else {
                 let result = try await DirectWebService().detail(id: series.id)
                 try Task.checkCancellation()
                 guard request == loadID, key == loadKey else { return }
                 detail = result; lastLoadedKey = key
-                episodeIndex = try? EpisodeSelection(seriesID: result.series.id, episodes: result.episodes)
+                updateEpisodeIndex(result)
             }
         } catch {
-            if request == loadID, !Task.isCancelled { self.error = error.localizedDescription }
+            if request == loadID, key == loadKey, !Task.isCancelled {
+                self.error = error.localizedDescription
+                refreshFailed = keepSnapshot
+            }
+        }
+    }
+
+    private func updateEpisodeIndex(_ result: SeriesDetail) {
+        episodeIndex = try? EpisodeSelection(seriesID: result.series.id, episodes: result.episodes)
+        if let selectedEpisodeGroupID, episodeIndex?.groups.contains(where: { $0.id == selectedEpisodeGroupID }) != true {
+            self.selectedEpisodeGroupID = nil
+        }
+        if let locatedEpisodeID, episodeIndex?.group(containing: locatedEpisodeID) == nil {
+            self.locatedEpisodeID = nil; episodeJumpMessage = nil
         }
     }
 
     private func play(_ episode: Episode) {
-        guard let detail, let service = loadedService, episode.isAvailable else { return }
+        guard hasCurrentSnapshot, let detail, let service = loadedService, episode.isAvailable else { return }
         let record = model.record(for: detail.series)
         guard let continuation = PlaybackContinuation.selected(seriesID: detail.series.id, episode: episode, record: record) else { return }
         route = PlaybackRoute(detail: detail, episode: continuation.episode,
