@@ -55,18 +55,24 @@ private struct PosterBitmap: View {
     var body: some View {
         let requested = request
         Group {
-            if loadedRequest == requested, let bitmap {
+            if loadedRequest?.url == requested.url, let bitmap {
                 Image(decorative: bitmap.image, scale: 1).resizable().aspectRatio(contentMode: contentMode)
             } else { Color.clear }
         }
         .task(id: requested) {
+            guard !Task.isCancelled else { return }
             let id = UUID(); loadID = id
-            bitmap = nil; loadedRequest = nil
+            if loadedRequest?.url != requested.url {
+                bitmap = nil; loadedRequest = nil
+            } else if let bitmap, max(bitmap.image.width, bitmap.image.height) >= requested.pixels {
+                // Reuse an adequate bitmap when the same poster becomes smaller.
+                return
+            }
             do {
                 let image = try await PosterImagePipeline.shared.image(for: requested.url, targetPixelSize: requested.pixels)
                 guard !Task.isCancelled, loadID == id else { return }
                 bitmap = image; loadedRequest = requested
-            } catch { /* Keep the existing placeholder; failures are not cached and can be retried on reappearance. */ }
+            } catch { /* Keep a same-URL bitmap, or the placeholder. A later request can retry. */ }
         }
         .onDisappear { loadID = UUID(); bitmap = nil; loadedRequest = nil }
     }
