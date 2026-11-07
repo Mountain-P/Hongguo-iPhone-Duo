@@ -469,6 +469,11 @@ struct RecommendationPreviewView: View {
                   Double(viewportHeight), Double(contentOffset ?? -9999), Double(nearest),
                   phaseIsIdle ? 1 : 0, pendingScrollTarget == nil ? 0 : 1,
                   aligned.flatMap { id in preview.items.firstIndex(where: { $0.id == id }) } ?? -1)
+            if let target = resizeTargetID {
+                let frame = frames[target] ?? .zero
+                NSLog("PreviewResize viewport=%.2fx%.2f page=%.2fx%.2f top=%.2f",
+                      Double(viewportSize.width), Double(viewportSize.height), Double(frame.width), Double(frame.height), Double(frame.minY))
+            }
         }
         #endif
         if commandHasArrived, resizeTargetID == nil { pendingScrollTarget = nil }
@@ -571,8 +576,9 @@ struct RecommendationPreviewView: View {
 
     private func resizeFrameAligned(_ id: String) -> Bool {
         guard let frame = frames[id] else { return false }
-        return abs(frame.minY) <= 2 && abs(frame.width - viewportSize.width) <= 2
-            && abs(frame.height - viewportSize.height) <= 2
+        // Native Duo bars can leave a small width difference between the outer
+        // geometry and scroll content. Vertical paging depends on top and height.
+        return abs(frame.minY) <= 2 && abs(frame.height - viewportSize.height) <= 2
     }
 
     private func finishResize(_ target: String) {
