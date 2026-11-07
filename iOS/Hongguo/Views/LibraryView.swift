@@ -13,6 +13,7 @@ struct LibraryView: View {
     @State private var historySort: LibraryHistorySort = .recent
     @State private var isEditing = false
     @State private var selectedIDs: Set<String> = []
+    @StateObject private var browser = LibraryBrowserModel()
 
     private enum LibrarySection: String, CaseIterable, Identifiable {
         case history = "歷史", favorites = "收藏"
@@ -72,12 +73,19 @@ struct LibraryView: View {
     }
 
     private var filteredHistory: [WatchRecord] {
-        let status: LibraryHistoryFilter = switch filter { case .all: .all; case .inProgress: .inProgress; case .completed: .completed }
-        return LibraryBrowser.history(model.history, query: query, filter: status, sort: historySort)
+        browser.isSameScope(browserInput) ? browser.history : []
     }
 
-    private var filteredFavorites: [Series] { LibraryBrowser.favorites(model.favorites, query: query, sort: favoriteSort) }
+    private var filteredFavorites: [Series] { browser.isSameScope(browserInput) ? browser.favorites : [] }
     private var visibleIDs: Set<String> { Set(section == .history ? filteredHistory.map(\.id) : filteredFavorites.map(\.id)) }
+    private var browserInput: LibraryBrowserInput {
+        let status: LibraryBrowserFilter = switch filter { case .all: .all; case .inProgress: .inProgress; case .completed: .completed }
+        return .init(owner: model.selectedLibraryOwner, source: model.revision, showingHistory: section == .history, query: query,
+              favoriteSort: favoriteSort, historySort: historySort,
+              filter: status,
+              favorites: model.favorites, history: model.history)
+    }
+    private var browserIsReady: Bool { browser.isCurrent(browserInput) }
 
     var body: some View {
         ScrollView {
@@ -130,13 +138,13 @@ struct LibraryView: View {
                 Button("登出", role: .destructive) { model.signOut() }
             case .removeHistory(let selection):
                 Button("移除 \(selection.ids.count) 部本機紀錄", role: .destructive) {
-                    guard selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
+                    guard browserIsReady, selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
                     model.removeHistory(seriesIDs: selection.ids)
                     resetSelection()
                 }
             case .removeFavorites(let selection):
                 Button("取消 \(selection.ids.count) 部收藏", role: .destructive) {
-                    guard selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
+                    guard browserIsReady, selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
                     model.removeFavorites(seriesIDs: selection.ids)
                     resetSelection()
                 }
@@ -159,6 +167,13 @@ struct LibraryView: View {
         .onChange(of: model.favorites.map(\.id)) { _, ids in
             if section == .favorites { selectedIDs.formIntersection(ids) }
         }
+        .onChange(of: browserInput, initial: true) { previous, value in
+            if !value.differsOnlyInSorting(from: previous) { selectedIDs = [] }
+            confirmation = nil
+            browser.update(value)
+        }
+        .onAppear { browser.update(browserInput) }
+        .onDisappear { browser.cancel(); resetSelection() }
     }
 
     private var browserControls: some View {
@@ -176,8 +191,12 @@ struct LibraryView: View {
             .font(.subheadline).padding(12)
             .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
             HStack(spacing: 12) {
-                Text("顯示 \(visibleIDs.count)／\(section == .history ? model.history.count : model.favorites.count) 部")
-                    .font(.caption).foregroundStyle(Theme.muted)
+                if !browserIsReady {
+                    ProgressView("正在整理片庫…").font(.caption).controlSize(.small)
+                } else {
+                    Text("顯示 \(visibleIDs.count)／\(section == .history ? model.history.count : model.favorites.count) 部")
+                        .font(.caption).foregroundStyle(Theme.muted)
+                }
                 Spacer(minLength: 0)
                 Menu {
                     if section == .history {
@@ -198,7 +217,7 @@ struct LibraryView: View {
                     if isEditing { resetSelection() } else { selectedIDs = []; isEditing = true }
                 }
                 .font(.subheadline.weight(.semibold)).tint(Theme.accent)
-                .disabled(visibleIDs.isEmpty && !isEditing)
+                .disabled(!browserIsReady || (visibleIDs.isEmpty && !isEditing))
                 .accessibilityIdentifier("library.edit")
             }
         }
@@ -209,18 +228,20 @@ struct LibraryView: View {
             Text("\(libraryName) · 已選 \(selectedIDs.count) 部").font(.caption).foregroundStyle(Theme.muted)
             HStack(spacing: 14) {
                 Button(selectedIDs == visibleIDs && !visibleIDs.isEmpty ? "取消全選" : "全選顯示結果") {
+                    guard browserIsReady else { return }
                     selectedIDs = selectedIDs == visibleIDs ? [] : visibleIDs
                 }
-                .font(.caption).disabled(visibleIDs.isEmpty)
+                .font(.caption).disabled(!browserIsReady || visibleIDs.isEmpty)
                 Spacer(minLength: 0)
                 Button(section == .history ? "移除本機紀錄" : "取消收藏", role: .destructive) {
+                    guard browserIsReady else { return }
                     let selection = BatchSelection(ids: selectedIDs.intersection(visibleIDs), owner: model.selectedLibraryOwner,
                                                    revision: model.revision, libraryName: libraryName)
                     guard !selection.ids.isEmpty else { return }
                     confirmation = section == .history ? .removeHistory(selection) : .removeFavorites(selection)
                 }
                 .font(.caption.weight(.semibold)).buttonStyle(.bordered)
-                .disabled(selectedIDs.isEmpty).accessibilityIdentifier("library.removeSelected")
+                .disabled(!browserIsReady || selectedIDs.isEmpty).accessibilityIdentifier("library.removeSelected")
             }
         }
         .padding(12).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
@@ -228,7 +249,9 @@ struct LibraryView: View {
 
     @ViewBuilder
     private var libraryContent: some View {
-        if section == .history {
+        if !browserIsReady, visibleIDs.isEmpty {
+            ProgressView("正在整理片庫…").frame(maxWidth: .infinity).padding(.vertical, 30)
+        } else if section == .history {
             if filteredHistory.isEmpty {
                 StatusCard(icon: "clock", title: model.history.isEmpty && model.librarySyncing ? "正在載入觀看紀錄" : model.history.isEmpty ? "從第一個故事開始" : "沒有符合的觀看紀錄",
                            message: model.history.isEmpty && model.librarySyncing ? "讀到的片庫會先顯示，海報會接著補齊。" : model.history.isEmpty ? "播放過的劇集會留在這裡，隨時接著看。" : "調整搜尋或分集進度篩選，查看其他紀錄。")
@@ -272,6 +295,7 @@ struct LibraryView: View {
 
     private func selectableCard<Content: View>(_ series: Series, @ViewBuilder content: () -> Content) -> some View {
         Button {
+            guard browserIsReady else { return }
             if !selectedIDs.insert(series.id).inserted { selectedIDs.remove(series.id) }
         } label: {
             content()
@@ -286,6 +310,7 @@ struct LibraryView: View {
                 }
         }
         .buttonStyle(.plain).accessibilityLabel(series.title)
+        .disabled(!browserIsReady)
         .accessibilityValue(selectedIDs.contains(series.id) ? "已選取" : "未選取")
         .accessibilityAddTraits(selectedIDs.contains(series.id) ? .isSelected : [])
     }
