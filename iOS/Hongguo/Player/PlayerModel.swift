@@ -39,12 +39,14 @@ final class PlayerModel: ObservableObject {
 
     var effectiveSpeed: Float { playbackSpeed.effectiveRate }
 
-    func selectSpeed(_ rate: Float) {
+    func selectSpeed(_ rate: Float, feedback: Bool = false) {
         guard rate.isFinite, (0.25...4).contains(rate) else { return }
+        let changed = playbackSpeed.normalRate != rate || playbackSpeed.isPressing || playbackSpeed.isLocked
         playbackSpeed.selectRate(rate)
         preferences.setNormalRate(playbackSpeed.normalRate)
         applyPlaybackRate()
         updateNextEpisodePrefetch()
+        if feedback, changed { PlaybackHaptics.emit(.speedSelected) }
     }
 
     func setAutoNext(_ enabled: Bool) {
@@ -114,26 +116,34 @@ final class PlayerModel: ObservableObject {
 
     func finishVisualTransition() { episodeTransitionFrame = nil }
 
-    func beginSpeedBoost() {
+    func beginSpeedBoost(feedback: Bool = false) {
         guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
+        let changed = !playbackSpeed.isPressing
         playbackSpeed.beginHold()
         applyPlaybackRate()
+        if feedback, changed { PlaybackHaptics.emit(.boostBegan) }
     }
 
-    func endSpeedBoost() {
+    func endSpeedBoost(feedback: Bool = false) {
+        let releasedTemporaryBoost = playbackSpeed.isPressing && !playbackSpeed.isLocked
         playbackSpeed.endHold()
         applyPlaybackRate()
+        if feedback, releasedTemporaryBoost { PlaybackHaptics.emit(.boostEnded) }
     }
 
-    func lockSpeedBoost() {
+    func lockSpeedBoost(feedback: Bool = false) {
         guard hasStarted, audioPolicy.permitsPlayback(sceneActive: sceneActive), !isLoading, errorMessage == nil else { return }
+        let changed = !playbackSpeed.isLocked
         playbackSpeed.lock()
         applyPlaybackRate()
+        if feedback, changed { PlaybackHaptics.emit(.boostLocked) }
     }
 
-    func unlockSpeedBoost() {
+    func unlockSpeedBoost(feedback: Bool = false) {
+        let changed = playbackSpeed.isLocked
         playbackSpeed.unlock()
         applyPlaybackRate()
+        if feedback, changed { PlaybackHaptics.emit(.boostUnlocked) }
     }
 
     private func applyPlaybackRate() {
@@ -276,11 +286,14 @@ final class PlayerModel: ObservableObject {
         beginLoad(episode, position: resumePosition, fresh: true, autoplay: true)
     }
 
-    func skip(_ seconds: Double) {
-        guard hasStarted else { return }
+    func skip(_ seconds: Double, feedback: Bool = false) {
+        guard hasStarted, seconds.isFinite, !isLoading, errorMessage == nil else { return }
         let current = player.currentTime().seconds
         guard current.isFinite else { return }
-        seek(to: current + seconds)
+        let target = min(max(0, current + seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
+        guard target.isFinite, abs(target - current) > 0.001 else { return }
+        seek(to: target)
+        if feedback { PlaybackHaptics.emit(.skip) }
     }
 
     func seek(to seconds: Double) {

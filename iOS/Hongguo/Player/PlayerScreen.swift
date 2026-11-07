@@ -215,8 +215,14 @@ struct PlayerScreen: View {
         .onChange(of: voiceOverEnabled) { _, _ in showControls() }
         .onChange(of: holdingBoost) { _, holding in
             if !holding {
-                if boostStarted { endBoostGesture() }
-                suppressBoostUntilRelease = false
+                Task { @MainActor in
+                    // The normal release callback owns feedback. Give it this turn
+                    // before silently cleaning up a cancelled gesture.
+                    await Task.yield()
+                    guard !holdingBoost else { return }
+                    if boostStarted { endBoostGesture() }
+                    suppressBoostUntilRelease = false
+                }
             }
         }
         .sheet(isPresented: $showingEpisodes) { episodePicker }
@@ -242,9 +248,9 @@ struct PlayerScreen: View {
             }
         }
         ToolbarItemGroup(placement: .bottomBar) {
-            Button { model.skip(-10); showControls() } label: { Label("後退十秒", systemImage: "gobackward.10") }
+            Button { model.skip(-10, feedback: true); showControls() } label: { Label("後退十秒", systemImage: "gobackward.10") }
                 .disabled(model.isLoading || model.duration <= 0)
-            Button { model.skip(10); showControls() } label: { Label("前進十秒", systemImage: "goforward.10") }
+            Button { model.skip(10, feedback: true); showControls() } label: { Label("前進十秒", systemImage: "goforward.10") }
                 .disabled(model.isLoading || model.duration <= 0)
             speedMenu
             Button {
@@ -263,8 +269,8 @@ struct PlayerScreen: View {
         Menu {
             ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
                 Button {
+                    model.selectSpeed(rate, feedback: true)
                     cancelBoostGesture()
-                    model.selectSpeed(rate)
                     showControls()
                 } label: {
                     if model.effectiveSpeed == rate {
@@ -405,8 +411,8 @@ struct PlayerScreen: View {
             }
             .accessibilityAction(named: Text(model.isSpeedBoostLocked ? "解除 2 倍速鎖定" : "鎖定 2 倍速")) {
                 cancelBoostGesture()
-                if model.isSpeedBoostLocked { model.unlockSpeedBoost() }
-                else { model.lockSpeedBoost() }
+                if model.isSpeedBoostLocked { model.unlockSpeedBoost(feedback: true) }
+                else { model.lockSpeedBoost(feedback: true) }
             }
         if !isPreview {
             touch
@@ -668,19 +674,19 @@ struct PlayerScreen: View {
                     boostCommitted = false
                     boostStartedLocked = model.isSpeedBoostLocked
                     hideTask?.cancel()
-                    model.beginSpeedBoost()
+                    model.beginSpeedBoost(feedback: true)
                 }
                 guard !boostCommitted, let drag else { return }
                 if !boostStartedLocked, drag.translation.height <= -60 {
-                    model.lockSpeedBoost()
+                    model.lockSpeedBoost(feedback: true)
                     boostCommitted = true
                 } else if boostStartedLocked, drag.translation.height >= 60 {
-                    model.unlockSpeedBoost()
+                    model.unlockSpeedBoost(feedback: true)
                     model.endSpeedBoost()
                     boostCommitted = true
                 }
             }
-            .onEnded { _ in endBoostGesture(); suppressBoostUntilRelease = false }
+            .onEnded { _ in endBoostGesture(feedback: !suppressBoostUntilRelease); suppressBoostUntilRelease = false }
     }
 
     private func cancelBoostGesture() {
@@ -688,9 +694,9 @@ struct PlayerScreen: View {
         endBoostGesture()
     }
 
-    private func endBoostGesture() {
+    private func endBoostGesture(feedback: Bool = false) {
         if boostStarted { lastBoostEndAt = Date() }
-        model.endSpeedBoost()
+        model.endSpeedBoost(feedback: feedback && boostStarted)
         boostStarted = false
         boostCommitted = false
         if controlsVisible { scheduleAutoHide() }
@@ -701,7 +707,7 @@ struct PlayerScreen: View {
         if model.isSpeedBoostLocked {
             Button {
                 cancelBoostGesture()
-                model.unlockSpeedBoost()
+                model.unlockSpeedBoost(feedback: true)
             } label: {
                 Label("2 倍速已鎖定 · 長按下滑解除", systemImage: "lock.fill")
                     .font(.caption.weight(.semibold))

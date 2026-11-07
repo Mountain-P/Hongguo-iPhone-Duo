@@ -263,10 +263,10 @@ private struct PreviewVideoContent: View {
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
                 hideTask?.cancel()
-                model.beginSpeedBoost()
+                model.beginSpeedBoost(feedback: true)
             }, onHoldEnded: { cancelled in
                 let wasBoosting = boostStarted
-                endBoost(reveal: false)
+                endBoost(reveal: false, feedback: !cancelled && isActive && scenePhase == .active)
                 if wasBoosting, !cancelled, controlsVisible, isActive, scenePhase == .active {
                     scheduleAutoHide()
                 }
@@ -314,8 +314,8 @@ private struct PreviewVideoContent: View {
             ForEach([Float(0.75), 1, 1.25, 1.5, 2], id: \.self) { rate in
                 Button {
                     guard allowsInteraction, isActive else { return }
+                    model.selectSpeed(rate, feedback: true)
                     cancelBoost()
-                    model.selectSpeed(rate)
                     revealControls()
                 } label: {
                     if model.effectiveSpeed == rate {
@@ -675,10 +675,11 @@ private struct PreviewVideoContent: View {
         endBoost(reveal: reveal)
     }
 
-    private func endBoost(reveal: Bool = true) {
+    private func endBoost(reveal: Bool = true, feedback: Bool = false) {
         if boostStarted { lastBoostEndAt = Date() }
+        let wasBoosting = boostStarted
         boostStarted = false
-        model.endSpeedBoost()
+        model.endSpeedBoost(feedback: feedback && wasBoosting)
         if reveal { revealControls() }
     }
 
