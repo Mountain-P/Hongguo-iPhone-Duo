@@ -1,6 +1,30 @@
 # 驗證紀錄
 
-更新：2026-11-07，當前版本 0.5.0／build 15。本輪改善試看載入、片庫保存、本機偏好、收藏與快速選集。預設內建取源與 progressive Range 播放不使用帳號憑據。
+更新：2026-11-07，當前版本 0.6.0／build 16。本輪加入片尾重播、正式播放下一集準備、手動倍速與連播偏好、繁簡補查、片庫整理及本機播放診斷。預設內建取源與 progressive Range 播放不使用帳號憑據。
+
+## 0.6.0 播放、搜尋與片庫整理
+
+最終完整測試合計登錄 291 項：Core 279 項／35 個 suites，278 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 12 項／1 個 suite，全部通過。記錄為 `build/core-0.6.0-validated-tests.log`。測試涵蓋片尾重播判斷、偏好保存、預取資格與取消、繁簡補查、來源題材篩選、片庫排序與批次操作，以及首幀／恢復等待的量測政策；詳細範圍見 [TESTING-CORE.md](TESTING-CORE.md)。
+
+本機 Duo 模擬器 Debug 建置成功，採 Xcode ad hoc 簽署並通過嚴格簽章檢查；已安裝並啟動 0.6.0／build 16。初次建置記錄為 `build/ios-0.6.0-build16-validated.log`，片庫背景搜尋補修後最終記錄為 `build/ios-0.6.0-build16-library-background-final.log`，已重新安裝與啟動。當次畫面觀察：
+
+- 搜尋「總裁」載入 10 部；以來源題材「剧情（1）」篩成 1／10 部，仍保留載入更多入口。原始查詢當次已有結果；繁簡空結果補查的觸發與分頁沿用另外由政策測試驗證。
+- 搜尋歷史能單筆移除。片庫中以繁體「榮耀」找到簡體片名，並能切換名稱排序。
+- 片庫多選會顯示已選數量；移除確認清楚列出本機 1 筆及不刪官方紀錄的範圍。當次取消確認，保留原有觀看紀錄；帳號批次寫入沒有在真人片庫執行。
+
+1,500 筆繁簡混合的合成片庫 CPU microbenchmark 發現，中文多詞搜尋加收藏名稱排序在 Mac Release 的七次暖跑約 185–198ms，歷史同條件約 186–487ms；空查詢的歷史時間排序約 0.36–0.70ms。這是與長播並行的開發機量測，尖峰受負載影響，不能推算 iPhone UI 耗時。為避免這段同步工作佔住畫面，片庫搜尋／排序已移到串行背景 worker，並加入 180ms 輸入防抖、完整 context／世代檢查，以及處理中批次操作限制。原始 microbenchmark 保存在本機 `build/library-browser-benchmark/`。
+
+補修後以正式 `LibraryBrowserModel.swift` 與 Release Core 編譯一次性併行檢查：收藏／歷史各 1,500 筆，舊搜尋執行中改查詢只發佈最新的 750 筆匹配；換帳號與同帳號換來源立即清空舊列表；取消後沒有晚到回填，之後新搜尋可正常完成。五種情境均通過。MainActor 的 5ms heartbeat 取得 598 筆，間隔中位 5.97ms、最大 9.20ms，搜尋 CPU 窗口仍有 heartbeat。這是開發機併行證據，沒有宣稱真機改善幅度；結果為 `build/library-browser-benchmark/concurrency-results.txt`。最終模擬器畫面亦確認匹配、無結果及清除查詢後的 1／1、0／1、1／1 狀態，原有片庫仍在。
+
+本機四秒合成影片連播從既有續播第 4 集至第 300 集，本輪新播 297 集全部完成，零失敗、零取消、零自動重試；末集正常停在 0:04。觀察器從已完成第 34 集時開始連續採樣 1,121.85 秒（約 18.7 分鐘），113 筆讀取均成功；累積取得 297 次已結束測量，首幀中位約 0.142 秒、播放中等待合計約 3.00 秒。Mac 模擬器程序 RSS 為 146.23–178.25 MB，末筆 147.25 MB，這段樣本未見持續上升；不能據此證明所有情境沒有記憶體洩漏。結果為 `build/soak-0.6.0-samples.jsonl`、`build/soak-0.6.0-samples.summary.json`、`build/soak-0.6.0-fixture.log`。合成橋接不會觸發內建下一集預取，該政策另由核心測試驗證；上述首幀不是官方片源或真機效能。長測與最終背景搜尋補修使用相同播放器／Core 原碼，之後補修只涉及片庫 UI 及其新 model，並已重做建置與片庫畫面。
+
+最終模擬器另觀察到：停在第 300 集片尾按中央播放，進度回到零秒並重新播放；手動 2 倍速及關閉自動下一集，在終止並重啟 App 後仍保持。測後還原 1 倍速與自動下一集，切回內建播放及原有片庫。播放診斷顯示有界 80 次與模擬器提示，最近測量的「原片重播」首幀為「—」，系統報告顯示尚未收到，沒有把 MetricKit 範例當作量測。
+
+唯讀 macOS 原生取源／解碼探針同次讀取一部 102 集作品的第 4 集：startup 準備 1.49 秒、首個解碼影格 2.00 秒；直接 seek 至 70% 準備 1.48 秒、首個解碼影格 2.07 秒。記錄為 `build/native-0.6.0-startup.log`、`build/native-0.6.0-seek.log`。這是分次 macOS 管線量測，不能視為 iPhone 首幀、前後版本效能比較或預載收益。
+
+播放診斷僅保存最多 80 筆去識別本機數值；重播另外標記，不混入冷啟播首幀。自動重試次數代表嘗試次數，恢復等待包含重建至恢復播放的空檔。模擬器不能驗證實機耗電；本輪沒有注入 MetricKit 範例報告作為效能證據。
+
+同一批 App 原碼另完成 iPhoneOS／arm64 Debug 簽署建置與嚴格簽章檢查，經既有 `localNetwork` 通道覆蓋安裝至已配對手機。安裝及啟動均回報成功，App 清單讀回 0.6.0／build 16；未刪除 App 或重新登入。初次部署後，背景搜尋補修亦重新簽署建置、覆蓋安裝並成功啟動。這是部署與啟動證據，本輪沒有重做真人帳號同步、實機手勢或實機長播／耗電驗收。初次記錄為 `build/ios-real-device-0.6.0-build16-build.log`、`build/ios-real-device-0.6.0-build16-install.json`、`build/ios-real-device-0.6.0-build16-launch.json`、`build/ios-real-device-0.6.0-build16-app.json`；最終補修記錄為 `build/ios-real-device-0.6.0-build16-library-background-final.log`、`build/ios-real-device-0.6.0-build16-background-final-install.json`、`build/ios-real-device-0.6.0-build16-background-final-launch.json`。原碼雜湊與產物平台／版號核對保存於 `build/ios-0.6.0-build16-validation.json`。裝置及簽署識別只留本機，公開工程的開發團隊仍為空白。本輪未另產生 Release IPA。
 
 ## 0.5.0 試看與片庫體驗
 

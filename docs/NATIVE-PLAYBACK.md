@@ -1,4 +1,4 @@
-# 內建漸進播放（0.5.0）
+# 內建漸進播放（0.6.0）
 
 App 首次啟動採用「內建播放」。首頁、劇場搜尋與劇集詳情直接連到來源平台；這些頁面的海報瀏覽不會準備影片，按播放後才發出取源與索引請求。0.4.4 的「試看」在同一頁連續垂直捲動，每劇佔一個可用畫面，停穩對齊後才試播第一集。不需要使用者填播放服務網址，也不需要 Mac 持續開機。影片索引準備好即可開始，剩餘資料依播放與拖曳位置取得。「我的」集中觀看歷史、收藏與設定。
 
@@ -13,6 +13,18 @@ App 首次啟動採用「內建播放」。首頁、劇場搜尋與劇集詳情�
 0.4.4 將試看改成原生垂直 paging 的連續影片卡片，不再逐部呈現另一個播放器頁。卡片跟手滑動，鄰頁保留海報，拖曳中的當前影片暫停並保留最後影格；只有停穩對齊的可見卡可以播放。一般首頁、劇場與完整播放器的入口維持原行為。
 
 0.5.0 加入有界首段重用與相鄰一部預取、原生暫時網路錯誤的一次 fresh 重試，以及以 `AVPlayerLayer.isReadyForDisplay` 回報切換試看海報的接點。試看卡可直接收藏、調整本機推薦偏好或標記不感興趣；真正顯示首幀且已播放後才記住本機「已試看」，不寫入正式觀看位置。這些程式路徑的合成測試與實網、GUI／裝置驗收分開記錄；尚未量測 0.5.0 的實網首幀改善幅度。
+
+## 0.6.0 正式連播、偏好與診斷
+
+正式播放器在播完、沒有下一集或關閉自動連播時，再按播放會先定位零秒。定位回呼綁定同一分集與操作世代；等待期間暫停、換集或另一次定位，舊回呼不能自行恢復播放。手動選擇的正常倍速與自動下一集設定保存在本機；長按加速和鎖速不寫入正常倍速，試看固定關閉自動下一集，也不覆寫正式播放的偏好。
+
+正式內建播放接近結尾時，沿用 `NativePlaybackPrefetch` 為下一個可用分集準備首段。觸發窗口約為剩餘 12 秒的實際播放時間，會按目前倍速換算；目前影片須至少有約三秒緩衝，最後不足三秒時則須完整緩衝剩餘部分。只有實際播放、允許連播、非昂貴／非受限網路且未開低耗電時才預備；暫停、資料不足、向後定位、背景化、換集或關閉連播會取消。仍受既有 1 MiB 媒體準備預算與有界首段快取限制，不建立第二個 AVPlayer，也不承諾所有網路都可無縫接集。
+
+「我的 → 設定 → 播放診斷」最多保存 80 次不含內容身分的數值測量：準備到首幀就緒、播放中等待與自動重試次數；另顯示目前記憶體占用與溫度，不逐次保存資源快照。自動重新取源沿用同一次起播時鐘；恢復期間替換 item 的內部暫停不會把中斷時間漏掉，使用者明確暫停則結束等待。原片重播使用獨立 `.replay` 測量，定位完成只記 ready，不冒充新的解碼首幀。離開或暫停後停止五秒資源採樣；清除測量不改片庫。
+
+診斷不接受片名、劇集 ID、播放網址、Cookie 或帳號，不自動上傳。實機的裝置電量變化只在連續未充電超過一分鐘後顯示，包含系統及其他 App 的耗電；各次播放／暫停之間不沿用舊電量窗口，不能把這個差值當作 App 單獨耗電。模擬器明確顯示無法代表 iPhone 效能或耗電。
+
+另訂閱本機 [MetricKit](https://developer.apple.com/documentation/metrickit) 系統報告，只保留日期、CPU 時間、記憶體與捲動卡頓等白名單數值。系統報告通常按日提供，可能涵蓋整個 App 和不同版本；沒有收到報告不代表已完成效能驗證。app 的經過時間量測用途列在 PrivacyInfo 的 SystemBootTime `35F9.1`，數據只在本機使用，依據為 Apple 的[必要原因 API 說明](https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitypereasons)。本輪實際建置、連播與量測界線見 [TESTING.md](TESTING.md)。
 
 ## 流程
 
@@ -41,7 +53,7 @@ Range 必須回傳精確的 206、Content-Range 與資料長度，檔長及來�
 
 播放器從 0.2.1 起使用 `playerFillsScreen.v2` 偏好，新偏好首次預設等比裁切填滿，可切回完整比例並保存選擇。0.4.3 單點影片切換播放／暫停並顯示控制；中央玻璃播放鈕與原生工具列使用相同狀態，暫停時均提供播放動作。控制資訊透明覆蓋影片，播放時可閒置隱藏，影片保持全畫布，不為控制列縮小。完整比例模式的留白由影片長寬比自然產生。原生控制列的位置由系統依 Duo 姿態決定。
 
-根畫面使用「首頁／試看／劇場／我的」原生 TabView；一般全螢幕播放器自帶 NavigationStack 與有名稱、symbol 的 `.toolbar` 項目。Duo 外螢幕與內螢幕橫向可使用側欄，內螢幕直向的原生列則在上下方。一般播放器的「更多」提供選集、下一集及自動續播；同頁試看只提供首集播放控制與「看整部」，分頁列保持原生。點按與 hover 分別處理。原生列的實作依據見 Apple [Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/) 與 [Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo)。
+根畫面使用「首頁／試看／劇場／我的」原生 TabView；一般全螢幕播放器自帶 NavigationStack 與有名稱、symbol 的 `.toolbar` 項目。Duo 外螢幕與內螢幕橫向可使用側欄，內螢幕直向的原生列則在上下方。一般播放器的「更多」提供選集、下一集及自動續播；同頁試看提供首集播放控制、收藏、推薦偏好與「看整部」，分頁列保持原生。點按與 hover 分別處理。原生列的實作依據見 Apple [Raise the bar with iPhone Duo](https://developer.apple.com/videos/play/tech-talks/111462/) 與 [Designing for iPhone Duo](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo)。
 
 0.2.4 的影片資訊採輕透明圓角框，片名／集數一列，slider／時間一列，最大寬度 560 pt，以玻璃材質呼應原生底部工具列。iOS 26+ 使用 `.glassEffect(.regular)` 與圓角矩形；較舊系統使用 ultraThinMaterial，啟用 Reduce Transparency 時改用不透明背景。資訊框隨 `controlsVisible` 同步隱藏，包含原有閒置自動隱藏；顯示與隱藏都只覆蓋影片，不重算影片尺寸。
 

@@ -2,7 +2,9 @@
 
 `HongguoCore` 是不依賴 SwiftUI／AVFoundation 的核心模組；同一本機 Swift Package 中的 `HongguoPlayback` 提供 App 與 macOS 工具共用的 `NativeMediaAssetLoader`。0.5.0 加入內部 `HongguoAppSupport` target，直接編譯 App 的帳號 Controller、會話保存與片庫保存原始碼，供整合測試使用，避免只測試 DTO／純狀態。測試使用 Swift Testing，最低工具版本為 Swift 6／Xcode 16。
 
-當前程式版本為 0.5.0／build 15。已執行最終完整回歸：**Core 245 項／29 個 suites，244 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 8 項／1 個 suite，全部通過**。合計登錄 253 項，252 通過、1 略過，記錄於 `build/core-0.5.0-validated-tests.log`。AppSupport 測試使用合成片庫、隔離的 defaults 與注入儲存／metadata，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以這些測試替代實機帳號、手勢或掉幀／耗電量測。
+當前程式版本為 0.6.0／build 16。已執行最終完整回歸：**Core 279 項／35 個 suites，278 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 12 項／1 個 suite，全部通過**。合計登錄 291 項，290 通過、1 略過，記錄於 `build/core-0.6.0-validated-tests.log`。AppSupport 測試使用合成片庫、隔離的 defaults 與注入儲存／metadata，不操作真人帳號或真實 Keychain。簽署建置、安裝與當版 UI／硬體結果另記於 [TESTING.md](TESTING.md)，不以這些測試替代當版片庫畫面、真人帳號批次操作、長播、手勢或掉幀／耗電量測。
+
+歷史 0.5.0／build 15 最終結果為 Core 245 項／29 個 suites（244 通過、1 略過），以及 AppSupport 8 項／1 個 suite（8 通過）；合計登錄 253 項，252 通過、1 略過，記錄於 `build/core-0.5.0-validated-tests.log`。
 
 歷史 0.4.4／build 14 完整核心回歸為 199 項、23 個 suites，198 通過、1 項可選快照略過，記錄於 `build/core-0.4.4-tests.log`。該版包含 UserLibrary 25、PlaybackSpeed 15、PlaybackContinuation 7、RecommendationPreviewQueue 9 與 RecommendationFeedActivation 7。
 
@@ -68,9 +70,9 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryTests
 
 原生 API 實際手機發碼／登入、來源挑戰、Keychain 真機保存／還原、真人帳號讀寫與跨裝置續播，另依 [ACCOUNT.md](ACCOUNT.md) 及 [TESTING.md](TESTING.md) 記錄；本輪未以真實 Cookie 或驗證碼執行上述 focused 測試。
 
-## 0.5.0 保存與 Controller 整合測試
+## 保存與 Controller 整合測試
 
-下列三組合計 22 項，均已參與最終完整測試，可分別重現：
+0.5.0 的下列三組原有 22 項；0.6.0 為 Controller 增加 4 項批次整理測試後，現合計 26 項，均已參與最終完整測試，可分別重現：
 
 ```sh
 swift test --disable-sandbox --disable-xctest --filter MetadataHydrationTests
@@ -82,9 +84,25 @@ swift test --disable-sandbox --disable-xctest --filter AccountLibraryControllerT
 
 `LibrarySnapshotStoreTests` 8 項使用可控的磁碟屏障與臨時目錄，驗證 20 個版本合併為 2 次寫入、舊版本不可覆寫新快照、重試標記落盤前不能繼續雲端寫入、儲存失敗阻擋請求、scope 隔離與同版本衝突、損壞主檔只回復有效且同 scope 的備份、備份寫入失敗／超限／損壞遷移不覆空，以及 1,500 部作品的保存與重新開啟。編碼、讀備份及原子 IO 在串行背景執行；測試沒有證明所有真機大型片庫均不掉幀。
 
-`AccountLibraryControllerTests` 8 項直接執行 `HongguoAppSupport` 中的正式 Controller／LibraryPersistence：延遲載入期間的收藏與進度先排隊；較早進度不能在稍後清除之後復活；切來源後舊載入／進度留在原 scope；載入失敗不以空片庫覆檔；flush 等待尚未完成寫入之後更新的最後進度；舊 metadata 任務的 defer 不能清除替代任務；換來源拒絕舊回覆；第二輪補資料能到達前 50 筆失敗之後的有效作品。
+`AccountLibraryControllerTests` 現為 12 項，直接執行 `HongguoAppSupport` 中的正式 Controller／LibraryPersistence。原有 8 項涵蓋：延遲載入期間的收藏與進度先排隊；較早進度不能在稍後清除之後復活；切來源後舊載入／進度留在原 scope；載入失敗不以空片庫覆檔；flush 等待尚未完成寫入之後更新的最後進度；舊 metadata 任務的 defer 不能清除替代任務；換來源拒絕舊回覆；第二輪補資料能到達前 50 筆失敗之後的有效作品。新增 4 項批次整理範圍見下一節。
 
 整合測試以注入初始化避開正式 Keychain，使用隔離的 UserDefaults、合成片庫與 metadata 載入器；沒有真實手機號碼、驗證碼、Cookie 或官方片庫寫入。App 的暫停／離開／背景 flush 觸發與有限背景執行時間仍需對應 GUI／裝置驗收，不能把合成落盤屏障測試當作強制終止或斷電零遺失證據。
+
+## 0.6.0 片庫、搜尋與播放政策測試
+
+```sh
+swift test --disable-sandbox --disable-xctest --filter LibraryBrowserTests
+swift test --disable-sandbox --disable-xctest --filter SearchPolicyTests
+swift test --disable-sandbox --disable-xctest --filter 'PlaybackPreferencesTests|PlaybackReplayTests|EpisodePrefetchTests|PlaybackPrefetchTests|PlaybackMeasurementTests'
+```
+
+`LibraryBrowserTests` 8 項驗證本機繁簡／全半形／大小寫搜尋、多詞同時比對、片名／題材／描述／分集名稱欄位、完成狀態篩選與明確排序、19 位 ID 的穩定順序，以及批次歷史移除與取消收藏。搜尋與排序不修改保存資料。批次操作先驗證全部 ID，再建立一次待提交狀態；未選項目的 UUID／重試限制保持原樣，舊 ACK 不能移除較新的取消收藏意圖，未知項目略過且不建立額外刪除記號。
+
+Controller 新增 4 項驗證：載入未完成時批次取消收藏仍套用於 captured scope，切來源後不污染新片庫並只提交一次；批次移除歷史只作一次本機提交且保留收藏；無效／過期選取不造成部分變更或無意義寫檔；排隊批次移除之後的明確收藏動作保留較新的意圖。確認對話框的數量、片庫名稱、帳號同步提示與切 context 取消行為屬 SwiftUI 整合，需另外驗收，不以這 4 項測試宣稱畫面通過。
+
+`SearchPolicyTests` 14 項使用合成來源，核對保留原查詢、僅完整空結果才允許一次順序繁簡替代、分頁沿用實際查詢、錯誤／取消不啟動替代，以及來源已載入題材的篩選與數量；不宣稱搜尋了來源尚未回傳的全部資料。
+
+0.6.0 新增 `PlaybackPreferencesTests` 3 項、`PlaybackReplayTests` 1 項與 `EpisodePrefetchTests` 3 項，共 7 項，涵蓋明確偏好保存、試看不覆寫設定、無效速率拒絕、播完重播，以及近片尾只預取一次、依速度換算時間、當前緩衝優先與取消。既有 `PlaybackPrefetchTests` 4 項仍參與回歸，驗證預取 actor 的取消、所有權與預算傳遞。`PlaybackMeasurementTests` 5 項核對首幀等待與後續緩衝分開計時、恢復沿用原起播時鐘、亂序事件與使用者暫停處理；這是時間狀態測試，不是當版真機首幀速度或長播穩定性量測。
 
 ## 選劇 metadata 實網探針
 

@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.5.0／build 15，試看採同頁連續垂直影片卡片，加入本機推薦偏好、直接收藏、受限預載與快速選集；保留原生手機簡訊登入、分帳號片庫、公開選劇 metadata、原生工具列與漸進 Range 播放。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.6.0／build 16，包含正式連播首段預備、手動倍速與連播偏好、搜尋繁簡補查、片庫多選整理及本機播放診斷；保留原生手機簡訊登入、分帳號片庫、公開選劇 metadata、原生工具列與漸進 Range 播放。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
@@ -105,6 +105,28 @@ Duo 的原生列使用 TabView／NavigationStack 與帶名稱、symbol 的 toolb
 預設內建播放直接使用 HTTPS，不需設定區網服務或允許連到 Mac。以下只適用選用的自訂播放服務：橋接支援 HTTPS，以及 localhost、`.local`、私有 IP 的 HTTP。iPhone 首次連區域網路時依需要允許系統權限。**實機上的 `127.0.0.1` 是 iPhone 自己**；連 Mac 服務需填 Mac 的區網位址，並讓服務監聽區網介面。
 
 參考 [BRIDGE.md](BRIDGE.md) 啟動真實橋接或明確標示為測試資料的合成影片 fixture。測試片源能檢查播放器整合，不能證明紅果平台片源可用。
+
+## 本機模擬器長時間連播
+
+`Backend/fixtures/server.mjs` 預設 3 集，亦可指定 1–600 集；每集使用同一段本機產生的四秒影片，不連平台或使用帳號。以下從專案根目錄啟動 300 集合成目錄：
+
+```sh
+FIXTURE_EPISODES=300 PORT=8788 node Backend/fixtures/server.mjs
+```
+
+模擬器 App 的設定中選自訂播放服務與自訂服務目錄，驗證並儲存 `http://127.0.0.1:8788`，再手動開始測試片段並開啟自動下一集。另開終端機取得目前模擬器與 App 程序的 ID，將資料容器路徑留在已忽略的 `build` 中：
+
+```sh
+SIMULATOR_ID="YOUR_SIMULATOR_ID"
+APP_PID="YOUR_RUNNING_SIMULATOR_APP_PID"
+mkdir -p build
+xcrun simctl get_app_container "$SIMULATOR_ID" tw.mountainp.hongguo data > build/soak-container.txt
+python3 scripts/monitor-simulator-soak.py \
+  --container-file build/soak-container.txt --pid "$APP_PID" \
+  --duration 1200 --last-episode 300 --output build/soak-samples.jsonl
+```
+
+觀察器只讀訪客片庫中的指定合成作品及本機診斷數值；不控制 UI、不讀帳號片庫、不輸出片源或帳號。每 10 秒記錄換集、完成集數及 Mac 模擬器程序 RSS；到指定末集或期限即輸出相鄰的 `.summary.json`。RSS 與真機 `phys_footprint`、耗電不同；合成橋接的首幀時間也不代表官方片源的等待時間。測後在 App 還原內建播放與官網目錄，並以 Ctrl-C 停止該 fixture。
 
 ## 驗收記錄
 
