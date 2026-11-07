@@ -14,6 +14,8 @@ struct SettingsView: View {
     @State private var isConnecting = false
     @State private var operationID = UUID()
     @State private var connectionTask: Task<Void, Never>?
+    @State private var playbackCacheBytes = 0
+    @State private var isClearingPlaybackCache = false
 
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "開發版" }
 
@@ -21,6 +23,7 @@ struct SettingsView: View {
         Form {
             appSection
             playbackSection
+            if playbackMode == .native { playbackCacheSection }
             if playbackMode == .bridge {
                 bridgeSection
                 catalogSection
@@ -39,6 +42,7 @@ struct SettingsView: View {
             token = model.token(for: model.serverURL)
         }
         .onDisappear { cancelConnection() }
+        .task { playbackCacheBytes = await NativeProgressiveMedia.shared.cachedPlaybackBytes() }
         .onChange(of: address) { _, value in
             cancelConnection()
             token = value == model.serverURL ? model.token(for: value) : ""
@@ -109,6 +113,22 @@ struct SettingsView: View {
         Text("儲存前會確認服務協定與劇集資料。各集能否取源、播放，仍以服務的實際回應為準。口令只保存在本機鑰匙圈。")
             .font(.footnote).foregroundStyle(.secondary)
     }
+    }
+
+    private var playbackCacheSection: some View {
+        Section("播放快取") {
+            LabeledContent("已使用", value: ByteCountFormatter.string(fromByteCount: Int64(playbackCacheBytes), countStyle: .file))
+            Text("分段快取最多使用約 0.5 GB，空間不足會自動回收。播放時依倍速增加緩衝；主動預讀僅在非低數據、非低耗電的 Wi‑Fi 等網路啟用。")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button(isClearingPlaybackCache ? "正在清除…" : "清除播放快取") {
+                isClearingPlaybackCache = true
+                Task {
+                    await NativeProgressiveMedia.shared.clearPlaybackDiskCache()
+                    playbackCacheBytes = await NativeProgressiveMedia.shared.cachedPlaybackBytes()
+                    isClearingPlaybackCache = false
+                }
+            }.disabled(isClearingPlaybackCache)
+        }
     }
 
     private var catalogSection: some View {

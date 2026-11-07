@@ -55,7 +55,7 @@ public actor NativeProgressiveMedia {
         let byteLimit = NativePrefetchContext.maximumBytes
         do {
             let stream = try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
-                group.addTask { try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit) }
+                group.addTask { try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit, diskCache: .shared) }
                 group.addTask {
                     try await Task.sleep(for: .seconds(30))
                     throw NativeSourceError(code: "ETIMEDOUT")
@@ -94,8 +94,12 @@ public actor NativeProgressiveMedia {
 
     var reusableEntryCount: Int { reusable.count }
 
+    public func cachedPlaybackBytes() async -> Int { await NativeChunkDiskCache.shared.byteCount }
+    public func clearPlaybackDiskCache() async { await NativeChunkDiskCache.shared.clear() }
+
     // Injectable byte source allows deterministic header, aux, LRU and cancellation tests.
-    func prepare(source: NativeMediaSource, fetcher: any NativeRangeFetching, byteLimit: Int? = nil) async throws -> NativeMediaStream {
+    func prepare(source: NativeMediaSource, fetcher: any NativeRangeFetching, byteLimit: Int? = nil,
+                 diskCache: NativeChunkDiskCache? = nil) async throws -> NativeMediaStream {
         let reader = PreparationReader(fetcher: fetcher, byteLimit: byteLimit)
         let first = try await reader.fetch(range: 0..<(256 * 1024))
         try Self.validate(first, requested: 0..<(256 * 1024), total: nil, validators: nil)
@@ -118,7 +122,7 @@ public actor NativeProgressiveMedia {
                 let clearPrefix = try plan.decrypt(data: prefix, offset: 0)
                 return NativeMediaStream(totalLength: first.totalLength, fetcher: fetcher, plan: plan,
                     validators: first.validators, prefix: clearPrefix, preparationByteCount: clearPrefix.count + auxiliaryBytes,
-                    variant: NativeMediaVariant(source: source))
+                    variant: NativeMediaVariant(source: source), diskCache: diskCache)
             } catch let requirements as NativeMP4StreamRequirements {
                 guard round < 3, !requirements.ranges.isEmpty, requirements.ranges.count <= 512 else { throw NativeProgressiveError.auxiliaryLimit }
                 for range in requirements.ranges {
@@ -183,32 +187,60 @@ public actor NativeMediaStream: Hashable {
     private let fetcher: any NativeRangeFetching
     private let plan: NativeMP4StreamPlan
     private let prefix: Data
+    private let diskCache: NativeChunkDiskCache?
     private var validators: NativeRangeValidators
     private struct Chunk { let data: Data; var access: UInt64 }
     private var cache: [Int: Chunk] = [:]
     private var cacheBytes = 0
     private var access: UInt64 = 0
+    private(set) var decryptedChunkCount = 0
+    private(set) var completedChunkFetchCount = 0
     private var permanentFailure: (any Error)?
+    private var readAheadStorageFailed = false
+    private var optionalDiskWrites: [UUID: Task<Void, Never>] = [:]
+    private var diskWriteCount = 0
+    private var committedDiskIndices: Set<Int> = []
+    private var recentDiskIndices: [Int] = []
+    private let maximumRememberedDiskIndices = 1024
+    private struct RawChunk: Sendable {
+        let data: Data
+        let storedOnDisk: Bool
+        let writeBusy: Bool
+        init(data: Data, storedOnDisk: Bool, writeBusy: Bool = false) {
+            self.data = data; self.storedOnDisk = storedOnDisk; self.writeBusy = writeBusy
+        }
+    }
+    private struct Waiter {
+        let continuation: CheckedContinuation<RawChunk, any Error>
+        let demand: Bool
+    }
     private struct Flight {
         let id: UUID
         var task: Task<Void, Never>?
-        var waiters: [UUID: CheckedContinuation<Data, any Error>]
+        var waiters: [UUID: Waiter]
+        var wantsClearBytes: Bool
+        var raw: Data?
     }
     private var flights: [Int: Flight] = [:]
     private let chunkSize = 512 * 1024
     private let cacheLimit = 8 * 1024 * 1024
 
     init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil,
-         variant: NativeMediaVariant) {
+         variant: NativeMediaVariant, diskCache: NativeChunkDiskCache? = nil) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
         self.preparationByteCount = preparationByteCount ?? prefix.count
         self.variant = variant
+        self.diskCache = diskCache
     }
 
-    deinit { (fetcher as? NativeRangeHTTP)?.close() }
+    deinit {
+        (fetcher as? NativeRangeHTTP)?.close()
+        optionalDiskWrites.values.forEach { $0.cancel() }
+    }
 
     var isReusable: Bool { permanentFailure == nil }
     var pendingReaderCount: Int { flights.values.reduce(0) { $0 + $1.waiters.count } }
+    var pendingDiskWriteCount: Int { diskWriteCount }
     public func trimCachedChunks() { cache.removeAll(); cacheBytes = 0 }
 
     public func read(range: Range<Int>) async throws -> Data {
@@ -232,7 +264,13 @@ public actor NativeMediaStream: Hashable {
             if var cached = cache[index] {
                 access &+= 1; cached.access = access; cache[index] = cached; chunk = cached.data
             } else {
-                chunk = try await sharedChunk(index: index, range: start..<end)
+                let raw = try await sharedChunk(index: index, range: start..<end, wantsClearBytes: true)
+                try Task.checkCancellation()
+                if let permanentFailure { throw permanentFailure }
+                // A demand may have joined a raw-only prefetch while its disk write
+                // was finishing. The first demand decrypts; the others reuse this entry.
+                if let cached = cache[index] { chunk = cached.data }
+                else { chunk = try cacheClearChunk(raw.data, index: index, range: start..<end) }
             }
             try Task.checkCancellation()
             if let permanentFailure { throw permanentFailure }
@@ -244,17 +282,73 @@ public actor NativeMediaStream: Hashable {
         return output
     }
 
-    private func sharedChunk(index: Int, range: Range<Int>) async throws -> Data {
+    /// Fills the raw disk cache without allocating clear media or displacing hot playback
+    /// chunks. This is deliberately a no-op for fixture/no-disk streams.
+    public func prefetch(range: Range<Int>) async throws {
+        try Task.checkCancellation()
+        guard range.lowerBound >= 0, range.upperBound <= totalLength, range.count <= 8 * 1024 * 1024 else {
+            throw NativeProgressiveError.invalidRange
+        }
+        if let permanentFailure { throw permanentFailure }
+        guard let diskCache, !range.isEmpty else { return }
+        guard !readAheadStorageFailed else { throw PlaybackPrefetchError.unsupported }
+        guard diskWriteCount < 2 else { throw NativeMediaError.busy }
+        guard await diskCache.allowsPrefetch else { throw PlaybackPrefetchError.unsupported }
+        var offset = max(range.lowerBound, prefix.count)
+        while offset < range.upperBound {
+            try Task.checkCancellation()
+            if let permanentFailure { throw permanentFailure }
+            guard !readAheadStorageFailed else { throw PlaybackPrefetchError.unsupported }
+            guard diskWriteCount < 2 else { throw NativeMediaError.busy }
+            let index = offset / chunkSize, start = index * chunkSize
+            let end = min(totalLength, start + chunkSize)
+            if cache[index] == nil {
+                guard await diskCache.allowsPrefetch else { throw PlaybackPrefetchError.unsupported }
+                let raw = try await sharedChunk(index: index, range: start..<end, wantsClearBytes: false)
+                guard raw.storedOnDisk else {
+                    if raw.writeBusy { throw NativeMediaError.busy }
+                    readAheadStorageFailed = true
+                    throw PlaybackPrefetchError.unsupported
+                }
+            }
+            offset = min(end, range.upperBound)
+        }
+        try Task.checkCancellation()
+    }
+
+    private func cacheClearChunk(_ raw: Data, index: Int, range: Range<Int>) throws -> Data {
+        let clear = try plan.decrypt(data: raw, offset: range.lowerBound)
+        guard clear.count == range.count else { throw NativeProgressiveError.invalidRange }
+        decryptedChunkCount += 1; access &+= 1
+        if let old = cache[index] { cacheBytes -= old.data.count }
+        cache[index] = Chunk(data: clear, access: access); cacheBytes += clear.count
+        while cacheBytes > cacheLimit, let victim = cache.min(by: { $0.value.access < $1.value.access }) {
+            cacheBytes -= victim.value.data.count; cache.removeValue(forKey: victim.key)
+        }
+        return clear
+    }
+
+    private func sharedChunk(index: Int, range: Range<Int>, wantsClearBytes: Bool) async throws -> RawChunk {
         if let permanentFailure { throw permanentFailure }
         let waiter = UUID()
         return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<RawChunk, any Error>) in
                 guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
                 if var flight = flights[index] {
-                    flight.waiters[waiter] = continuation; flights[index] = flight
+                    if wantsClearBytes, let raw = flight.raw {
+                        // Raw bytes are already validated. A late foreground joiner
+                        // must not wait behind a speculative disk commit either.
+                        continuation.resume(returning: RawChunk(data: raw, storedOnDisk: false))
+                        return
+                    }
+                    flight.waiters[waiter] = Waiter(continuation: continuation, demand: wantsClearBytes)
+                    flight.wantsClearBytes = flight.wantsClearBytes || wantsClearBytes
+                    flights[index] = flight
                 } else {
                     let id = UUID()
-                    flights[index] = Flight(id: id, task: nil, waiters: [waiter: continuation])
+                    flights[index] = Flight(id: id, task: nil,
+                        waiters: [waiter: Waiter(continuation: continuation, demand: wantsClearBytes)],
+                        wantsClearBytes: wantsClearBytes, raw: nil)
                     let task = Task { [weak self] in
                         guard let self else { return }
                         await self.fetchChunk(index: index, range: range, id: id)
@@ -269,43 +363,117 @@ public actor NativeMediaStream: Hashable {
 
     private func cancelWaiter(index: Int, waiter: UUID) {
         guard var flight = flights[index], let continuation = flight.waiters.removeValue(forKey: waiter) else { return }
-        continuation.resume(throwing: CancellationError())
+        continuation.continuation.resume(throwing: CancellationError())
         if flight.waiters.isEmpty {
             flights.removeValue(forKey: index); flight.task?.cancel()
         } else { flights[index] = flight }
     }
 
     private func fetchChunk(index: Int, range: Range<Int>, id: UUID) async {
+        defer { completedChunkFetchCount += 1 }
         do {
-            let response = try await fetcher.fetch(range: range)
+            var raw: Data?, diskGeneration: UUID?
+            let bypassDisk = diskWriteCount > 0 && !committedDiskIndices.contains(index)
+                && flights[index]?.waiters.values.contains(where: \.demand) == true
+            // An optional write can occupy the cache actor. A definitely new demand
+            // chunk goes straight to HTTP rather than waiting for a guaranteed miss.
+            if !bypassDisk, let diskCache {
+                let lookup = await diskCache.lookup(streamID: self.id, index: index, expectedBytes: range.count)
+                raw = lookup.data; diskGeneration = lookup.generation
+            }
             try Task.checkCancellation()
             guard flights[index]?.id == id else { return }
-            try NativeProgressiveMedia.validate(response, requested: range, total: totalLength, validators: validators)
-            if validators.etag == nil { validators.etag = response.validators.etag }
-            if validators.lastModified == nil { validators.lastModified = response.validators.lastModified }
-            let data = try plan.decrypt(data: response.data, offset: range.lowerBound)
-            guard data.count == range.count else { throw NativeProgressiveError.invalidRange }
-            access &+= 1
-            if let old = cache[index] { cacheBytes -= old.data.count }
-            cache[index] = Chunk(data: data, access: access); cacheBytes += data.count
-            while cacheBytes > cacheLimit, let victim = cache.min(by: { $0.value.access < $1.value.access }) {
-                cacheBytes -= victim.value.data.count; cache.removeValue(forKey: victim.key)
+            if !bypassDisk, diskCache != nil {
+                if raw != nil { rememberDiskIndex(index) }
+                else { committedDiskIndices.remove(index); recentDiskIndices.removeAll { $0 == index } }
             }
+            let hitDisk = raw != nil
+            if raw == nil {
+                let response = try await fetcher.fetch(range: range)
+                try Task.checkCancellation()
+                guard flights[index]?.id == id else { return }
+                try NativeProgressiveMedia.validate(response, requested: range, total: totalLength, validators: validators)
+                if validators.etag == nil { validators.etag = response.validators.etag }
+                if validators.lastModified == nil { validators.lastModified = response.validators.lastModified }
+                raw = response.data
+            }
+            guard let raw, raw.count == range.count else { throw NativeProgressiveError.invalidRange }
+            flights[index]?.raw = raw
+            if flights[index]?.wantsClearBytes == true { _ = try cacheClearChunk(raw, index: index, range: range) }
+            try Task.checkCancellation()
+            guard flights[index]?.id == id else { return }
+            if let current = flights[index], current.waiters.values.contains(where: \.demand) {
+                // Playback never waits for the optional disk write. Keep only speculative
+                // consumers waiting for commit, since read-ahead must stop on write failure.
+                var remaining = current
+                let delivered = current.waiters.filter { $0.value.demand }
+                remaining.waiters = current.waiters.filter { !$0.value.demand }
+                if remaining.waiters.isEmpty {
+                    flights.removeValue(forKey: index)
+                    if !hitDisk, let diskCache, let diskGeneration {
+                        scheduleOptionalWrite(raw, index: index, generation: diskGeneration, diskCache: diskCache)
+                    }
+                } else { flights[index] = remaining }
+                let value = RawChunk(data: raw, storedOnDisk: hitDisk)
+                delivered.values.forEach { $0.continuation.resume(returning: value) }
+                if remaining.waiters.isEmpty { return }
+            }
+            var storedOnDisk = hitDisk
+            var writeBusy = bypassDisk
+            if !hitDisk, let diskCache, let diskGeneration {
+                if diskWriteCount < 2 {
+                    diskWriteCount += 1
+                    storedOnDisk = await diskCache.store(raw, streamID: self.id, index: index, generation: diskGeneration)
+                    diskWriteCount -= 1
+                    if storedOnDisk, !Task.isCancelled, permanentFailure == nil { rememberDiskIndex(index) }
+                } else { writeBusy = true }
+            }
+            try Task.checkCancellation()
+            guard flights[index]?.id == id else { return }
             let completed = flights.removeValue(forKey: index)
-            completed?.waiters.values.forEach { $0.resume(returning: data) }
+            let value = RawChunk(data: raw, storedOnDisk: storedOnDisk, writeBusy: writeBusy)
+            completed?.waiters.values.forEach { $0.continuation.resume(returning: value) }
         } catch {
             guard flights[index]?.id == id else { return }
             if Self.terminal(error) {
                 permanentFailure = error; trimCachedChunks()
+                committedDiskIndices = []; recentDiskIndices = []
                 let abandoned = flights.values; flights.removeAll()
+                for flight in abandoned { flight.task?.cancel() }
+                optionalDiskWrites.values.forEach { $0.cancel() }
+                if let diskCache { await diskCache.remove(streamID: self.id) }
                 for flight in abandoned {
-                    flight.task?.cancel()
-                    flight.waiters.values.forEach { $0.resume(throwing: error) }
+                    flight.waiters.values.forEach { $0.continuation.resume(throwing: error) }
                 }
             } else {
                 let completed = flights.removeValue(forKey: index)
-                completed?.waiters.values.forEach { $0.resume(throwing: error) }
+                completed?.waiters.values.forEach { $0.continuation.resume(throwing: error) }
             }
+        }
+    }
+
+    private func scheduleOptionalWrite(_ raw: Data, index: Int, generation: UUID, diskCache: NativeChunkDiskCache) {
+        guard diskWriteCount < 2 else { return }
+        diskWriteCount += 1
+        let writeID = UUID(), streamID = id
+        optionalDiskWrites[writeID] = Task(priority: .utility) { [weak self] in
+            let stored = await diskCache.store(raw, streamID: streamID, index: index, generation: generation)
+            await self?.finishedOptionalWrite(writeID, index: index, stored: stored)
+        }
+    }
+
+    private func finishedOptionalWrite(_ writeID: UUID, index: Int, stored: Bool) {
+        guard optionalDiskWrites.removeValue(forKey: writeID) != nil else { return }
+        diskWriteCount -= 1
+        if stored, permanentFailure == nil { rememberDiskIndex(index) }
+        if !stored { readAheadStorageFailed = true }
+    }
+
+    private func rememberDiskIndex(_ index: Int) {
+        committedDiskIndices.insert(index)
+        recentDiskIndices.removeAll { $0 == index }; recentDiskIndices.append(index)
+        while recentDiskIndices.count > maximumRememberedDiskIndices {
+            committedDiskIndices.remove(recentDiskIndices.removeFirst())
         }
     }
 

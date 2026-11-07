@@ -13,6 +13,7 @@ struct RecommendationPreviewMediaCard: View {
     let isActive: Bool
     var resumeSeconds: Double = 0
     var handoffContext: PlaybackHandoffEligibility.Context? = nil
+    var allowsReadAhead = false
     var topicPreferences = RecommendationTopicPreferences()
     var topicPreferencesLoading = false
     var onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)? = nil
@@ -37,6 +38,7 @@ struct RecommendationPreviewMediaCard: View {
     var body: some View {
         PreviewVideoContent(series: series, episode: episode, service: service,
                             isActive: isActive, resumeSeconds: resumeSeconds, handoffContext: handoffContext,
+                            allowsReadAhead: allowsReadAhead,
                             topicPreferences: topicPreferences, topicPreferencesLoading: topicPreferencesLoading,
                             onTopicPreference: onTopicPreference, retainsFrame: retainsFrame,
                             allowsInteraction: allowsInteraction, isFavorite: isFavorite,
@@ -66,6 +68,7 @@ private struct PreviewVideoContent: View {
     @StateObject private var model: PlayerModel
     private let episodeID: String
     let isActive: Bool
+    let allowsReadAhead: Bool
     let topicPreferences: RecommendationTopicPreferences
     let topicPreferencesLoading: Bool
     let onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)?
@@ -104,7 +107,7 @@ private struct PreviewVideoContent: View {
     @State private var fillsScreen = true
 
     init(series: Series, episode: Episode, service: any CatalogService,
-         isActive: Bool, resumeSeconds: Double, handoffContext: PlaybackHandoffEligibility.Context?,
+         isActive: Bool, resumeSeconds: Double, handoffContext: PlaybackHandoffEligibility.Context?, allowsReadAhead: Bool,
          topicPreferences: RecommendationTopicPreferences, topicPreferencesLoading: Bool,
          onTopicPreference: ((String, RecommendationTopicPreferences.Preference) -> Void)?,
          retainsFrame: Bool, allowsInteraction: Bool, isFavorite: Bool,
@@ -115,6 +118,7 @@ private struct PreviewVideoContent: View {
          onShowPreferences: (() -> Void)?, onNotInterested: (() -> Void)?, onViewDetails: (() -> Void)?,
          onOpenSeries: @escaping (PreviewPlaybackSnapshot, PlaybackTransitionFrame?, PreviewPlaybackHandoff?) -> Void) {
         self.isActive = isActive
+        self.allowsReadAhead = allowsReadAhead
         _originContext = State(initialValue: handoffContext)
         self.topicPreferences = topicPreferences
         self.topicPreferencesLoading = topicPreferencesLoading
@@ -210,7 +214,11 @@ private struct PreviewVideoContent: View {
         .background(.black)
         .foregroundStyle(.white)
         .accessibilityHidden(!allowsInteraction)
-        .task { synchronizeActivation(); updatePreviewQualification() }
+        .task {
+            model.setPrefetchNetworkAllowed(allowsReadAhead)
+            synchronizeActivation(); updatePreviewQualification()
+        }
+        .onChange(of: allowsReadAhead) { _, allowed in model.setPrefetchNetworkAllowed(allowed) }
         .onChange(of: isActive) { wasActive, active in
             if wasActive, !active { reportPositionSnapshot(allowLeaving: true) }
             if active { clearHandoffFrame(reason: "active") }

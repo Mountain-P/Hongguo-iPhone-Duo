@@ -25,9 +25,19 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private let stream: NativeMediaStream
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.native-asset")
     private let chunkSize = 256 * 1024
+    private let aheadChunkSize = 512 * 1024
+    private let aheadWindow = 16 * 1024 * 1024
     // All AVFoundation loading-request references are read and mutated only on queue.
     private var pending: [ObjectIdentifier: Pending] = [:]
     private var stopped = false
+    private var readAheadEnabled = false
+    private var readAheadStorageFailed = false
+    private var readAheadTask: Task<Void, Never>?
+    private var readAheadGeneration = UUID()
+    private var readAheadNext = 0
+    private var readAheadEnd = 0
+    private var latestDemandRequest: ObjectIdentifier?
+    private var lastDemandEnd: Int?
 
     public init(stream: NativeMediaStream) {
         self.stream = stream
@@ -37,6 +47,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     deinit {
         // Task cancellation is thread-safe; no AVFoundation request is touched here.
         pending.values.forEach { $0.task?.cancel() }
+        readAheadTask?.cancel()
     }
 
     public func makeAsset() -> AVURLAsset {
@@ -45,10 +56,22 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         return asset
     }
 
+    /// Network/scene/power policy is owned by the active player. This can be called
+    /// from any queue; speculation never starts merely because an asset was created.
+    public func setReadAheadEnabled(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.readAheadEnabled = enabled
+            if !enabled { self.cancelReadAhead() }
+            else if let cursor = self.lastDemandEnd { self.extendReadAhead(after: cursor) }
+        }
+    }
+
     public func invalidate() {
         queue.async { [self] in
             guard !stopped else { return }
             stopped = true
+            cancelReadAhead()
             let entries = Array(pending.values)
             pending.removeAll()
             for entry in entries {
@@ -116,6 +139,12 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         }
 
         let identifier = ObjectIdentifier(loadingRequest)
+        // A seek takes the foreground slot before its first bytes arrive. Cancelling
+        // this loader's speculative consumer does not cancel an attached demand reader.
+        if let previous = lastDemandEnd, abs(start - previous) > aheadChunkSize {
+            cancelReadAhead(); lastDemandEnd = nil
+        }
+        latestDemandRequest = identifier
         // A delegate normally receives a request once; never leave an earlier
         // task alive if AVFoundation asks again for that same request object.
         pending.removeValue(forKey: identifier)?.task?.cancel()
@@ -173,9 +202,70 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                 }
                 data.respond(with: bytes)
                 entry.offset += bytes.count
+                if self.latestDemandRequest == identifier {
+                    self.lastDemandEnd = entry.offset
+                    self.extendReadAhead(after: entry.offset)
+                }
                 continuation.resume(returning: true)
             }
         }
+    }
+
+    private func extendReadAhead(after cursor: Int) {
+        guard readAheadEnabled, !readAheadStorageFailed, !stopped, cursor < stream.totalLength else { return }
+        let start = cursor / aheadChunkSize * aheadChunkSize
+        readAheadEnd = cursor + min(aheadWindow, stream.totalLength - cursor)
+        if readAheadTask == nil {
+            readAheadNext = max(start, readAheadNext)
+            guard readAheadNext < readAheadEnd else { return }
+            let generation = UUID(); readAheadGeneration = generation
+            let stream = stream
+            readAheadTask = Task(priority: .utility) { [weak self] in
+                var completed = false
+                var storageFailed = false
+                do {
+                    while let range = await self?.nextReadAheadRange(generation: generation) {
+                        try Task.checkCancellation()
+                        try await stream.prefetch(range: range)
+                    }
+                    completed = true
+                } catch PlaybackPrefetchError.unsupported { storageFailed = true }
+                catch { /* Read-ahead failures never replace foreground errors. */ }
+                self?.finishReadAhead(generation: generation, continueIfExtended: completed, storageFailed: storageFailed)
+            }
+        }
+    }
+
+    private func nextReadAheadRange(generation: UUID) async -> Range<Int>? {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self, !self.stopped, self.readAheadEnabled,
+                      self.readAheadGeneration == generation, self.readAheadNext < self.readAheadEnd else {
+                    continuation.resume(returning: nil); return
+                }
+                let start = self.readAheadNext
+                let end = start + min(self.aheadChunkSize, self.stream.totalLength - start)
+                self.readAheadNext = end
+                continuation.resume(returning: start..<end)
+            }
+        }
+    }
+
+    private func finishReadAhead(generation: UUID, continueIfExtended: Bool, storageFailed: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.readAheadGeneration == generation else { return }
+            self.readAheadTask = nil
+            if storageFailed { self.readAheadStorageFailed = true }
+            if continueIfExtended, self.readAheadNext < self.readAheadEnd, let cursor = self.lastDemandEnd {
+                self.extendReadAhead(after: cursor)
+            }
+        }
+    }
+
+    private func cancelReadAhead() {
+        readAheadGeneration = UUID()
+        readAheadTask?.cancel(); readAheadTask = nil
+        readAheadNext = 0; readAheadEnd = 0
     }
 
     private func finish(request identifier: ObjectIdentifier, generation: UUID, error: (any Error)? = nil) {

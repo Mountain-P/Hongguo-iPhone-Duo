@@ -57,6 +57,7 @@ final class PlayerModel: ObservableObject {
 
     func setPrefetchNetworkAllowed(_ allowed: Bool) {
         prefetchNetworkAllowed = allowed
+        updateLoaderReadAheadEligibility()
         updateNextEpisodePrefetch()
     }
 
@@ -107,6 +108,8 @@ final class PlayerModel: ObservableObject {
         self.onProgress = onProgress
         self.currentEpisode = resolved
         isPreview = false
+        updateBufferPolicy()
+        updateLoaderReadAheadEligibility()
         autoNext = preferences.load().resolved(isPreview: false).autoNext
         pendingFormalActivation = true
         diagnosticsID = PlaybackDiagnostics.shared.begin(context: .episode)
@@ -148,6 +151,8 @@ final class PlayerModel: ObservableObject {
 
     private func applyPlaybackRate() {
         let rate = effectiveSpeed
+        updateBufferPolicy()
+        updateLoaderReadAheadEligibility()
         if abs(player.defaultRate - rate) > 0.0001 { player.defaultRate = rate }
         let transport: PlaybackSpeedState.Transport
         switch player.timeControlStatus {
@@ -166,6 +171,39 @@ final class PlayerModel: ObservableObject {
         playbackSpeed.requestPlayback()
         applyPlaybackRate()
         player.playImmediately(atRate: effectiveSpeed)
+    }
+
+    /// This is an AVFoundation preference only. It never delays startup or commands playback.
+    private func updateBufferPolicy(for item: AVPlayerItem? = nil, waiting: Bool = false) {
+        guard let item = item ?? player.currentItem else { return }
+        let previous = bufferPolicy.targetMediaSeconds
+        let target = bufferPolicy.update(isPreview: isPreview, rate: effectiveSpeed, waiting: waiting)
+        if target > 0, item.preferredForwardBufferDuration != target {
+            item.preferredForwardBufferDuration = target
+        }
+        if target != previous { traceBufferPolicy() }
+    }
+
+    private func updateLoaderReadAheadEligibility() {
+        setLoaderReadAheadEnabled(prefetchNetworkAllowed && sceneActive && hasStarted
+            && playbackSpeed.wantsPlayback && !isLoading && errorMessage == nil)
+    }
+
+    private func setLoaderReadAheadEnabled(_ requested: Bool) {
+        let enabled = requested && progressiveLoader != nil
+        guard loaderReadAheadEnabled != enabled else { return }
+        progressiveLoader?.setReadAheadEnabled(enabled)
+        loaderReadAheadEnabled = enabled
+        traceBufferPolicy()
+    }
+
+    private func traceBufferPolicy() {
+        #if DEBUG
+        guard ProcessInfo.processInfo.arguments.contains("-playback-buffer-diagnostics") else { return }
+        NSLog("PlaybackBuffer rate=%.2f targetMediaSeconds=%.2f preview=%d aheadEnabled=%d",
+              Double(effectiveSpeed), bufferPolicy.targetMediaSeconds, isPreview ? 1 : 0,
+              loaderReadAheadEnabled ? 1 : 0)
+        #endif
     }
 
     private var service: any CatalogService
@@ -207,6 +245,8 @@ final class PlayerModel: ObservableObject {
     private var nextPrefetchState = EpisodePrefetchState()
     private var nextPrefetchTask: Task<Void, Never>?
     private var prefetchNetworkAllowed = false
+    private var bufferPolicy = PlaybackBufferPolicy()
+    private var loaderReadAheadEnabled = false
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
@@ -245,6 +285,8 @@ final class PlayerModel: ObservableObject {
                 guard let self else { return }
                 self.isPlaying = self.player.timeControlStatus == .playing
                 self.isBuffering = self.hasStarted && self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                self.updateBufferPolicy(waiting: self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
+                self.updateLoaderReadAheadEligibility()
                 if let id = self.diagnosticsID {
                     PlaybackDiagnostics.shared.recordTransport(id: id,
                         waiting: self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate,
@@ -383,10 +425,12 @@ final class PlayerModel: ObservableObject {
 
     func setSceneActive(_ active: Bool) {
         sceneActive = active
+        updateLoaderReadAheadEligibility()
         if !active { episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave() }
     }
 
     func stop() {
+        setLoaderReadAheadEnabled(false)
         pendingFormalActivation = false
         episodeTransitionFrame = nil
         removeAudioObservers()
@@ -482,7 +526,8 @@ final class PlayerModel: ObservableObject {
             ])
             item.add(output); transitionVideoOutput = output
         }
-        item.preferredForwardBufferDuration = 5
+        updateBufferPolicy(for: item)
+        updateLoaderReadAheadEligibility()
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.player.currentItem === item else { return }
@@ -506,6 +551,7 @@ final class PlayerModel: ObservableObject {
                 self.playbackSpeed.pause()
                 self.isPlaying = false
                 self.isBuffering = false
+                self.updateLoaderReadAheadEligibility()
                 if shouldAdvance { self.playNext() }
             }
         }
@@ -545,6 +591,7 @@ final class PlayerModel: ObservableObject {
                 self.elapsed = target
                 self.hasStarted = true
                 self.isLoading = false
+                self.updateLoaderReadAheadEligibility()
                 if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
                 if self.sceneActive, self.playbackSpeed.wantsPlayback { self.resumePlayback() }
             }
@@ -690,6 +737,8 @@ final class PlayerModel: ObservableObject {
     }
 
     private func clearItem(autoplay: Bool = false) {
+        setLoaderReadAheadEnabled(false)
+        bufferPolicy.reset()
         hasStarted = false
         isSeeking = false
         preparingGeneration = nil

@@ -381,7 +381,9 @@ struct RecommendationPreviewView: View {
                 RecommendationPreviewMediaCard(series: media.series, episode: media.episode, service: media.service,
                     isActive: !resizing && preview.lease?.seriesID == series.id && effectivePlaybackAllowed,
                     resumeSeconds: previewResumeSeconds(for: media),
-                    handoffContext: handoffContext, topicPreferences: model.topicPreferences,
+                    handoffContext: handoffContext,
+                    allowsReadAhead: model.playbackMode == .native && networkPolicy.allowsPrefetch,
+                    topicPreferences: model.topicPreferences,
                     topicPreferencesLoading: model.topicPreferencesLoading,
                     onTopicPreference: { tag, preference in
                         model.setTopicPreference(tag: tag, preference: preference, contextID: topicContextID)
