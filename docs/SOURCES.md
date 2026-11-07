@@ -49,6 +49,6 @@
 
 ## 原生系統元件
 
-SwiftUI、AVFoundation、AVKit、Foundation、Security、JavaScriptCore、CommonCrypto、CryptoKit 及系統 zlib 由 Apple SDK／系統提供。內建 Buffer 相依為 MIT 的 buffer 6.0.3、base64-js 1.5.1，以及 BSD-3-Clause 的 ieee754 1.2.1，各原始 LICENSE 隨 Core assets 分發。精確來源、SHA256 與替代 Node API 的差異見 [NativeRuntime/UPSTREAM.md](../Sources/HongguoCore/NativeRuntime/UPSTREAM.md)。
+SwiftUI、AVFoundation、AVKit、Foundation、CoreGraphics、ImageIO、Security、JavaScriptCore、CommonCrypto、CryptoKit 及系統 zlib 由 Apple SDK／系統提供。0.7.0 的海報縮圖使用系統 ImageIO，沒有新增第三方圖片套件；本機播放 runtime 的 `app-source.js` 新增省流量選源政策，保留既有簽章與授權聲明。內建 Buffer 相依為 MIT 的 buffer 6.0.3、base64-js 1.5.1，以及 BSD-3-Clause 的 ieee754 1.2.1，各原始 LICENSE 隨 Core assets 分發。精確來源、SHA256 與替代 Node API 的差異見 [NativeRuntime/UPSTREAM.md](../Sources/HongguoCore/NativeRuntime/UPSTREAM.md)。
 
 Xcode／iOS 使用條款依 Apple 規定。測試 fixture 由本專案程式產生，不含平台影片。App 不附劇集媒體、登入 Cookie 或固定裝置憑證。

@@ -13,6 +13,7 @@ enum Theme {
 struct Poster: View {
     let series: Series
     var contentMode: ContentMode = .fill
+    @Environment(\.displayScale) private var displayScale
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -20,9 +21,10 @@ struct Poster: View {
                 Image(systemName: "play.rectangle.on.rectangle")
                     .font(.system(size: 36, weight: .ultraLight)).foregroundStyle(.white.opacity(0.25))
                 if let url = URL(string: series.cover), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
-                    AsyncImage(url: url) { image in
-                        image.resizable().aspectRatio(contentMode: contentMode)
-                    } placeholder: { Color.clear }
+                    let side = max(geometry.size.width, geometry.size.height) * displayScale
+                    if side.isFinite, side > 0 {
+                        PosterBitmap(url: url, pixels: Int(min(side.rounded(.up), 2048)), contentMode: contentMode)
+                    }
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
@@ -32,6 +34,41 @@ struct Poster: View {
         }
         .contentShape(Rectangle())
         .accessibilityHidden(true)
+    }
+}
+
+@MainActor
+private struct PosterBitmap: View {
+    let url: URL
+    let pixels: Int
+    let contentMode: ContentMode
+    @State private var bitmap: PosterImage?
+    @State private var loadedRequest: Request?
+    @State private var loadID = UUID()
+    private struct Request: Hashable { let url: URL; let pixels: Int }
+    private var request: Request {
+        // Match the pipeline's buckets so small layout changes do not clear a ready poster.
+        let clamped = min(max(1, pixels), 2048)
+        return .init(url: url, pixels: min(((clamped + 63) / 64) * 64, 2048))
+    }
+
+    var body: some View {
+        let requested = request
+        Group {
+            if loadedRequest == requested, let bitmap {
+                Image(decorative: bitmap.image, scale: 1).resizable().aspectRatio(contentMode: contentMode)
+            } else { Color.clear }
+        }
+        .task(id: requested) {
+            let id = UUID(); loadID = id
+            bitmap = nil; loadedRequest = nil
+            do {
+                let image = try await PosterImagePipeline.shared.image(for: requested.url, targetPixelSize: requested.pixels)
+                guard !Task.isCancelled, loadID == id else { return }
+                bitmap = image; loadedRequest = requested
+            } catch { /* Keep the existing placeholder; failures are not cached and can be retried on reappearance. */ }
+        }
+        .onDisappear { loadID = UUID(); bitmap = nil; loadedRequest = nil }
     }
 }
 
