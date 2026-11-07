@@ -170,6 +170,22 @@ final class AccountLibraryController: ObservableObject {
         mutate(scope) { $0.removeHistory(seriesID: series.id, at: date) }
     }
 
+    func removeHistory(seriesIDs: Set<String>) {
+        guard !seriesIDs.isEmpty else { return }
+        let date = clock()
+        mutate(scope) { state in
+            state = try LibraryManagement.removingHistory(seriesIDs: seriesIDs, from: state, at: date)
+        }
+    }
+
+    func removeFavorites(seriesIDs: Set<String>) {
+        guard !seriesIDs.isEmpty else { return }
+        let date = clock()
+        mutate(scope, syncDelay: .seconds(2)) { state in
+            state = try LibraryManagement.removingFavorites(seriesIDs: seriesIDs, from: state, at: date)
+        }
+    }
+
     func progressHandler(for series: Series, episodes: [Episode]) -> (Episode, Double, Double) -> Void {
         let capturedScope = scope
         if !episodes.isEmpty { episodeDetails.insert(.init(series: series, episodes: episodes)) }
@@ -536,7 +552,10 @@ final class AccountLibraryController: ObservableObject {
         let apply: @MainActor () throws -> Void = { [weak self] in
             guard let self else { return }
             var state = try self.state(for: context)
-            try body(&state); try self.commit(state)
+            let before = state
+            try body(&state)
+            guard state != before else { return }
+            try self.commit(state)
             if context == self.scope, let syncDelay { self.scheduleSync(delay: syncDelay) }
         }
         if states[context] != nil, mutationTails[context] == nil {

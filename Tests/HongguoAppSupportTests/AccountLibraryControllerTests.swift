@@ -153,6 +153,73 @@ struct AccountLibraryControllerTests {
         #expect(controller.favorites.filter { $0.title.hasPrefix("成功") }.count == 10)
     }
 
+    @Test func batchUnfavoriteWaitsForItsCapturedScopeAndCommitsOnceWithoutUnlockingOtherFailures() async throws {
+        var original = try state(a, ids: ["100", "101", "102"])
+        try original.setFavorite(series("100"), isFavorite: true)
+        let old = original.pendingFavorites[0]
+        original.markFavoriteAttempt(operationID: old.operationID)
+        let io = ControllerStorageProbe(initial: [a: original, b: try state(b, ids: ["100", "101", "102"])], blockedLoads: [a])
+        let controller = makeController(io)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: false)
+        controller.removeFavorites(seriesIDs: ["101", "102"])
+        controller.selectSource(b.sourceID, legacy: nil, allowsAccount: false)
+        await io.waitForLoad(a); await io.releaseLoad(a)
+        await controller.flush()
+        #expect(Set(controller.favorites.map(\.id)) == ["100", "101", "102"])
+        let saved = try #require(await io.value(a))
+        #expect(saved.favorites.map(\.id) == ["100"])
+        #expect(saved.pendingFavorites.first { $0.seriesID == "100" }?.operationID == old.operationID)
+        #expect(saved.pendingFavorites.first { $0.seriesID == "100" }?.retryRequired == true)
+        #expect(Set(saved.eligibleFavorites().map(\.seriesID)) == ["101", "102"])
+        #expect(await io.writeCount == 1)
+    }
+
+    @Test func batchHistoryRemovalMakesOneLocalCommitAndKeepsFavorites() async throws {
+        var original = try state(a, ids: ["100", "101", "102"])
+        for id in ["100", "101", "102"] {
+            try original.record(.init(series: series(id), episode: episode, seconds: 20, duration: 90))
+        }
+        let io = ControllerStorageProbe(initial: [a: original]), controller = makeController(io)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: false)
+        await controller.flush()
+        controller.removeHistory(seriesIDs: ["100", "101"])
+        await controller.flush()
+        let saved = try #require(await io.value(a))
+        #expect(saved.history.map(\.id) == ["102"])
+        #expect(Set(saved.favorites.map(\.id)) == ["100", "101", "102"])
+        #expect(saved.pendingProgress.filter(\.isDeletion).count == 2)
+        #expect(!saved.eligibleProgress().contains { ["100", "101"].contains($0.seriesID) })
+        #expect(await io.writeCount == 1)
+    }
+
+    @Test func invalidAndStaleSelectionsCannotPartiallyChangeOrRewriteTheLibrary() async throws {
+        let original = try state(a, ids: ["100", "101"])
+        let io = ControllerStorageProbe(initial: [a: original]), controller = makeController(io)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: false)
+        await controller.flush()
+        controller.removeFavorites(seriesIDs: ["100", "invalid"])
+        controller.removeHistory(seriesIDs: ["100", "invalid"])
+        controller.removeFavorites(seriesIDs: ["999"])
+        await controller.flush()
+        #expect(controller.persistenceError != nil)
+        #expect(await io.value(a) == original)
+        #expect(await io.writeCount == 0)
+    }
+
+    @Test func aNewUserToggleAfterQueuedBulkRemovalRetainsTheLaterDesiredState() async throws {
+        let io = ControllerStorageProbe(initial: [a: try state(a, ids: ["100", "101", "102"])], blockedLoads: [a])
+        let controller = makeController(io)
+        controller.selectSource(a.sourceID, legacy: nil, allowsAccount: false)
+        controller.removeFavorites(seriesIDs: ["100", "101"])
+        controller.toggleFavorite(series("100"))
+        await io.waitForLoad(a); await io.releaseLoad(a)
+        await controller.flush()
+        let saved = try #require(await io.value(a))
+        #expect(Set(saved.favorites.map(\.id)) == ["100", "102"])
+        #expect(saved.pendingFavorites.first { $0.seriesID == "100" }?.isFavorite == true)
+        #expect(saved.pendingFavorites.first { $0.seriesID == "101" }?.isFavorite == false)
+    }
+
     private var episode: Episode { .init(id: "900", number: 1, title: "第1集") }
     private func series(_ id: String) -> Series { .init(id: id, title: "待補劇\(id)") }
     private func state(_ scope: LibraryScope, ids: [String]) throws -> LibraryState {

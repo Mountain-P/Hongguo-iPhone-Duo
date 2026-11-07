@@ -11,6 +11,7 @@ struct PlayerScreen: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @EnvironmentObject private var appModel: AppModel
     @StateObject private var model: PlayerModel
+    @StateObject private var prefetchNetworkPolicy = PlaybackPrefetchNetworkPolicy()
     private let onClose: (() -> Void)?
     private let onSeriesSwipe: ((Int) -> Void)?
     private let isPreview: Bool
@@ -42,7 +43,7 @@ struct PlayerScreen: View {
         self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: episodes,
             initialEpisodeID: initialEpisodeID, resumeSeconds: resumeSeconds, service: service,
-            onProgress: onProgress))
+            onProgress: onProgress, isPreview: isPreview))
     }
 
     var body: some View {
@@ -54,7 +55,8 @@ struct PlayerScreen: View {
                     let region = viewingRegion(geometry)
                     ZStack(alignment: .topLeading) {
                         Color.black
-                        NativePlayerSurface(player: model.player, fillsScreen: fillsScreen)
+                        NativePlayerSurface(player: model.player, fillsScreen: fillsScreen,
+                            onReadyForDisplayChange: { if $0 { model.recordFirstFrame() } })
                             .frame(width: region.width, height: region.height)
                             .clipped()
                             .position(x: region.midX, y: region.midY)
@@ -109,7 +111,8 @@ struct PlayerScreen: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task {
-            if isPreview { model.autoNext = false }
+            if isPreview { model.setAutoNext(false) }
+            model.setPrefetchNetworkAllowed(!isPreview && prefetchNetworkPolicy.allowsPrefetch)
             model.setSceneActive(scenePhase == .active)
             model.start()
         }
@@ -124,6 +127,9 @@ struct PlayerScreen: View {
             if phase != .active { cancelBoostGesture(); showControls() }
         }
         .onChange(of: model.isPlaying) { _, _ in showControls() }
+        .onChange(of: prefetchNetworkPolicy.allowsPrefetch) { _, allowed in
+            model.setPrefetchNetworkAllowed(!isPreview && allowed)
+        }
         .onChange(of: model.canPausePlayback) { _, canPause in
             if !canPause { Task { await appModel.flushLibrary() } }
         }
@@ -217,7 +223,7 @@ struct PlayerScreen: View {
             } label: { Label("下一集", systemImage: "forward.end.fill") }
                 .disabled(model.nextEpisode == nil)
             Toggle("自動播放下一集", isOn: Binding(get: { model.autoNext }, set: {
-                model.autoNext = $0
+                model.setAutoNext($0)
                 showControls()
             }))
         } label: { Label("更多", systemImage: "ellipsis") }

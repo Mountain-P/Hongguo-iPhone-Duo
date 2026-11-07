@@ -25,7 +25,12 @@ final class PlayerModel: ObservableObject {
     @Published private var playbackSpeed = PlaybackSpeedState()
     var isSpeedBoosting: Bool { playbackSpeed.isPressing }
     var isSpeedBoostLocked: Bool { playbackSpeed.isLocked }
-    @Published var autoNext = true
+    @Published private(set) var autoNext = true {
+        didSet {
+            if !autoNext { cancelNextEpisodePrefetch() }
+            else { updateNextEpisodePrefetch() }
+        }
+    }
     var speed: Float {
         get { playbackSpeed.normalRate }
         set { selectSpeed(newValue) }
@@ -34,8 +39,26 @@ final class PlayerModel: ObservableObject {
     var effectiveSpeed: Float { playbackSpeed.effectiveRate }
 
     func selectSpeed(_ rate: Float) {
+        guard rate.isFinite, (0.25...4).contains(rate) else { return }
         playbackSpeed.selectRate(rate)
+        preferences.setNormalRate(playbackSpeed.normalRate)
         applyPlaybackRate()
+        updateNextEpisodePrefetch()
+    }
+
+    func setAutoNext(_ enabled: Bool) {
+        guard !isPreview else { autoNext = false; return }
+        autoNext = enabled
+        preferences.setAutoNext(enabled)
+    }
+
+    func setPrefetchNetworkAllowed(_ allowed: Bool) {
+        prefetchNetworkAllowed = allowed
+        updateNextEpisodePrefetch()
+    }
+
+    func recordFirstFrame() {
+        if let diagnosticsID { PlaybackDiagnostics.shared.recordFirstFrame(id: diagnosticsID) }
     }
 
     func beginSpeedBoost() {
@@ -83,6 +106,8 @@ final class PlayerModel: ObservableObject {
     }
 
     private let service: any CatalogService
+    private let isPreview: Bool
+    private let preferences = PlaybackPreferencesStore.shared
     private let initialEpisodeID: String
     private let resumeSeconds: Double
     private let onProgress: (Episode, Double, Double) -> Void
@@ -104,15 +129,28 @@ final class PlayerModel: ObservableObject {
     private var lastSavedAt = Date.distantPast
     private var loadStartedAt = Date()
     private var loggedPlaybackStart = false
+    private var reachedEnd = false
+    private var seekGeneration = UUID()
+    private var diagnosticsID: UUID?
+    private let nextPrefetcher = NativePlaybackPrefetch()
+    private var nextPrefetchState = EpisodePrefetchState()
+    private var nextPrefetchTask: Task<Void, Never>?
+    private var prefetchNetworkAllowed = false
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
-         service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void) {
+         service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
+         isPreview: Bool = false) {
         self.series = series
         self.episodes = episodes.sorted { $0.number < $1.number }
         self.initialEpisodeID = initialEpisodeID
         self.resumeSeconds = resumeSeconds.isFinite ? max(0, resumeSeconds) : 0
         self.service = service
         self.onProgress = onProgress
+        self.isPreview = isPreview
+        let saved = preferences.load().resolved(isPreview: isPreview)
+        playbackSpeed.selectRate(saved.normalRate)
+        autoNext = saved.autoNext
+        applyPlaybackRate()
     }
 
     func start() {
@@ -129,6 +167,12 @@ final class PlayerModel: ObservableObject {
                 guard let self else { return }
                 self.isPlaying = self.player.timeControlStatus == .playing
                 self.isBuffering = self.hasStarted && self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                if let id = self.diagnosticsID {
+                    PlaybackDiagnostics.shared.recordTransport(id: id,
+                        waiting: self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate,
+                        playing: self.player.timeControlStatus == .playing)
+                }
+                self.updateNextEpisodePrefetch()
                 if self.isPlaying {
                     if self.hasStarted, !self.loggedPlaybackStart {
                         self.loggedPlaybackStart = true
@@ -174,14 +218,53 @@ final class PlayerModel: ObservableObject {
     func seek(to seconds: Double) {
         guard hasStarted, seconds.isFinite else { return }
         let target = min(max(0, seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
+        let requestGeneration = generation
+        let seekRequest = UUID(); seekGeneration = seekRequest
         elapsed = target
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        reachedEnd = false
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor [weak self] in
+                guard let self, finished, self.generation == requestGeneration, self.seekGeneration == seekRequest,
+                      self.playbackSpeed.wantsPlayback, self.sceneActive,
+                      self.player.timeControlStatus == .paused else { return }
+                self.resumePlayback()
+            }
+        }
+        updateNextEpisodePrefetch()
     }
 
     func togglePlayback() {
         guard hasStarted, !isLoading, errorMessage == nil else { return }
         if canPausePlayback { pauseAndSave() }
-        else { resumePlayback() }
+        else if PlaybackReplay.shouldRestart(position: elapsed, duration: duration, reachedEnd: reachedEnd) {
+            restartFromBeginning()
+        } else { resumePlayback() }
+    }
+
+    private func restartFromBeginning() {
+        let requestGeneration = generation
+        let seekRequest = UUID(); seekGeneration = seekRequest
+        if diagnosticsID == nil {
+            diagnosticsID = PlaybackDiagnostics.shared.begin(context: .replay)
+        }
+        playbackSpeed.requestPlayback()
+        reachedEnd = false
+        elapsed = 0
+        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
+                guard finished else {
+                    if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
+                    self.finishDiagnostics(outcome: .failed)
+                    self.pauseAndSave()
+                    self.errorMessage = "無法從頭重播，請重新載入。"
+                    return
+                }
+                if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
+                guard self.playbackSpeed.wantsPlayback, self.sceneActive else { return }
+                self.resumePlayback()
+            }
+        }
     }
 
     var nextEpisode: Episode? {
@@ -195,6 +278,8 @@ final class PlayerModel: ObservableObject {
     }
 
     func pauseAndSave() {
+        if let id = diagnosticsID { PlaybackDiagnostics.shared.recordPause(id: id) }
+        cancelNextEpisodePrefetch()
         playbackSpeed.pause()
         player.pause()
         isPlaying = false
@@ -209,6 +294,8 @@ final class PlayerModel: ObservableObject {
     }
 
     func stop() {
+        cancelNextEpisodePrefetch()
+        finishDiagnostics(outcome: .cancelled)
         saveProgress()
         pendingResume = resumePosition
         didStart = false
@@ -223,7 +310,13 @@ final class PlayerModel: ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool) {
+    private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool,
+                           continuingDiagnostics: Bool = false) {
+        cancelNextEpisodePrefetch()
+        if !continuingDiagnostics || diagnosticsID == nil {
+            finishDiagnostics(outcome: .cancelled)
+            diagnosticsID = PlaybackDiagnostics.shared.begin(context: isPreview ? .preview : .episode)
+        }
         saveProgress()
         loadTask?.cancel()
         let requestGeneration = UUID()
@@ -239,6 +332,7 @@ final class PlayerModel: ObservableObject {
         isBuffering = false
         loadStartedAt = Date()
         loggedPlaybackStart = false
+        reachedEnd = false
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -286,6 +380,8 @@ final class PlayerModel: ObservableObject {
                 self.updateDuration()
                 self.elapsed = self.duration
                 self.saveProgress(completed: true)
+                self.reachedEnd = true
+                self.finishDiagnostics(outcome: .completed)
                 self.playbackSpeed.pause()
                 self.isPlaying = false
                 self.isBuffering = false
@@ -305,6 +401,7 @@ final class PlayerModel: ObservableObject {
                 guard let self, self.generation == requestGeneration, self.hasStarted else { return }
                 self.elapsed = time.seconds.isFinite ? max(0, time.seconds) : 0
                 self.updateDuration()
+                self.updateNextEpisodePrefetch()
                 if Date().timeIntervalSince(self.lastSavedAt) >= 5 { self.saveProgress() }
             }
         }
@@ -327,6 +424,7 @@ final class PlayerModel: ObservableObject {
                 self.elapsed = target
                 self.hasStarted = true
                 self.isLoading = false
+                if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
                 if self.sceneActive, self.playbackSpeed.wantsPlayback { self.resumePlayback() }
             }
         }
@@ -335,15 +433,59 @@ final class PlayerModel: ObservableObject {
     private func handleFailure(generation requestGeneration: UUID, error: (any Error)? = nil) {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
         if error is CancellationError { return }
-        if PlaybackRecovery.shouldRetry(error, attempt: retryCount) {
+        let willRetry = PlaybackRecovery.shouldRetry(error, attempt: retryCount)
+        if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: willRetry) }
+        if willRetry {
             let resumeAfterRecovery = playbackSpeed.wantsPlayback
             retryCount = 1
-            beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery)
+            beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery,
+                      continuingDiagnostics: true)
         } else {
+            finishDiagnostics(outcome: .failed)
             isLoading = false
             errorMessage = error?.localizedDescription ?? "目前無法播放這一集。請重新取源，或選擇其他集數。"
             pauseAndSave()
         }
+    }
+
+    private func finishDiagnostics(outcome: PlaybackDiagnostics.Outcome) {
+        guard let id = diagnosticsID else { return }
+        PlaybackDiagnostics.shared.finish(id: id, outcome: outcome)
+        diagnosticsID = nil
+    }
+
+    private func updateNextEpisodePrefetch() {
+        guard let currentEpisode else { cancelNextEpisodePrefetch(); return }
+        let bufferAhead = player.currentItem?.loadedTimeRanges.reduce(0.0) { best, value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds, end = CMTimeRangeGetEnd(range).seconds
+            guard start.isFinite, end.isFinite, start <= elapsed + 0.25, end > elapsed else { return best }
+            return max(best, end - elapsed)
+        } ?? 0
+        let context = EpisodePrefetchState.Context(elapsed: elapsed, duration: duration, rate: effectiveSpeed,
+            bufferedAhead: bufferAhead,
+            allowed: !isPreview && service is NativeCatalogService && autoNext && sceneActive && hasStarted
+                && playbackSpeed.wantsPlayback && isPlaying && !isLoading && !isBuffering
+                && errorMessage == nil && prefetchNetworkAllowed)
+        switch nextPrefetchState.update(episodeID: currentEpisode.id, nextEpisodeID: nextEpisode?.id, context: context) {
+        case .none: break
+        case .cancel: cancelNextEpisodePrefetch()
+        case .prepare(let episodeID):
+            nextPrefetchTask?.cancel()
+            let service = service, seriesID = series.id, prefetcher = nextPrefetcher
+            nextPrefetchTask = Task(priority: .utility) {
+                do {
+                    try Task.checkCancellation()
+                    _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service)
+                } catch { /* Optional work cannot become a visible playback error. */ }
+            }
+        }
+    }
+
+    private func cancelNextEpisodePrefetch() {
+        nextPrefetchState.reset()
+        nextPrefetchTask?.cancel()
+        nextPrefetchTask = nil
     }
 
     private func mediaFailure(_ error: (any Error)?) -> (any Error)? {

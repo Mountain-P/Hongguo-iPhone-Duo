@@ -8,6 +8,11 @@ struct LibraryView: View {
     @State private var filter: HistoryFilter = .all
     @State private var showingLogin = false
     @State private var confirmation: LibraryConfirmation?
+    @State private var query = ""
+    @State private var favoriteSort: LibraryFavoriteSort = .storedOrder
+    @State private var historySort: LibraryHistorySort = .recent
+    @State private var isEditing = false
+    @State private var selectedIDs: Set<String> = []
 
     private enum LibrarySection: String, CaseIterable, Identifiable {
         case history = "歷史", favorites = "收藏"
@@ -19,14 +24,25 @@ struct LibraryView: View {
         var id: String { rawValue }
     }
 
+    private struct BatchSelection {
+        let ids: Set<String>
+        let owner: LibraryOwner
+        let revision: UUID
+        let libraryName: String
+        var isAccount: Bool { if case .account = owner { true } else { false } }
+    }
+
     private enum LibraryConfirmation {
         case clearHistory, importGuest, signOut
+        case removeHistory(BatchSelection), removeFavorites(BatchSelection)
 
         var title: String {
             switch self {
             case .clearHistory: "清除觀看紀錄？"
             case .importGuest: "匯入本機片庫到紅果帳號？"
             case .signOut: "登出紅果帳號？"
+            case .removeHistory(let selection): "移除 \(selection.ids.count) 部本機觀看紀錄？"
+            case .removeFavorites(let selection): "取消收藏 \(selection.ids.count) 部劇集？"
             }
         }
 
@@ -35,6 +51,8 @@ struct LibraryView: View {
             case .clearHistory: "只清除目前片庫在這部 iPhone 的觀看紀錄。"
             case .importGuest: "本機收藏與觀看進度將加入目前帳號並同步至紅果，本機片庫會繼續保留。"
             case .signOut: "登出後切換至本機片庫。這個帳號在本機的片庫快取會保留，重新登入同一帳號即可使用。"
+            case .removeHistory(let selection): "目前片庫：\(selection.libraryName)。只移除這部 iPhone 的 \(selection.ids.count) 部觀看紀錄，不刪除官方觀看紀錄；收藏會保留。"
+            case .removeFavorites(let selection): "目前片庫：\(selection.libraryName)。將取消 \(selection.ids.count) 部收藏。" + (selection.isAccount ? "這些帳號取消收藏會加入待同步變更並同步至紅果；觀看紀錄會保留。" : "只更改這部 iPhone 的本機收藏；觀看紀錄會保留。")
             }
         }
     }
@@ -54,14 +72,12 @@ struct LibraryView: View {
     }
 
     private var filteredHistory: [WatchRecord] {
-        model.history.filter { record in
-            switch filter {
-            case .all: true
-            case .inProgress: record.progress < 0.98
-            case .completed: record.progress >= 0.98
-            }
-        }
+        let status: LibraryHistoryFilter = switch filter { case .all: .all; case .inProgress: .inProgress; case .completed: .completed }
+        return LibraryBrowser.history(model.history, query: query, filter: status, sort: historySort)
     }
+
+    private var filteredFavorites: [Series] { LibraryBrowser.favorites(model.favorites, query: query, sort: favoriteSort) }
+    private var visibleIDs: Set<String> { Set(section == .history ? filteredHistory.map(\.id) : filteredFavorites.map(\.id)) }
 
     var body: some View {
         ScrollView {
@@ -78,36 +94,10 @@ struct LibraryView: View {
                             .font(.caption).foregroundStyle(Theme.muted)
                     }
                     sectionTabs
-                    if section == .history {
-                        historyFilters
-                        if filter != .all {
-                            Text("依最近觀看的分集進度篩選").font(.system(size: 10)).foregroundStyle(Theme.muted)
-                                .padding(.top, -8)
-                        }
-                        if filteredHistory.isEmpty {
-                            StatusCard(icon: "clock", title: model.history.isEmpty && model.librarySyncing ? "正在載入觀看紀錄" : model.history.isEmpty ? "從第一個故事開始" : "沒有符合的觀看紀錄",
-                                       message: model.history.isEmpty && model.librarySyncing ? "讀到的片庫會先顯示，海報會接著補齊。" : model.history.isEmpty ? "播放過的劇集會留在這裡，隨時接著看。" : "切換上方分類，查看其他分集進度。")
-                                .padding(.vertical, 22)
-                        } else {
-                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 12)], alignment: .leading, spacing: 18) {
-                                ForEach(filteredHistory) { record in
-                                    NavigationLink(value: record.series) { historyCard(record) }
-                                        .buttonStyle(.plain)
-                                        .contentShape(Rectangle())
-                                        .contextMenu {
-                                            Button(role: .destructive) { model.removeHistory(record.series) } label: {
-                                                Label("移除本機紀錄", systemImage: "trash")
-                                            }
-                                        }
-                                }
-                            }
-                        }
-                    } else if model.favorites.isEmpty {
-                        StatusCard(icon: "heart", title: "喜歡的故事，先收藏", message: "在劇集頁點一下愛心，就能加入你的片庫。")
-                            .padding(.vertical, 30)
-                    } else {
-                        SeriesGrid(items: model.favorites)
-                    }
+                    browserControls
+                    if section == .history { historyFilters }
+                    if isEditing { selectionControls }
+                    libraryContent
                     if model.hasAccount {
                         Divider().overlay(.white.opacity(0.08))
                         Button("登出紅果帳號", role: .destructive) { confirmation = .signOut }
@@ -138,12 +128,175 @@ struct LibraryView: View {
                 Button("匯入並同步") { model.importGuestLibrary() }
             case .signOut:
                 Button("登出", role: .destructive) { model.signOut() }
+            case .removeHistory(let selection):
+                Button("移除 \(selection.ids.count) 部本機紀錄", role: .destructive) {
+                    guard selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
+                    model.removeHistory(seriesIDs: selection.ids)
+                    resetSelection()
+                }
+            case .removeFavorites(let selection):
+                Button("取消 \(selection.ids.count) 部收藏", role: .destructive) {
+                    guard selectionMatchesCurrentLibrary(selection) else { resetSelection(); return }
+                    model.removeFavorites(seriesIDs: selection.ids)
+                    resetSelection()
+                }
             }
             Button("取消", role: .cancel) {}
         } message: { value in
             Text(value.message)
         }
+        .onChange(of: section) { _, _ in resetSelection() }
+        .onChange(of: filter) { _, _ in selectedIDs = []; confirmation = nil }
+        .onChange(of: query) { _, value in
+            if value.count > 80 { query = String(value.prefix(80)) }
+            selectedIDs = []; confirmation = nil
+        }
+        .onChange(of: model.selectedLibraryOwner) { _, _ in resetSelection(); query = "" }
+        .onChange(of: model.revision) { _, _ in resetSelection(); query = "" }
+        .onChange(of: model.history.map(\.id)) { _, ids in
+            if section == .history { selectedIDs.formIntersection(ids) }
+        }
+        .onChange(of: model.favorites.map(\.id)) { _, ids in
+            if section == .favorites { selectedIDs.formIntersection(ids) }
+        }
     }
+
+    private var browserControls: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(Theme.muted)
+                TextField(section == .history ? "搜尋目前觀看紀錄" : "搜尋目前收藏", text: $query)
+                    .textInputAutocapitalization(.never).autocorrectionDisabled().submitLabel(.search)
+                    .accessibilityIdentifier("library.search")
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.muted) }
+                        .buttonStyle(.plain).accessibilityLabel("清除片庫搜尋")
+                }
+            }
+            .font(.subheadline).padding(12)
+            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            HStack(spacing: 12) {
+                Text("顯示 \(visibleIDs.count)／\(section == .history ? model.history.count : model.favorites.count) 部")
+                    .font(.caption).foregroundStyle(Theme.muted)
+                Spacer(minLength: 0)
+                Menu {
+                    if section == .history {
+                        Picker("觀看紀錄排序", selection: $historySort) {
+                            ForEach(LibraryHistorySort.allCases) { Text($0.title).tag($0) }
+                        }
+                    } else {
+                        Picker("收藏排序", selection: $favoriteSort) {
+                            ForEach(LibraryFavoriteSort.allCases) { Text($0.title).tag($0) }
+                        }
+                    }
+                } label: {
+                    Label(section == .history ? historySort.title : favoriteSort.title, systemImage: "arrow.up.arrow.down")
+                        .font(.caption).lineLimit(1)
+                }
+                .tint(Theme.accent).accessibilityLabel("片庫排序")
+                Button(isEditing ? "完成" : "編輯") {
+                    if isEditing { resetSelection() } else { selectedIDs = []; isEditing = true }
+                }
+                .font(.subheadline.weight(.semibold)).tint(Theme.accent)
+                .disabled(visibleIDs.isEmpty && !isEditing)
+                .accessibilityIdentifier("library.edit")
+            }
+        }
+    }
+
+    private var selectionControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("\(libraryName) · 已選 \(selectedIDs.count) 部").font(.caption).foregroundStyle(Theme.muted)
+            HStack(spacing: 14) {
+                Button(selectedIDs == visibleIDs && !visibleIDs.isEmpty ? "取消全選" : "全選顯示結果") {
+                    selectedIDs = selectedIDs == visibleIDs ? [] : visibleIDs
+                }
+                .font(.caption).disabled(visibleIDs.isEmpty)
+                Spacer(minLength: 0)
+                Button(section == .history ? "移除本機紀錄" : "取消收藏", role: .destructive) {
+                    let selection = BatchSelection(ids: selectedIDs.intersection(visibleIDs), owner: model.selectedLibraryOwner,
+                                                   revision: model.revision, libraryName: libraryName)
+                    guard !selection.ids.isEmpty else { return }
+                    confirmation = section == .history ? .removeHistory(selection) : .removeFavorites(selection)
+                }
+                .font(.caption.weight(.semibold)).buttonStyle(.bordered)
+                .disabled(selectedIDs.isEmpty).accessibilityIdentifier("library.removeSelected")
+            }
+        }
+        .padding(12).background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    @ViewBuilder
+    private var libraryContent: some View {
+        if section == .history {
+            if filteredHistory.isEmpty {
+                StatusCard(icon: "clock", title: model.history.isEmpty && model.librarySyncing ? "正在載入觀看紀錄" : model.history.isEmpty ? "從第一個故事開始" : "沒有符合的觀看紀錄",
+                           message: model.history.isEmpty && model.librarySyncing ? "讀到的片庫會先顯示，海報會接著補齊。" : model.history.isEmpty ? "播放過的劇集會留在這裡，隨時接著看。" : "調整搜尋或分集進度篩選，查看其他紀錄。")
+                    .padding(.vertical, 22)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 12)], alignment: .leading, spacing: 18) {
+                    ForEach(filteredHistory) { historyItem($0) }
+                }
+            }
+        } else if filteredFavorites.isEmpty {
+            StatusCard(icon: "heart", title: model.favorites.isEmpty ? "喜歡的故事，先收藏" : "沒有符合的收藏",
+                       message: model.favorites.isEmpty ? "在劇集頁點一下愛心，就能加入你的片庫。" : "調整搜尋文字，查看其他收藏。")
+                .padding(.vertical, 30)
+        } else {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], alignment: .leading, spacing: 12) {
+                ForEach(filteredFavorites) { favoriteItem($0) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func historyItem(_ record: WatchRecord) -> some View {
+        if isEditing {
+            selectableCard(record.series) { historyCard(record) }
+        } else {
+            NavigationLink(value: record.series) { historyCard(record) }
+                .buttonStyle(.plain).contentShape(Rectangle())
+                .contextMenu {
+                    Button(role: .destructive) { model.removeHistory(record.series) } label: {
+                        Label("移除本機紀錄", systemImage: "trash")
+                    }
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func favoriteItem(_ series: Series) -> some View {
+        if isEditing { selectableCard(series) { SeriesCard(series: series) } }
+        else { NavigationLink(value: series) { SeriesCard(series: series) }.buttonStyle(.plain) }
+    }
+
+    private func selectableCard<Content: View>(_ series: Series, @ViewBuilder content: () -> Content) -> some View {
+        Button {
+            if !selectedIDs.insert(series.id).inserted { selectedIDs.remove(series.id) }
+        } label: {
+            content()
+                .overlay(alignment: .topTrailing) {
+                    Image(systemName: selectedIDs.contains(series.id) ? "checkmark.circle.fill" : "circle")
+                        .font(.title2).symbolRenderingMode(.palette)
+                        .foregroundStyle(selectedIDs.contains(series.id) ? Theme.accent : .white, .black.opacity(0.75))
+                        .padding(7)
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(selectedIDs.contains(series.id) ? Theme.accent : .clear, lineWidth: 2)
+                }
+        }
+        .buttonStyle(.plain).accessibilityLabel(series.title)
+        .accessibilityValue(selectedIDs.contains(series.id) ? "已選取" : "未選取")
+        .accessibilityAddTraits(selectedIDs.contains(series.id) ? .isSelected : [])
+    }
+
+    private var libraryName: String { model.showingAccountLibrary ? "帳號片庫" : "本機片庫" }
+
+    private func selectionMatchesCurrentLibrary(_ selection: BatchSelection) -> Bool {
+        selection.owner == model.selectedLibraryOwner && selection.revision == model.revision
+    }
+
+    private func resetSelection() { selectedIDs = []; isEditing = false; confirmation = nil }
 
     private var profileHeader: some View {
         HStack(spacing: 15) {

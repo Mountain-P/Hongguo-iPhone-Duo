@@ -58,7 +58,7 @@ struct RootView: View {
         .onChange(of: selectedTab) { _, _ in
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
-        .task { model.resumeAccount() }
+        .task { _ = PlaybackDiagnostics.shared; model.resumeAccount() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { model.resumeAccount() }
             else { libraryFlush.flush(model) }

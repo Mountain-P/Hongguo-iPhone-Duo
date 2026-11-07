@@ -124,6 +124,9 @@ struct SettingsView: View {
         NavigationLink { RecommendationPreferencesView() } label: {
                 Label("推薦偏好", systemImage: "slider.horizontal.3")
             }
+            NavigationLink { PlaybackDiagnosticsView() } label: {
+                Label("播放診斷", systemImage: "waveform.path.ecg")
+            }
         Label("直向觀看與橫向全螢幕", systemImage: "rotate.right")
         Label("倍速、快轉與自動下一集", systemImage: "forward.end")
         Text("長按影片暫時 2 倍速；上滑鎖定。鎖定時長按下滑解除，回到原先速度。")

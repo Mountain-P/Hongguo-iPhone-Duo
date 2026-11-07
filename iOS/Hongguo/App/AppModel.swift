@@ -145,6 +145,8 @@ final class AppModel: ObservableObject {
 
     func clearHistory() { library.clearHistory() }
     func removeHistory(_ series: Series) { library.removeHistory(series) }
+    func removeHistory(seriesIDs: Set<String>) { library.removeHistory(seriesIDs: seriesIDs) }
+    func removeFavorites(seriesIDs: Set<String>) { library.removeFavorites(seriesIDs: seriesIDs) }
     func selectLibraryOwner(_ owner: LibraryOwner) { library.selectOwner(owner) }
     func acceptAccountSession(_ session: AccountSession) { library.accept(session) }
     func synchronizeLibrary() async { await library.synchronize(userInitiated: true) }
@@ -208,6 +210,16 @@ final class AppModel: ObservableObject {
         searchHistory.insert(value, at: 0)
         searchHistory = Array(searchHistory.prefix(12))
         defaults.set(searchHistory, forKey: "searchHistory")
+    }
+
+    func removeSearch(_ query: String) {
+        searchHistory.removeAll { $0 == query }
+        defaults.set(searchHistory, forKey: "searchHistory")
+    }
+
+    func clearSearchHistory() {
+        searchHistory = []
+        defaults.removeObject(forKey: "searchHistory")
     }
 
     private func restoreLibrary() {

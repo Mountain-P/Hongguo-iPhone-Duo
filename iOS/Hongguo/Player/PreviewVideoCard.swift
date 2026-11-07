@@ -79,7 +79,7 @@ private struct PreviewVideoContent: View {
         self.onOpenSeries = onOpenSeries
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: [episode],
             initialEpisodeID: episode.id, resumeSeconds: 0, service: service,
-            onProgress: { _, _, _ in }))
+            onProgress: { _, _, _ in }, isPreview: true))
     }
 
     var body: some View {
@@ -91,6 +91,7 @@ private struct PreviewVideoContent: View {
                     Poster(series: model.series, contentMode: .fill)
                         .allowsHitTesting(false).accessibilityHidden(true)
                     NativePlayerSurface(player: model.player, fillsScreen: true, onReadyForDisplayChange: { ready in
+                        if ready { model.recordFirstFrame() }
                         firstFrameReady = ready
                         reportPreviewStarted()
                     })
@@ -302,7 +303,7 @@ private struct PreviewVideoContent: View {
         suspendedForPaging = false
         resumeAfterPaging = false
         PreviewPlaybackOwner.acquire(ownerID, model: model)
-        model.autoNext = false
+        model.setAutoNext(false)
         model.setSceneActive(true)
         model.start()
         if shouldResume, !model.canPausePlayback { model.togglePlayback() }
