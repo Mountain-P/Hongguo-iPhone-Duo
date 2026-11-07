@@ -1,15 +1,7 @@
 import SwiftUI
+import UIKit
 import HongguoCore
 import Darwin
-
-private struct FeedPlaybackRoute: Identifiable {
-    let id = UUID()
-    let detail: SeriesDetail
-    let episode: Episode
-    let seconds: Double
-    let service: any CatalogService
-    let onProgress: (Episode, Double, Double) -> Void
-}
 
 @MainActor
 struct HomeFeedView: View {
@@ -19,23 +11,28 @@ struct HomeFeedView: View {
     @StateObject private var catalogue = CatalogModel()
     @State private var category: DirectWebService.Category = .realDrama
     @State private var scrollTargetID: String?
-    @State private var route: FeedPlaybackRoute?
-    @State private var preparation: Task<Void, Never>?
-    @State private var requestID = UUID()
-    @State private var requestedSeriesID: String?
-    @State private var preparingID: String?
-    @State private var failure: String?
-    @State private var failureSeriesID: String?
+    @StateObject private var playback = ContinuePlaybackModel()
     @State private var lastLoadKey = ""
     @State private var activeTab = true
 
     private var loadKey: String { "\(model.revision):\(category.rawValue)" }
+    private var route: ContinuePlaybackRoute? { playback.route }
+    private var preparingID: String? { playback.preparingSeriesID }
+    private var failure: String? { playback.errorMessage }
+    private var failureSeriesID: String? { playback.failedSeriesID }
+    private var playbackContext: ContinuePlaybackContext {
+        .init(owner: model.selectedLibraryOwner, revision: model.revision,
+              sceneActive: scenePhase == .active && UIApplication.shared.applicationState == .active,
+              parentActive: isActive && activeTab)
+    }
+    private var recentRecords: [WatchRecord] { Array(model.history.sorted { $0.updatedAt > $1.updatedAt }.prefix(5)) }
 
     var body: some View {
         ScrollViewReader { scroll in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 18) {
                     header
+                    if !recentRecords.isEmpty { recentWatching }
                     if catalogue.items.isEmpty {
                         emptyCatalogue
                     } else {
@@ -91,27 +88,17 @@ struct HomeFeedView: View {
             if active {
                 if lastLoadKey != loadKey || !catalogue.hasLoadedPage { Task { await load(reset: true) } }
             } else {
-                cancelPreparation(); route = nil; model.isImmersivePlayback = false
+                playback.dismiss(); model.isImmersivePlayback = false
             }
         }
-        .onChange(of: model.revision) { _, _ in cancelPreparation(); route = nil }
+        .onChange(of: model.revision) { _, _ in playback.dismiss() }
         .onChange(of: route?.id) { _, _ in model.isImmersivePlayback = activeTab && route != nil }
         .onDisappear {
             // Presenting the player also hides this view. It must not cancel its own presentation.
             guard route == nil else { return }
             cancelPreparation(); model.isImmersivePlayback = false
         }
-        .fullScreenCover(item: $route, onDismiss: {
-            model.isImmersivePlayback = false
-            trace("dismissed")
-        }) { selection in
-            PlayerScreen(series: selection.detail.series, episodes: selection.detail.episodes,
-                         initialEpisodeID: selection.episode.id, resumeSeconds: selection.seconds,
-                         service: selection.service, onProgress: selection.onProgress,
-                         onClose: { route = nil }, onSeriesSwipe: browse)
-                .id(selection.id)
-                .onAppear { trace("presented") }
-        }
+        .continuePlaybackPresentation(playback, context: playbackContext, onSeriesSwipe: browse)
     }
 
     private var emptyCatalogue: some View {
@@ -124,6 +111,44 @@ struct HomeFeedView: View {
                     .padding(20).frame(maxHeight: .infinity)
             }
         }
+    }
+
+    private var recentWatching: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("接著看").font(.headline)
+                Spacer()
+                Text(model.showingAccountLibrary ? "帳號片庫" : "本機片庫").font(.caption).foregroundStyle(Theme.muted)
+            }
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(recentRecords) { record in
+                        HStack(spacing: 10) {
+                            NavigationLink(value: record.series) {
+                                Poster(series: record.series, contentMode: .fit)
+                                    .frame(width: 56, height: 80).clipShape(RoundedRectangle(cornerRadius: 6))
+                            }.buttonStyle(.plain)
+                            VStack(alignment: .leading, spacing: 5) {
+                                NavigationLink(value: record.series) {
+                                    Text(record.series.title).font(.caption.weight(.medium))
+                                        .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                                }.buttonStyle(.plain)
+                                Text("上次第 \(record.episode.number) 集" + (record.duration > 0 ? " · \(Int(record.progress * 100))%" : ""))
+                                    .font(.caption2).foregroundStyle(Theme.muted).lineLimit(1)
+                                ContinuePlaybackButton(seriesTitle: record.series.title, isPreparing: preparingID == record.id,
+                                    disabled: preparingID != nil || route != nil) { start(record.series, requiresRecord: true) }
+                            }
+                        }
+                        .frame(width: 240).frame(minHeight: 100).padding(10)
+                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }.padding(.bottom, 4)
+            }.scrollIndicators(.hidden)
+            if let failureSeriesID, recentRecords.contains(where: { $0.id == failureSeriesID }), let failure {
+                Text(failure).font(.caption).foregroundStyle(.orange).lineLimit(2)
+            }
+        }
+        .foregroundStyle(.white)
     }
 
     private var header: some View {
@@ -223,59 +248,28 @@ struct HomeFeedView: View {
     }
 
     private func cancelPreparation() {
-        if preparation != nil || preparingID != nil { trace("cancelled") }
-        requestID = UUID()
-        preparation?.cancel(); preparation = nil
-        requestedSeriesID = nil; preparingID = nil
-        failure = nil; failureSeriesID = nil
+        if preparingID != nil { trace("cancelled") }
+        playback.cancelPending()
     }
 
     private func browse(_ offset: Int) {
-        let selected = route?.detail.series.id ?? requestedSeriesID
-        cancelPreparation(); route = nil; model.isImmersivePlayback = false
+        let selected = route?.detail.series.id ?? preparingID
+        playback.dismiss(); model.isImmersivePlayback = false
         guard let selected, let index = catalogue.items.firstIndex(where: { $0.id == selected }) else { return }
         let target = index + offset
         guard catalogue.items.indices.contains(target) else { return }
         scrollTargetID = catalogue.items[target].id
     }
 
-    private func start(_ series: Series) {
-        guard isActive, activeTab, scenePhase == .active, preparingID == nil, route == nil else { return }
-        cancelPreparation()
-        let request = UUID(), revision = model.revision
-        requestID = request; requestedSeriesID = series.id; preparingID = series.id
-        trace("prepare_started")
-        preparation = Task {
-            defer {
-                if requestID == request { preparingID = nil; requestedSeriesID = nil; preparation = nil }
-            }
-            do {
-                let service = try model.playbackService()
-                let detail: SeriesDetail
-                if let bridge = service as? BridgeService { detail = try await bridge.verifiedDetail(id: series.id) }
-                else { detail = try await service.detail(id: series.id) }
-                try Task.checkCancellation()
-                guard requestID == request, requestedSeriesID == series.id, model.revision == revision, activeTab else { return }
-                trace("detail_ready")
-                let record = model.record(for: series)
-                guard let continuation = PlaybackContinuation.preferred(seriesID: detail.series.id, episodes: detail.episodes, record: record) else {
-                    throw CatalogError.unavailablePlayback
-                }
-                route = FeedPlaybackRoute(detail: detail, episode: continuation.episode,
-                    seconds: continuation.seconds, service: service,
-                    onProgress: model.playbackProgressHandler(for: detail.series, episodes: detail.episodes))
-            } catch is CancellationError {
-                if requestID == request {
-                    failure = "影片準備已取消，請再試一次。"; failureSeriesID = series.id
-                    trace("cancelled")
-                }
-            } catch {
-                if requestID == request, !Task.isCancelled {
-                    failure = error.localizedDescription; failureSeriesID = series.id
-                    trace("failed", error: error)
-                }
-            }
-        }
+    private func start(_ series: Series, requiresRecord: Bool = false) {
+        guard playbackContext.permitsStart, preparingID == nil, route == nil else { return }
+        do {
+            let service = try model.playbackService()
+            trace("prepare_started")
+            playback.start(series: series, requiresRecord: requiresRecord, context: playbackContext, service: service,
+                currentContext: { playbackContext }, latestRecord: { model.record(for: series) },
+                progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
+        } catch { playback.fail(error, seriesID: series.id); trace("failed", error: error) }
     }
 
     private func trace(_ event: String, error: (any Error)? = nil) {

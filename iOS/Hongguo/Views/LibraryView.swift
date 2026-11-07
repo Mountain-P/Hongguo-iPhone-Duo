@@ -1,9 +1,11 @@
 import SwiftUI
+import UIKit
 import HongguoCore
 
 @MainActor
 struct LibraryView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var section: LibrarySection = .history
     @State private var filter: HistoryFilter = .all
     @State private var showingLogin = false
@@ -14,6 +16,8 @@ struct LibraryView: View {
     @State private var isEditing = false
     @State private var selectedIDs: Set<String> = []
     @StateObject private var browser = LibraryBrowserModel()
+    @StateObject private var playback = ContinuePlaybackModel()
+    @State private var parentVisible = false
 
     private enum LibrarySection: String, CaseIterable, Identifiable {
         case history = "歷史", favorites = "收藏"
@@ -86,6 +90,11 @@ struct LibraryView: View {
               favorites: model.favorites, history: model.history)
     }
     private var browserIsReady: Bool { browser.isCurrent(browserInput) }
+    private var playbackContext: ContinuePlaybackContext {
+        .init(owner: model.selectedLibraryOwner, revision: model.revision,
+              sceneActive: scenePhase == .active && UIApplication.shared.applicationState == .active,
+              parentActive: parentVisible)
+    }
 
     var body: some View {
         ScrollView {
@@ -153,7 +162,8 @@ struct LibraryView: View {
         } message: { value in
             Text(value.message)
         }
-        .onChange(of: section) { _, _ in resetSelection() }
+        .onChange(of: section) { _, _ in resetSelection(); playback.cancelPending() }
+        .onChange(of: isEditing) { _, editing in if editing { playback.cancelPending() } }
         .onChange(of: filter) { _, _ in selectedIDs = []; confirmation = nil }
         .onChange(of: query) { _, value in
             if value.count > 80 { query = String(value.prefix(80)) }
@@ -172,8 +182,12 @@ struct LibraryView: View {
             confirmation = nil
             browser.update(value)
         }
-        .onAppear { browser.update(browserInput) }
-        .onDisappear { browser.cancel(); resetSelection() }
+        .onAppear { parentVisible = true; browser.update(browserInput) }
+        .onDisappear {
+            browser.cancel(); resetSelection()
+            if playback.route == nil { parentVisible = false; playback.cancelPending() }
+        }
+        .continuePlaybackPresentation(playback, context: playbackContext)
     }
 
     private var browserControls: some View {
@@ -277,13 +291,20 @@ struct LibraryView: View {
         if isEditing {
             selectableCard(record.series) { historyCard(record) }
         } else {
-            NavigationLink(value: record.series) { historyCard(record) }
-                .buttonStyle(.plain).contentShape(Rectangle())
-                .contextMenu {
-                    Button(role: .destructive) { model.removeHistory(record.series) } label: {
-                        Label("移除本機紀錄", systemImage: "trash")
+            VStack(alignment: .leading, spacing: 7) {
+                NavigationLink(value: record.series) { historyCard(record) }
+                    .buttonStyle(.plain).contentShape(Rectangle())
+                    .contextMenu {
+                        Button(role: .destructive) { model.removeHistory(record.series) } label: {
+                            Label("移除本機紀錄", systemImage: "trash")
+                        }
                     }
+                ContinuePlaybackButton(seriesTitle: record.series.title, isPreparing: playback.preparingSeriesID == record.id,
+                    disabled: playback.preparingSeriesID != nil || playback.route != nil) { continueWatching(record.series) }
+                if playback.failedSeriesID == record.id, let error = playback.errorMessage {
+                    Text(error).font(.caption2).foregroundStyle(.orange).lineLimit(4)
                 }
+            }
         }
     }
 
@@ -316,6 +337,15 @@ struct LibraryView: View {
     }
 
     private var libraryName: String { model.showingAccountLibrary ? "帳號片庫" : "本機片庫" }
+
+    private func continueWatching(_ series: Series) {
+        guard !isEditing, playbackContext.permitsStart else { return }
+        do {
+            playback.start(series: series, requiresRecord: true, context: playbackContext, service: try model.playbackService(),
+                currentContext: { playbackContext }, latestRecord: { model.record(for: series) },
+                progressFactory: { detail in model.playbackProgressHandler(for: detail.series, episodes: detail.episodes) })
+        } catch { playback.fail(error, seriesID: series.id) }
+    }
 
     private func selectionMatchesCurrentLibrary(_ selection: BatchSelection) -> Bool {
         selection.owner == model.selectedLibraryOwner && selection.revision == model.revision
