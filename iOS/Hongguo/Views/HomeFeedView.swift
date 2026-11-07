@@ -84,12 +84,12 @@ struct HomeFeedView: View {
         .toolbar(.hidden, for: .navigationBar)
         .onAppear { activeTab = isActive }
         .task(id: loadKey) {
-            if isActive, lastLoadKey != loadKey || catalogue.items.isEmpty { await load(reset: true) }
+            if isActive, lastLoadKey != loadKey || !catalogue.hasLoadedPage { await load(reset: true) }
         }
         .onChange(of: isActive) { _, active in
             activeTab = active
             if active {
-                if lastLoadKey != loadKey || catalogue.items.isEmpty { Task { await load(reset: true) } }
+                if lastLoadKey != loadKey || !catalogue.hasLoadedPage { Task { await load(reset: true) } }
             } else {
                 cancelPreparation(); route = nil; model.isImmersivePlayback = false
             }

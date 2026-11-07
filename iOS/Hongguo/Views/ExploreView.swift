@@ -93,7 +93,7 @@ struct ExploreView: View {
         .background(Theme.background)
         .toolbar(.hidden, for: .navigationBar)
         .task(id: loadKey) {
-            if catalogue.key != loadKey || catalogue.items.isEmpty { await load(reset: true) }
+            if catalogue.key != loadKey || !catalogue.hasLoadedPage { await load(reset: true) }
         }
         .refreshable { await load(reset: true, fresh: true) }
         .onDisappear { catalogue.cancel() }
@@ -316,6 +316,7 @@ private final class TheaterDiscoveryModel: ObservableObject {
     private var knownGenres: [DirectWebService.Category: [DiscoveryGenre]] = [:]
     private let website = WebDiscoveryService()
     private let releases = NativeNewReleaseService()
+    var hasLoadedPage: Bool { page > 0 }
 
     func load(query: TheaterQuery, key requestedKey: String, legacy: (any CatalogService)?, reset: Bool, fresh: Bool) async {
         guard !Task.isCancelled else { return }
@@ -325,7 +326,7 @@ private final class TheaterDiscoveryModel: ObservableObject {
             items = []; page = 0; hasMore = false; error = nil; updatedText = ""
             genres = query.usesBridge ? [] : knownGenres[query.category] ?? []
         }
-        guard !isLoading else { return }
+        guard !isLoading, page < 100 else { return }
         let request = generation
         let next = page + 1
         isLoading = true; error = nil; pageNotice = nil
@@ -359,10 +360,11 @@ private final class TheaterDiscoveryModel: ObservableObject {
             } onCancel: { task.cancel() }
             try Task.checkCancellation()
             guard request == generation, key == requestedKey else { return }
+            guard result.page == next else { throw CatalogError.malformedResponse }
             var existing = Set(items.map(\.id))
             let additions = result.items.filter { existing.insert($0.id).inserted }
             items.append(contentsOf: additions)
-            page = max(next, result.page)
+            page = next
             hasMore = result.hasMore && page < 100
             if additions.isEmpty, hasMore { pageNotice = "這一頁沒有新增劇集，仍可手動載入下一頁。" }
             updatedText = result.updatedText

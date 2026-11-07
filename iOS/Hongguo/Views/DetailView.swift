@@ -86,6 +86,14 @@ struct DetailView: View {
         .background(Theme.background).navigationTitle("劇集詳情").navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { Task { await load() } } label: {
+                    Label("更新劇集", systemImage: "arrow.clockwise")
+                }
+                .disabled(isLoading)
+                .accessibilityHint("更新分集資料；更新失敗時保留目前可用的資料")
+                .accessibilityIdentifier("detail.refresh")
+            }
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("完成") { episodeJumpFocused = false }

@@ -17,7 +17,7 @@ let package = Package(
         .target(name: "HongguoAppSupport", dependencies: ["HongguoCore"], path: "iOS/Hongguo",
                 exclude: ["Assets.xcassets", "Views", "Player", "App/AppModel.swift", "App/HongguoApp.swift", "Account/NativePhoneLoginView.swift"],
                 sources: ["Account/AccountLibraryController.swift", "Account/AccountSessionVault.swift",
-                          "App/LibraryPersistence.swift", "App/AppError.swift"]),
+                          "App/LibraryPersistence.swift", "App/AppError.swift", "App/CatalogModel.swift", "App/LibraryBrowserModel.swift"]),
         .testTarget(name: "HongguoCoreTests", dependencies: ["HongguoCore"]),
         .testTarget(name: "HongguoAppSupportTests", dependencies: ["HongguoCore", "HongguoAppSupport"]),
         .executableTarget(name: "NativePlaybackCheck", dependencies: ["HongguoCore", "HongguoPlayback"], path: "Tools/NativePlaybackCheck"),

@@ -23,7 +23,7 @@ struct LibraryBrowserInput: Equatable, Sendable {
     }
 }
 
-private struct LibraryBrowserOutput: Sendable {
+struct LibraryBrowserOutput: Sendable {
     var favorites: [Series] = []
     var history: [WatchRecord] = []
 }
@@ -46,12 +46,25 @@ final class LibraryBrowserModel: ObservableObject {
     @Published private(set) var favorites: [Series] = []
     @Published private(set) var history: [WatchRecord] = []
     @Published private(set) var isProcessing = false
-    private let worker = LibraryBrowserWorker()
+    private let process: @Sendable (LibraryBrowserInput) async -> LibraryBrowserOutput
+    private let debounceDelay: Duration
+    private var completed: (LibraryBrowserInput, LibraryBrowserOutput)?
     private var input: LibraryBrowserInput?
     private var generation = UUID()
     private var pending: (LibraryBrowserInput, UUID)?
     private var debounce: Task<Void, Never>?
     private var operation: Task<Void, Never>?
+
+    init() {
+        let worker = LibraryBrowserWorker()
+        process = { await worker.process($0) }
+        debounceDelay = .milliseconds(180)
+    }
+
+    init(debounceDelay: Duration = .zero,
+         process: @escaping @Sendable (LibraryBrowserInput) async -> LibraryBrowserOutput) {
+        self.process = process; self.debounceDelay = debounceDelay
+    }
 
     func isCurrent(_ value: LibraryBrowserInput) -> Bool { !isProcessing && input == value }
     func isSameScope(_ value: LibraryBrowserInput) -> Bool {
@@ -62,16 +75,22 @@ final class LibraryBrowserModel: ObservableObject {
         guard input != value else { return }
         let previous = input
         let typing = previous != nil && previous?.query != value.query
+        if let accepted = completed, accepted.0.owner != value.owner || accepted.0.source != value.source { completed = nil }
+        input = value; generation = UUID(); pending = nil
+        debounce?.cancel(); debounce = nil
+        if let accepted = completed, accepted.0 == value {
+            favorites = accepted.1.favorites; history = accepted.1.history
+            isProcessing = false
+            return
+        }
         if previous?.owner != value.owner || previous?.source != value.source || previous?.showingHistory != value.showingHistory {
             favorites = []; history = []
         }
-        input = value; generation = UUID(); pending = nil
         isProcessing = true
-        debounce?.cancel()
         let token = generation
         debounce = Task { @MainActor [weak self] in
             if typing {
-                do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+                do { try await Task.sleep(for: self?.debounceDelay ?? .zero) } catch { return }
             }
             guard let self, !Task.isCancelled, self.generation == token, self.input == value else { return }
             self.debounce = nil
@@ -95,8 +114,9 @@ final class LibraryBrowserModel: ObservableObject {
             defer { self.operation = nil }
             while let (value, token) = self.pending {
                 self.pending = nil
-                let result = await self.worker.process(value)
+                let result = await self.process(value)
                 guard self.generation == token, self.input == value else { continue }
+                self.completed = (value, result)
                 self.favorites = result.favorites; self.history = result.history
                 self.isProcessing = false
             }
