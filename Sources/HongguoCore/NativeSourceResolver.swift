@@ -38,8 +38,28 @@ public struct NativeSourceError: Error, Sendable, LocalizedError {
 
 public actor NativeSourceResolver {
     public static let shared = NativeSourceResolver()
+    static let maximumPendingFlights = 16
+    static let maximumWaitersPerFlight = 32
     private struct Entry { let source: NativeMediaSource; let expires: Date; var access: UInt64 }
+    private final class CancellationToken: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() { lock.withLock { cancelled = true } }
+        var isCancelled: Bool { lock.withLock { cancelled } }
+    }
+    private struct Waiter {
+        let continuation: CheckedContinuation<NativeMediaSource, any Error>
+        let cancellation: CancellationToken
+    }
+    private struct Flight {
+        let key: String
+        var task: Task<Void, Never>?
+        var waiters: [UUID: Waiter]
+    }
     private var cache: [String: Entry] = [:]
+    private var flights: [UUID: Flight] = [:]
+    private var joinable: [String: UUID] = [:]
+    private var waiterFlights: [UUID: UUID] = [:]
     private var requests: [String: UUID] = [:]
     private var access: UInt64 = 0
     private let resolveSource: @Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource
@@ -57,6 +77,11 @@ public actor NativeSourceResolver {
         self.now = now; self.resolveSource = resolveQuality
     }
 
+    deinit { for flight in flights.values { flight.task?.cancel() } }
+
+    var pendingFlightCount: Int { flights.count }
+    var pendingWaiterCount: Int { waiterFlights.count }
+
     public func resolve(episodeID: String, contentType: String = "1004", fresh: Bool = false,
                         quality: NativePlaybackQuality = .automatic) async throws -> NativeMediaSource {
         try Task.checkCancellation()
@@ -66,22 +91,79 @@ public actor NativeSourceResolver {
         if !fresh, var entry = cache[key], entry.expires > now() {
             access &+= 1; entry.access = access; cache[key] = entry; return entry.source
         }
-        cache.removeValue(forKey: key)
-        let request = UUID(); requests[key] = request
-        do {
-            // Pending work is request-isolated: cancelling one caller cannot stop another.
-            let source = try await resolveSource(episodeID, contentType, quality)
-            try Task.checkCancellation()
-            guard source.preference == quality else { throw NativeSourceError(code: "INVALID_RESPONSE") }
-            if requests[key] == request {
-                requests.removeValue(forKey: key)
-                access &+= 1; cache[key] = Entry(source: source, expires: now().addingTimeInterval(120), access: access)
+        let waiter = UUID(), cancellation = CancellationToken()
+        let source: NativeMediaSource = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<NativeMediaSource, any Error>) in
+                guard !Task.isCancelled, !cancellation.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                if !fresh, let id = joinable[key], var flight = flights[id] {
+                    guard flight.waiters.count < Self.maximumWaitersPerFlight else {
+                        continuation.resume(throwing: NativeSourceError(code: "SOURCE_BUSY")); return
+                    }
+                    flight.waiters[waiter] = Waiter(continuation: continuation, cancellation: cancellation)
+                    flights[id] = flight; waiterFlights[waiter] = id
+                    return
+                }
+                guard flights.count < Self.maximumPendingFlights else {
+                    continuation.resume(throwing: NativeSourceError(code: "SOURCE_BUSY")); return
+                }
+                cache.removeValue(forKey: key)
+                let id = UUID()
+                requests[key] = id
+                // A fresh request is never joined. It also prevents future callers from
+                // joining an older flight, without cancelling that flight's existing readers.
+                if fresh { joinable.removeValue(forKey: key) } else { joinable[key] = id }
+                flights[id] = Flight(key: key, task: nil, waiters: [waiter: Waiter(continuation: continuation, cancellation: cancellation)])
+                waiterFlights[waiter] = id
+                let resolver = resolveSource
+                let task = Task { [weak self] in
+                    let result: Result<NativeMediaSource, any Error>
+                    do {
+                        let source = try await resolver(episodeID, contentType, quality)
+                        try Task.checkCancellation()
+                        guard source.preference == quality else { throw NativeSourceError(code: "INVALID_RESPONSE") }
+                        result = .success(source)
+                    } catch { result = .failure(error) }
+                    await self?.complete(id: id, result: result)
+                }
+                flights[id]?.task = task
+            }
+        } onCancel: {
+            // Mark synchronously so a completion queued before actor cleanup cannot cache
+            // a result belonging only to cancelled consumers.
+            cancellation.cancel()
+            Task { await self.cancel(waiter: waiter) }
+        }
+        try Task.checkCancellation()
+        return source
+    }
+
+    private func cancel(waiter: UUID) {
+        guard let id = waiterFlights.removeValue(forKey: waiter), var flight = flights[id],
+              let removed = flight.waiters.removeValue(forKey: waiter) else { return }
+        removed.continuation.resume(throwing: CancellationError())
+        guard flight.waiters.isEmpty else { flights[id] = flight; return }
+        // Keep a cancelled worker counted until it acknowledges completion, so even an
+        // uncooperative injected transport cannot create unbounded detached work.
+        flights[id] = flight; flight.task?.cancel()
+        if joinable[flight.key] == id { joinable.removeValue(forKey: flight.key) }
+        if requests[flight.key] == id { requests.removeValue(forKey: flight.key) }
+    }
+
+    private func complete(id: UUID, result: Result<NativeMediaSource, any Error>) {
+        guard let flight = flights.removeValue(forKey: id) else { return }
+        let activeWaiters = flight.waiters.values.contains { !$0.cancellation.isCancelled }
+        if requests[flight.key] == id {
+            requests.removeValue(forKey: flight.key)
+            if activeWaiters, case .success(let source) = result {
+                access &+= 1; cache[flight.key] = Entry(source: source, expires: now().addingTimeInterval(120), access: access)
                 while cache.count > 16, let oldest = cache.min(by: { $0.value.access < $1.value.access }) { cache.removeValue(forKey: oldest.key) }
             }
-            return source
-        } catch {
-            if requests[key] == request { requests.removeValue(forKey: key) }
-            throw error
+        }
+        if joinable[flight.key] == id { joinable.removeValue(forKey: flight.key) }
+        for (waiter, value) in flight.waiters {
+            waiterFlights.removeValue(forKey: waiter)
+            if value.cancellation.isCancelled { value.continuation.resume(throwing: CancellationError()) }
+            else { value.continuation.resume(with: result) }
         }
     }
 }
