@@ -1,6 +1,25 @@
 # 驗證紀錄
 
-更新：2026-11-07，當前版本 0.8.0／build 19。本輪加入依目前片庫排序的本機推薦、試看位置接續正式播放，以及空白點按顯隱／中央播放控制。預設內建取源與 progressive Range 播放不使用帳號憑據。
+更新：2026-11-07，當前版本 0.8.1／build 20。本輪修正推薦試看外螢幕底部安全區黑帶，保留本機推薦、試看接續與中央播放控制。預設內建取源與 progressive Range 播放不使用帳號憑據。
+
+## 0.8.1 試看底部安全區
+
+使用者回報外螢幕推薦下方有黑邊。本輪以外螢幕直向重現：影片已使用填滿模式，Card 的 region 與 bounds 都是 382×644 pt，並非影片比例或 Duo 避讓另外縮短畫布；畫布外另留有 34 pt 底部安全區。修正後 pager 與每張卡片同為 382×678 pt，region 仍與 bounds 相同，HUD 的獨立安全底距為 34 pt，原生側邊保留區仍是 84 pt。修正前量測為 `build/preview-edge-canvas-before.stderr.log`，修補階段為 `build/preview-edge-after.stderr.log`，正式 build 20 為 `build/preview-edge-final.stderr.log`。
+
+最終 Core／AppSupport 完整回歸仍登錄 376 項：Core 317 項／40 個 suites（316 通過、1 項可選 `currentWebsiteSnapshot` 略過），AppSupport 59 項／5 個 suites 全數通過；`build/core-0.8.1-validated-tests.log`。這次沒有新增鏡像布局測試。Duo 模擬器與 iPhoneOS／arm64 Debug build 20 均建置成功，且嚴格簽章檢查通過；記錄為 `build/ios-0.8.1-build20-final.log`、`build/ios-real-device-0.8.1-build20-final.log`。102 個 App 原碼雜湊與兩平台版號保存在 `build/ios-0.8.1-build20-validation.json`；公開工程團隊保持空白，未另外產生 Release IPA。
+
+程式提交 `224b171` 的 [GitHub Actions](https://github.com/Mountain-P/Hongguo-iPhone-Duo/actions/runs/42363353796) 核心測試同樣通過，登錄 376 項／45 個 suites，含同一項可選快照略過。遠端 runner 的 App 建置因缺少 Duo SDK 明確略過，兩平台實際建置以上述本機結果為準。
+
+當次模擬器觀察：
+
+- 外螢幕直向的實際影片已延伸至底部，原固定黑帶消失，原生側欄仍保留。試看底圖改為等比填滿，選劇網格海報沿用完整比例。
+- 延伸後仍以同一 GeometryReader 決定每頁高度與座標，保留頁面裁切和穩定 ID。修補階段一次拖曳停穩時為 offset 2712、當頁 minY 0、idle 1、aligned 4，接著出現首集準備；沒有用 offset／舊頁高猜目前卡片。
+- 正式 build 20 看到動態影片及底部滿版畫面，中央按鈕可暫停於約 49%；點片名進詳情再返回，同卡與位置仍保留，等待手動繼續。外螢幕旋轉後診斷為 594×466 pt，頁面仍對齊；展開直向時，海報延伸至原生底部分頁列後方，資訊與「追這部」按鈕保留在分頁列上方。
+- 準備／取消及錯誤浮層亦獨立套用安全底距，沒有替整個 pager 增加 padding。該保護由程式核對及兩平台建置驗證，本輪未另外注入每一種錯誤畫面。
+
+測後已收合並正常重新啟動至首頁，未保留診斷啟動旗標；沒有新增真人帳號操作、收藏變更或正式觀看紀錄。本輪不是實機手勢、長播／耗電、所有折疊角度或精準單次滑動距離的驗收。手機部署結果如下。
+
+同一批 build 20 已經既有無線通道覆蓋安裝，App 清單讀回 0.8.1／20，沒有刪除 App 或重新登入。首次啟動遇到 RSD 連線配置失敗；重新確認通道已連線後，iOS 明確因手機鎖定拒絕啟動，已請使用者解鎖，不能將安裝成功當成啟動通過。證據為本機 `build/ios-real-device-0.8.1-build20-install.json`、`build/ios-real-device-0.8.1-build20-app.json`、`build/ios-real-device-0.8.1-build20-launch.json`、`build/ios-real-device-0.8.1-build20-details.json`、`build/ios-real-device-0.8.1-build20-launch-recheck.json`。裝置與簽署識別只保留本機。
 
 ## 0.8.0 推薦、試看接續與中央控制
 

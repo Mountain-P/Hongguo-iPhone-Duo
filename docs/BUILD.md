@@ -2,7 +2,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.8.0／build 19，加入依目前片庫排序的本機推薦、試看位置直接接續正式播放，以及空白點按顯隱／中央播放按鈕；保留畫質偏好、有界海報、片庫管理與原生手機簡訊登入。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.8.1／build 20，修正推薦試看底部安全區黑帶，影片延伸到底部，浮動控制另保留安全間距；保留本機推薦、試看接續、中央播放按鈕、畫質偏好與原生手機簡訊登入。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
