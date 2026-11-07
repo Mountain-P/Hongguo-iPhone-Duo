@@ -20,7 +20,9 @@
 
 測試期間 Device Hub 曾回傳失效 AX、`noWindowsAvailable` 與無法擷取畫面，重新連線後可繼續原生按鈕及無障礙操作；座標拖曳無法在收尾時穩定重現，因此不將早期短程拖曳結果宣稱為最終版完整手勢驗收。iOS 17 相容分支、長按持續時間與取消手感、所有姿態與真機長時間播放仍未在本輪完整驗證。
 
-本輪較早的 0.4.4 Debug 曾使用既有開發團隊簽署並通過嚴格驗證，經已配對 iPhone 的 `localNetwork` 連線安裝、啟動及讀回 0.4.4／build 14（`build/ios-wireless-0.4.4-build14-install.json`、`launch.json`、`app.json`，後兩者沿用同一檔名前綴）。後續手勢修正版雖再次安裝成功，啟動時無線連線逾時；使用者隨後指示先以模擬器驗證，因此最後的分頁完成判斷尚未再送到手機，不能只憑相同版號宣稱手機已有最終程式。裝置與簽署識別、帳號、片單及私人產物不放入公開倉庫。無線安裝／啟動不當作本版真機手勢、帳號或長時間播放驗收；本輪未另產生未簽署 Release IPA。
+本輪較早的 0.4.4 Debug 曾使用既有開發團隊簽署並通過嚴格驗證，經已配對 iPhone 的 `localNetwork` 連線安裝、啟動及讀回 0.4.4／build 14（`build/ios-wireless-0.4.4-build14-install.json`、`launch.json`、`app.json`，後兩者沿用同一檔名前綴）。後續手勢修正版雖再次安裝成功，啟動時無線連線逾時；使用者當時指示先以模擬器驗證，因此該次無線結果不能僅憑相同版號證明手機已有最終分頁修正。
+
+之後使用者以 USB 連接並解鎖 iPhone，裝置確認為有線且已連線。最終 Debug 重新建置自 `19530ec`，嚴格簽署驗證通過；預覽來源與 App 程式碼 SHA256 再次核對，與 `build/ios-wireless-0.4.4-build14-delivery-validation.json` 記錄一致。USB 安裝、啟動及 App 清單查詢均回報 `info.outcome=success`，讀回版本為 0.4.4／build 14。證據：`build/ios-real-device-0.4.4-build14-delivery-build.log`、`build/ios-usb-0.4.4-build14-delivery-install.json`、`build/ios-usb-0.4.4-build14-delivery-launch.json`、`build/ios-usb-0.4.4-build14-delivery-app.json`。無線連線後續可用性尚未另外重驗。這證明最終程式已透過 USB 安裝並啟動，不作為本版真機手勢、帳號或長時間播放驗收。裝置與簽署識別、帳號、片單及私人產物不放入公開倉庫；本輪未另產生未簽署 Release IPA。
 
 ## 0.4.3 播放狀態與推薦試看
 
