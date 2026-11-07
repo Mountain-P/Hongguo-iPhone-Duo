@@ -281,12 +281,9 @@ struct RecommendationPreviewView: View {
     }
 
     private var alignedID: String? {
-        if let contentOffset {
-            let index = Int((contentOffset / viewportHeight).rounded())
-            guard preview.items.indices.contains(index),
-                  abs(contentOffset - CGFloat(index) * viewportHeight) <= 2 else { return nil }
-            return preview.items[index].id
-        }
+        // The system's available scroll viewport can change with Duo bars and
+        // rotation independently of the outer GeometryReader. Measured card
+        // origins share the actual viewport coordinates used by viewAligned.
         let known = Set(preview.items.map(\.id))
         guard let closest = frames.filter({ known.contains($0.key) }).min(by: { abs($0.value) < abs($1.value) }),
               abs(closest.value) <= 2 else { return nil }
@@ -294,10 +291,6 @@ struct RecommendationPreviewView: View {
     }
 
     private func intersectsViewport(_ id: String) -> Bool {
-        if let contentOffset, let index = preview.items.firstIndex(where: { $0.id == id }) {
-            let top = CGFloat(index) * viewportHeight - contentOffset
-            return top > -viewportHeight && top < viewportHeight
-        }
         guard let top = frames[id] else { return false }
         return top > -viewportHeight && top < viewportHeight
     }
@@ -326,6 +319,15 @@ struct RecommendationPreviewView: View {
         let sourceMatches = preview.revision == model.revision && preview.filterRevision == model.recommendationFilterRevision
         let aligned = alignedID
         let commandHasArrived = pendingScrollTarget == nil || pendingScrollTarget == aligned
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-preview-layout-diagnostics") {
+            let nearest = frames.values.min(by: { abs($0) < abs($1) }) ?? -9999
+            NSLog("PreviewLayout height=%.2f offset=%.2f nearest=%.2f idle=%d pending=%d aligned=%d",
+                  Double(viewportHeight), Double(contentOffset ?? -9999), Double(nearest),
+                  phaseIsIdle ? 1 : 0, pendingScrollTarget == nil ? 0 : 1,
+                  aligned.flatMap { id in preview.items.firstIndex(where: { $0.id == id }) } ?? -1)
+        }
+        #endif
         if commandHasArrived { pendingScrollTarget = nil }
         preview.update(selectedID: commandHasArrived ? aligned : nil, isIdle: phaseIsIdle,
             isActive: isVisible && tabIsActive && sourceMatches && !showingPreferences && !requiresManualResume,
@@ -345,7 +347,7 @@ struct RecommendationPreviewView: View {
     private func framesChanged(_ next: [String: CGFloat]) {
         frames = next
         if #available(iOS 18.0, *) {
-            if contentOffset == nil { refreshEligibility() }
+            refreshEligibility()
         }
         else { scheduleFallbackSettle() }
     }
