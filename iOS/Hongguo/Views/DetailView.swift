@@ -124,10 +124,14 @@ struct DetailView: View {
                     Text(current.tags.joined(separator: " · ")).font(.caption).foregroundStyle(Theme.muted)
                 }
                 if let detail, hasCurrentSnapshot { Text("共 \(detail.episodes.count) 集").font(.caption).foregroundStyle(Theme.muted) }
-                Button { model.toggleFavorite(current) } label: {
+                Button {
+                    guard hasCurrentSnapshot else { return }
+                    model.toggleFavorite(current)
+                } label: {
                     Label(model.isFavorite(current) ? "已收藏" : "加入收藏", systemImage: model.isFavorite(current) ? "heart.fill" : "heart")
                         .font(.subheadline.weight(.semibold))
                 }.buttonStyle(.bordered).controlSize(.large)
+                    .disabled(!hasCurrentSnapshot)
             }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }
