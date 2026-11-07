@@ -188,7 +188,9 @@ final class AppModel: ObservableObject {
         var next = recommendationPreferences
         do {
             try next.setNotInterested(seriesID: series.id, value: value)
-            saveRecommendationPreferences(next, changesFilter: true)
+            // A single exclusion is applied to the live queue in place. Restoring a
+            // work restarts discovery so already-seen IDs can become eligible again.
+            saveRecommendationPreferences(next, changesFilter: !value)
         } catch { persistenceError = "無法更新這部劇的推薦偏好。" }
     }
 

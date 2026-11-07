@@ -2,6 +2,12 @@ import Foundation
 
 /// A bounded cursor over real catalogue pages. Previewing never mutates a user's library.
 public struct RecommendationPreviewQueue: Sendable {
+    public struct ExclusionChange: Equatable, Sendable {
+        public let removedIDs: Set<String>
+        public let previousCurrentID: String?
+        public let currentID: String?
+        public var currentChanged: Bool { previousCurrentID != currentID }
+    }
     public struct PageRequest: Hashable, Sendable {
         public let page: Int
         fileprivate let generation: UUID
@@ -19,6 +25,7 @@ public struct RecommendationPreviewQueue: Sendable {
     private var generation = UUID()
     private var pendingPage: PageRequest?
     private var seenIDs: Set<String> = []
+    private var excludedIDs: Set<String> = []
     private static let maximumPages = 100
     private static let maximumPageItems = 100
     private static let maximumSeenIDs = 10_000
@@ -32,7 +39,7 @@ public struct RecommendationPreviewQueue: Sendable {
     public var hasNext: Bool { currentIndex.map { $0 + 1 < items.count } ?? false }
 
     public mutating func reset() {
-        generation = UUID(); pendingPage = nil; seenIDs = []
+        generation = UUID(); pendingPage = nil; seenIDs = []; excludedIDs = []
         items = []; currentIndex = nil; page = 0; hasMore = true
     }
 
@@ -60,12 +67,16 @@ public struct RecommendationPreviewQueue: Sendable {
         // Source pages still advance when every valid item was excluded by local choices.
         // Reset the queue when restoring/changing choices to revisit previously excluded IDs.
         let additions = result.items.filter {
-            seen.insert($0.id).inserted && (preferences?.allows(seriesID: $0.id) ?? true)
+            seen.insert($0.id).inserted && !excludedIDs.contains($0.id)
+                && (preferences?.allows(seriesID: $0.id) ?? true)
         }
         guard seen.count <= Self.maximumSeenIDs else { throw CatalogError.responseTooLarge }
         // The current and visited cards remain anchored to their stable IDs.
         // Local ranking only changes a newly arrived batch after validation.
-        var combined = items + ranking(additions)
+        let allowedIDs = Set(additions.map(\.id))
+        var rankedIDs: Set<String> = []
+        let ranked = ranking(additions).filter { allowedIDs.contains($0.id) && rankedIDs.insert($0.id).inserted }
+        var combined = items + ranked
         var index = currentIndex ?? (combined.isEmpty ? nil : 0)
         if combined.count > capacity {
             let removeCount = combined.count - capacity
@@ -81,6 +92,27 @@ public struct RecommendationPreviewQueue: Sendable {
     }
 
     public mutating func cancelPageRequest() { pendingPage = nil }
+
+    /// Remove only explicit dislikes in place. Preview exposure never removes an existing card.
+    /// The pending source page, its cursor and seen IDs remain valid; even a stale page caller
+    /// without a fresh preferences snapshot cannot reinsert a currently excluded work.
+    @discardableResult
+    public mutating func excludeNotInterested(using preferences: RecommendationPreferences) -> ExclusionChange {
+        excludedIDs = Set(preferences.notInterestedIDs)
+        let previous = current?.id
+        let removed = Set(items.filter { excludedIDs.contains($0.id) }.map(\.id))
+        guard !removed.isEmpty else {
+            return .init(removedIDs: [], previousCurrentID: previous, currentID: previous)
+        }
+        var replacement = previous
+        if let index = currentIndex, let previous, removed.contains(previous) {
+            replacement = items.dropFirst(index + 1).first(where: { !removed.contains($0.id) })?.id
+                ?? items.prefix(index).last(where: { !removed.contains($0.id) })?.id
+        }
+        items.removeAll { removed.contains($0.id) }
+        currentIndex = replacement.flatMap { id in items.firstIndex(where: { $0.id == id }) }
+        return .init(removedIDs: removed, previousCurrentID: previous, currentID: current?.id)
+    }
 
     /// Scroll positions use stable series IDs; trimming older cards cannot retarget one.
     @discardableResult

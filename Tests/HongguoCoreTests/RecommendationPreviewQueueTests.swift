@@ -183,6 +183,96 @@ struct RecommendationPreviewQueueTests {
         #expect(!queue.hasMore)
     }
 
+    @Test func excludingCurrentChoosesTheNextSurvivorWithoutResettingAPendingPage() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10", "20", "30", "40"], more: true), for: queue.beginPageRequest()!)
+        queue.select(seriesID: "20")
+        let nextPage = queue.beginPageRequest()!
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "20", value: true)
+        try preferences.setNotInterested(seriesID: "30", value: true)
+        let change = queue.excludeNotInterested(using: preferences)
+        #expect(change.removedIDs == ["20", "30"])
+        #expect(change.previousCurrentID == "20" && change.currentID == "40")
+        #expect(queue.page == 1 && queue.hasMore)
+        #expect(queue.beginPageRequest() == nil)
+        // Simulate an in-flight caller holding an old preferences snapshot.
+        try queue.receive(page(2, ["20", "30", "50"], more: false), for: nextPage)
+        #expect(queue.items.map(\.id) == ["10", "40", "50"])
+        #expect(queue.current?.id == "40")
+        #expect(queue.page == 2 && !queue.hasMore)
+    }
+
+    @Test func excludingBeforeCurrentRetainsItsIDAndExcludingLastFallsBackToPrevious() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10", "20", "30"], more: false), for: queue.beginPageRequest()!)
+        queue.select(seriesID: "30")
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "10", value: true)
+        let first = queue.excludeNotInterested(using: preferences)
+        #expect(!first.currentChanged)
+        #expect(queue.current?.id == "30" && queue.currentIndex == 1)
+        try preferences.setNotInterested(seriesID: "30", value: true)
+        let last = queue.excludeNotInterested(using: preferences)
+        #expect(last.currentID == "20")
+        #expect(queue.currentIndex == 0 && queue.page == 1 && !queue.hasMore)
+    }
+
+    @Test func anEmptyExcludedPageContinuesAtTheNextPageAndBlocksUnseenHiddenIDs() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10"], more: true), for: queue.beginPageRequest()!)
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "10", value: true)
+        try preferences.setNotInterested(seriesID: "20", value: true)
+        let change = queue.excludeNotInterested(using: preferences)
+        #expect(change.currentID == nil && queue.items.isEmpty)
+        #expect(queue.page == 1 && queue.hasMore)
+        let pending = queue.beginPageRequest()
+        let request = try #require(pending)
+        #expect(request.page == 2)
+        try queue.receive(page(2, ["10", "20", "30"], more: false), for: request)
+        #expect(queue.items.map(\.id) == ["30"])
+        #expect(queue.current?.id == "30")
+    }
+
+    @Test func excludingOnlyDislikesNeverRemovesAnAlreadyPreviewedCurrentCard() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10", "20"], more: true), for: queue.beginPageRequest()!)
+        var preferences = RecommendationPreferences(skipsPreviewed: true)
+        try preferences.markPreviewed(seriesID: "10")
+        let change = queue.excludeNotInterested(using: preferences)
+        #expect(change.removedIDs.isEmpty && !change.currentChanged)
+        #expect(queue.current?.id == "10" && queue.items.count == 2)
+        try preferences.setNotInterested(seriesID: "20", value: true)
+        queue.excludeNotInterested(using: preferences)
+        #expect(queue.items.map(\.id) == ["10"])
+    }
+
+    @Test func restoringPreferencesAndResettingCanRevisitAnExcludedWork() throws {
+        var queue = RecommendationPreviewQueue()
+        try queue.receive(page(1, ["10"], more: true), for: queue.beginPageRequest()!)
+        let stale = queue.beginPageRequest()!
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "10", value: true)
+        queue.excludeNotInterested(using: preferences)
+        preferences.clearNotInterested()
+        queue.reset()
+        #expect(try !queue.receive(page(2, ["20"], more: false), for: stale))
+        try queue.receive(page(1, ["10"], more: false), for: queue.beginPageRequest()!, preferences: preferences)
+        #expect(queue.current?.id == "10")
+    }
+
+    @Test func rankingCannotReintroduceHiddenOrForeignOrRepeatedCandidates() throws {
+        var queue = RecommendationPreviewQueue()
+        var preferences = RecommendationPreferences()
+        try preferences.setNotInterested(seriesID: "10", value: true)
+        queue.excludeNotInterested(using: preferences)
+        try queue.receive(page(1, ["10", "20"], more: false), for: queue.beginPageRequest()!, ranking: {
+            [.init(id: "10", title: "已隱藏"), .init(id: "999", title: "非來源")] + $0 + $0
+        })
+        #expect(queue.items.map(\.id) == ["20"])
+    }
+
     private func page(_ number: Int, _ ids: [String], more: Bool) -> SeriesPage {
         .init(items: ids.map { .init(id: $0, title: "劇集\($0)") }, page: number, hasMore: more)
     }

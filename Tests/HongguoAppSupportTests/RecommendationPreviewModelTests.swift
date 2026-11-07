@@ -1,0 +1,233 @@
+import Foundation
+import Testing
+import HongguoCore
+@testable import HongguoAppSupport
+
+@MainActor
+struct RecommendationPreviewModelTests {
+    private let scope = LibraryScope(owner: .guest, sourceID: "test-source")
+
+    @Test func hidingCurrentRejectsItsLateDetailAndPreservesOtherCachedCards() async throws {
+        let source = PreviewCatalogueGate()
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("10", model, source)
+        try await prepare("20", model, source)
+        let first = try #require(model.media["10"]?.id)
+        let second = try #require(model.media["20"]?.id)
+        activate("30", model)
+        try await wait { await source.hasDetail("30") }
+        let stale = try #require(model.detailTask)
+        let change = model.excludeNotInterested(try hidden(["30"]))
+        #expect(change.currentID == "20")
+        #expect(model.lease == nil && model.loadingID == nil)
+        await source.releaseDetail("30")
+        await stale.value
+        #expect(model.media["30"] == nil)
+        #expect(model.media["10"]?.id == first && model.media["20"]?.id == second)
+        #expect(model.queue.page == 1 && !model.queue.hasMore)
+        #expect(await source.homeRequests == [1])
+    }
+
+    @Test func aPageAlreadyInFlightUsesLatestExclusionsWithoutLosingItsCursor() async throws {
+        let source = PreviewCatalogueGate()
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20"], more: true)
+        model.loadMoreIfNeeded(force: true)
+        try await wait { await source.hasHome(2) }
+        let pageTask = try #require(model.catalogueTask)
+        model.excludeNotInterested(try hidden(["10", "30"]))
+        #expect(model.catalogueTask != nil && model.queue.page == 1)
+        await source.releaseHome(2, ids: ["10", "30", "40"])
+        await pageTask.value
+        #expect(model.items.map(\.id) == ["20", "40"])
+        #expect(model.current?.id == "20" && model.queue.page == 2)
+        #expect(await source.homeRequests == [1, 2])
+    }
+
+    @Test func anEmptyFeedContinuesAtPageTwoAndOnlyExplicitReloadRestartsIt() async throws {
+        let source = PreviewCatalogueGate()
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10"], more: true)
+        model.excludeNotInterested(try hidden(["10"]))
+        #expect(model.items.isEmpty && model.queue.page == 1 && model.queue.hasMore)
+        model.loadInitial()
+        try await wait { await source.hasHome(2) }
+        let continuation = try #require(model.catalogueTask)
+        await source.releaseHome(2, ids: ["10", "20"])
+        await continuation.value
+        #expect(model.items.map(\.id) == ["20"] && model.queue.page == 2)
+        model.excludeNotInterested(try hidden(["10", "20"]))
+        model.loadInitial()
+        #expect(model.items.isEmpty && model.catalogueTask == nil && !model.queue.hasMore)
+        #expect(await source.homeRequests == [1, 2])
+        model.reloadEmptyCatalogue()
+        try await wait { await source.hasHome(1) }
+        let reload = try #require(model.catalogueTask)
+        await source.releaseHome(1, ids: ["30"])
+        await reload.value
+        #expect(model.items.map(\.id) == ["30"] && model.queue.page == 1)
+        #expect(await source.homeRequests == [1, 2, 1])
+    }
+
+    @Test func removingAnOffscreenCardKeepsTheCurrentLeaseAndMediaIdentity() async throws {
+        let source = PreviewCatalogueGate()
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("20", model, source)
+        let lease = try #require(model.lease)
+        let media = try #require(model.media["20"]?.id)
+        var preferences = try hidden(["10"])
+        preferences.skipsPreviewed = true
+        try preferences.markPreviewed(seriesID: "20")
+        let change = model.excludeNotInterested(preferences)
+        #expect(!change.currentChanged)
+        #expect(model.current?.id == "20" && model.lease == lease)
+        #expect(model.media["20"]?.id == media)
+        #expect(model.items.map(\.id) == ["20", "30"])
+    }
+
+    @Test func excludingACachedNeighborPrefetchesTheNextLegalCardAndRejectsLateOldWork() async throws {
+        let source = PreviewCatalogueGate()
+        let model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20", "30"])
+        try await prepare("20", model, source)
+        try await prepare("10", model, source)
+        let currentMedia = try #require(model.media["10"]?.id)
+        let currentLease = try #require(model.lease)
+        model.setPrefetchAllowed(true)
+        model.didStartPreview(seriesID: "10")
+        try await wait { await source.hasPlayback("20") }
+        let oldPrefetch = try #require(model.prefetchTask)
+        model.excludeNotInterested(try hidden(["20"]))
+        #expect(model.lease == currentLease && model.media["10"]?.id == currentMedia)
+        #expect(model.media["20"] == nil)
+        try await wait { await source.hasDetail("30") }
+        await source.releaseDetail("30")
+        try await wait { await source.hasPlayback("30") }
+        let newPrefetch = try #require(model.prefetchTask)
+        await source.releasePlayback("20")
+        await oldPrefetch.value
+        #expect(model.prefetchTask != nil)
+        #expect(model.media["20"] == nil && model.media["30"] != nil)
+        await source.releasePlayback("30")
+        await newPrefetch.value
+        #expect(model.media["10"]?.id == currentMedia)
+        #expect(await source.playbackRequests == ["20", "30"])
+        #expect(await source.homeRequests == [1])
+    }
+
+    @Test func sourceAndOwnerReplacementStillRejectAnOldCatalogueResponse() async throws {
+        let oldSource = PreviewCatalogueGate(), newSource = PreviewCatalogueGate()
+        let model = configured(oldSource)
+        defer { cleanUp(model, oldSource); Task { await newSource.finishAll() } }
+        model.loadInitial()
+        try await wait { await oldSource.hasHome(1) }
+        let stale = try #require(model.catalogueTask)
+        let account = LibraryScope(owner: .account(id: "test-account"), sourceID: "other-source")
+        model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(category: .comicDrama),
+                        profile: .init(scope: account, favorites: [], history: []), scope: account,
+                        catalogue: newSource, playback: newSource)
+        model.loadInitial()
+        try await wait { await newSource.hasHome(1) }
+        let current = try #require(model.catalogueTask)
+        await oldSource.releaseHome(1, ids: ["10"])
+        await stale.value
+        #expect(model.items.isEmpty && model.rankingScope == account)
+        await newSource.releaseHome(1, ids: ["20"])
+        await current.value
+        #expect(model.items.map(\.id) == ["20"])
+    }
+
+    private func configured(_ source: PreviewCatalogueGate) -> RecommendationPreviewModel {
+        let model = RecommendationPreviewModel()
+        model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
+                        profile: .init(scope: scope, favorites: [], history: []), scope: scope,
+                        catalogue: source, playback: source)
+        return model
+    }
+    private func hidden(_ ids: [String]) throws -> RecommendationPreferences {
+        var preferences = RecommendationPreferences()
+        for id in ids { try preferences.setNotInterested(seriesID: id, value: true) }
+        return preferences
+    }
+    private func activate(_ id: String, _ model: RecommendationPreviewModel) {
+        model.update(selectedID: id, isIdle: true, isActive: true, isSceneActive: true, isDetailPresented: false)
+    }
+    private func loadFirst(_ model: RecommendationPreviewModel, _ source: PreviewCatalogueGate,
+                           ids: [String], more: Bool = false) async throws {
+        model.loadInitial()
+        try await wait { await source.hasHome(1) }
+        let task = try #require(model.catalogueTask)
+        await source.releaseHome(1, ids: ids, more: more)
+        await task.value
+    }
+    private func prepare(_ id: String, _ model: RecommendationPreviewModel, _ source: PreviewCatalogueGate) async throws {
+        activate(id, model)
+        try await wait { await source.hasDetail(id) }
+        let task = try #require(model.detailTask)
+        await source.releaseDetail(id)
+        await task.value
+        #expect(model.media[id] != nil)
+    }
+    private func wait(_ condition: () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        Issue.record("A controlled catalogue operation never entered its barrier")
+        throw CancellationError()
+    }
+    private func cleanUp(_ model: RecommendationPreviewModel, _ source: PreviewCatalogueGate) {
+        model.suspend()
+        Task { await source.finishAll() }
+    }
+}
+
+/// Deliberately ignores task cancellation until release, exercising stale-response guards.
+private actor PreviewCatalogueGate: CatalogService {
+    private(set) var homeRequests: [Int] = []
+    private(set) var playbackRequests: [String] = []
+    private var homes: [Int: CheckedContinuation<SeriesPage, any Error>] = [:]
+    private var details: [String: CheckedContinuation<SeriesDetail, any Error>] = [:]
+    private var playbacks: [String: CheckedContinuation<PlaybackSource, any Error>] = [:]
+
+    func home(page: Int) async throws -> SeriesPage {
+        homeRequests.append(page)
+        return try await withCheckedThrowingContinuation { homes[page] = $0 }
+    }
+    func detail(id: String) async throws -> SeriesDetail {
+        try await withCheckedThrowingContinuation { details[id] = $0 }
+    }
+    func search(query: String, page: Int) async throws -> SeriesPage { throw CatalogError.network }
+    func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
+        playbackRequests.append(seriesID)
+        return try await withCheckedThrowingContinuation { playbacks[seriesID] = $0 }
+    }
+    func hasHome(_ page: Int) -> Bool { homes[page] != nil }
+    func hasDetail(_ id: String) -> Bool { details[id] != nil }
+    func hasPlayback(_ id: String) -> Bool { playbacks[id] != nil }
+    func releaseHome(_ page: Int, ids: [String], more: Bool = false) {
+        homes.removeValue(forKey: page)?.resume(returning: .init(items: ids.map { .init(id: $0, title: "劇\($0)") }, page: page, hasMore: more))
+    }
+    func releaseDetail(_ id: String) {
+        details.removeValue(forKey: id)?.resume(returning: .init(series: .init(id: id, title: "劇\(id)"),
+            episodes: [.init(id: "\(id)1", number: 1, title: "第1集")]))
+    }
+    func releasePlayback(_ id: String) {
+        playbacks.removeValue(forKey: id)?.resume(returning: .init(url: URL(string: "https://example.invalid/test.mp4")!))
+    }
+    func finishAll() {
+        let home = Array(homes.values), detail = Array(details.values), playback = Array(playbacks.values)
+        homes = [:]; details = [:]; playbacks = [:]
+        for continuation in home { continuation.resume(throwing: CancellationError()) }
+        for continuation in detail { continuation.resume(throwing: CancellationError()) }
+        for continuation in playback { continuation.resume(throwing: CancellationError()) }
+    }
+}

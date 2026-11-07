@@ -31,8 +31,10 @@ public struct RecommendationPreferences: Codable, Equatable, Sendable {
     public mutating func clearPreviewed() { previewedIDs = [] }
     public mutating func reset() { self = .init() }
 
+    public func isNotInterested(seriesID: String) -> Bool { notInterestedIDs.contains(seriesID) }
+
     public func allows(seriesID: String) -> Bool {
-        (try? Self.validate(seriesID)) != nil && !notInterestedIDs.contains(seriesID)
+        (try? Self.validate(seriesID)) != nil && !isNotInterested(seriesID: seriesID)
             && (!skipsPreviewed || !previewedIDs.contains(seriesID))
     }
 
