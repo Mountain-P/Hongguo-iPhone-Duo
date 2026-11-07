@@ -159,13 +159,6 @@ struct PlayerScreen: View {
                 else { dismiss() }
             } label: { Label("關閉", systemImage: "chevron.down") }
         }
-        ToolbarItem(placement: .primaryAction) {
-            Button {
-                togglePlaybackFromUser()
-            } label: { Label(model.canPausePlayback ? "暫停" : "播放", systemImage: model.canPausePlayback ? "pause.fill" : "play.fill") }
-                .disabled(model.isLoading || model.duration <= 0)
-                .accessibilityIdentifier("player.playPause")
-        }
         if isPreview, let onOpenSeries {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -330,12 +323,13 @@ struct PlayerScreen: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 guard !boostStarted, Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
-                togglePlaybackFromUser()
+                toggleControlsVisibility()
             }
             .simultaneousGesture(speedBoostGesture)
             .simultaneousGesture(seriesSwipeGesture)
             .accessibilityLabel("影片")
             .accessibilityAddTraits(.isButton)
+            .accessibilityAction { showControls() }
             .accessibilityAction(named: Text("顯示播放控制")) { showControls() }
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放")) {
                 togglePlaybackFromUser()
@@ -445,6 +439,12 @@ struct PlayerScreen: View {
         hideTask?.cancel()
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = true }
         scheduleAutoHide()
+    }
+
+    private func toggleControlsVisibility() {
+        hideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
+        if controlsVisible { scheduleAutoHide() }
     }
 
     private func scheduleAutoHide() {
