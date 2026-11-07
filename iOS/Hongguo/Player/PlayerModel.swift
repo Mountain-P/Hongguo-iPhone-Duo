@@ -283,6 +283,13 @@ final class PlayerModel: ObservableObject {
         select(nextEpisode)
     }
 
+    func navigateEpisode(_ direction: EpisodeNavigation.Direction) -> EpisodeNavigation.Result {
+        guard !isPreview, sceneActive else { return .missingCurrent }
+        let result = EpisodeNavigation.adjacent(to: currentEpisode?.id, in: episodes, direction: direction)
+        if case .episode(let episode) = result { select(episode) }
+        return result
+    }
+
     func pauseAndSave() {
         if let id = diagnosticsID { PlaybackDiagnostics.shared.recordPause(id: id) }
         cancelNextEpisodePrefetch()

@@ -82,6 +82,70 @@ struct EpisodeSelectionTests {
         #expect(throws: EpisodeSelectionError.episodeNotFound) { try index.resolve(numberText: "1") }
     }
 
+    @Test func adjacentNavigationSortsUnorderedEpisodesBeforeMovingBothDirections() {
+        let source = episodes(3)
+        let unordered = [source[2], source[0], source[1]]
+        #expect(EpisodeNavigation.adjacent(to: source[1].id, in: unordered, direction: .next) == .episode(source[2]))
+        #expect(EpisodeNavigation.adjacent(to: source[1].id, in: unordered, direction: .previous) == .episode(source[0]))
+        #expect(unordered.map(\.number) == [3, 1, 2])
+    }
+
+    @Test func adjacentNavigationReportsFirstAndLastWithoutProducingAPlaybackTarget() {
+        let source = episodes(3)
+        #expect(EpisodeNavigation.adjacent(to: source[0].id, in: source, direction: .previous) == .first)
+        #expect(EpisodeNavigation.adjacent(to: source[2].id, in: source, direction: .next) == .last)
+        #expect(EpisodeNavigation.adjacent(to: source[0].id, in: source, direction: .next) == .episode(source[1]))
+        #expect(EpisodeNavigation.adjacent(to: source[2].id, in: source, direction: .previous) == .episode(source[1]))
+    }
+
+    @Test func aSingleEpisodeHasBothBoundaries() {
+        let source = episodes(1)
+        #expect(EpisodeNavigation.adjacent(to: source[0].id, in: source, direction: .previous) == .first)
+        #expect(EpisodeNavigation.adjacent(to: source[0].id, in: source, direction: .next) == .last)
+    }
+
+    @Test func anUnavailableNextEpisodeIsNotSkippedForALaterAvailableEpisode() {
+        var source = episodes(3)
+        source[1].isAvailable = false
+        #expect(EpisodeNavigation.adjacent(to: source[0].id, in: source, direction: .next) == .unavailable(source[1]))
+        #expect(source[2].isAvailable)
+    }
+
+    @Test func anUnavailablePreviousEpisodeIsNotSkippedForAnEarlierAvailableEpisode() {
+        var source = episodes(3)
+        source[1].isAvailable = false
+        #expect(EpisodeNavigation.adjacent(to: source[2].id, in: source, direction: .previous) == .unavailable(source[1]))
+        #expect(source[0].isAvailable)
+    }
+
+    @Test func missingCurrentAndEmptyCataloguesNeverPretendToBeABoundary() {
+        let source = episodes(2)
+        for direction in [EpisodeNavigation.Direction.previous, .next] {
+            for missing: String? in [nil, "", "unknown"] {
+                #expect(EpisodeNavigation.adjacent(to: missing, in: source, direction: direction) == .missingCurrent)
+            }
+            #expect(EpisodeNavigation.adjacent(to: source[0].id, in: [], direction: direction) == .missingCurrent)
+        }
+    }
+
+    @Test func adjacencyUsesTheActualListInsteadOfAssumingConsecutiveNumbers() {
+        let first = Episode(id: "11", number: 1, title: "第一集")
+        let middle = Episode(id: "88", number: 8, title: "第八集")
+        let last = Episode(id: "4242", number: 42, title: "第四十二集")
+        let source = [last, first, middle]
+        #expect(EpisodeNavigation.adjacent(to: middle.id, in: source, direction: .previous) == .episode(first))
+        #expect(EpisodeNavigation.adjacent(to: middle.id, in: source, direction: .next) == .episode(last))
+    }
+
+    @Test func duplicateNumbersHaveStableTiesAndAmbiguousCurrentIDsAreRejected() {
+        let first = Episode(id: "11", number: 1, title: "第一集")
+        let a = Episode(id: "21", number: 2, title: "第二集甲")
+        let b = Episode(id: "22", number: 2, title: "第二集乙")
+        #expect(EpisodeNavigation.adjacent(to: a.id, in: [a, b, first], direction: .next) == .episode(b))
+        #expect(EpisodeNavigation.adjacent(to: b.id, in: [a, b, first], direction: .previous) == .episode(a))
+        #expect(EpisodeNavigation.adjacent(to: a.id, in: [first, a, a], direction: .next) == .missingCurrent)
+    }
+
     private func episodes(_ count: Int) -> [Episode] {
         (1...count).map { .init(id: String(1_000 + $0), number: $0, title: "第\($0)集") }
     }

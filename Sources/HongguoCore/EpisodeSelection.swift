@@ -71,3 +71,38 @@ public struct EpisodeSelection: Sendable {
         return byID[record.episode.id]
     }
 }
+
+/// Explicit adjacent navigation for user gestures. It neither loads nor starts playback.
+public enum EpisodeNavigation {
+    public enum Direction: Hashable, Sendable { case previous, next }
+    public enum Result: Hashable, Sendable {
+        case episode(Episode)
+        case first
+        case last
+        case unavailable(Episode)
+        case missingCurrent
+    }
+
+    public static func adjacent(to currentEpisodeID: String?, in episodes: [Episode],
+                                direction: Direction) -> Result {
+        guard let currentEpisodeID, !currentEpisodeID.isEmpty,
+              (1...10_000).contains(episodes.count),
+              episodes.filter({ $0.id == currentEpisodeID }).count == 1 else { return .missingCurrent }
+        let ordered = episodes.enumerated().sorted {
+            if $0.element.number != $1.element.number { return $0.element.number < $1.element.number }
+            return $0.offset < $1.offset
+        }.map(\.element)
+        guard let current = ordered.firstIndex(where: { $0.id == currentEpisodeID }) else { return .missingCurrent }
+        let target: Int
+        switch direction {
+        case .previous:
+            guard current > 0 else { return .first }
+            target = current - 1
+        case .next:
+            guard current + 1 < ordered.count else { return .last }
+            target = current + 1
+        }
+        let episode = ordered[target]
+        return episode.isAvailable ? .episode(episode) : .unavailable(episode)
+    }
+}

@@ -24,6 +24,8 @@ struct PlayerScreen: View {
     @State private var isScrubbing = false
     @State private var scrubPosition: Double = 0
     @State private var hideTask: Task<Void, Never>?
+    @State private var episodeNotice: String?
+    @State private var episodeNoticeTask: Task<Void, Never>?
     @GestureState private var holdingBoost = false
     @State private var boostStarted = false
     @State private var boostCommitted = false
@@ -85,8 +87,17 @@ struct PlayerScreen: View {
                             .position(x: region.midX, y: region.midY)
                         centralPlaybackControl
                             .position(x: region.midX, y: region.midY)
-                        VStack {
+                        VStack(spacing: 8) {
                             speedBoostHint.padding(.top, 12)
+                            if let episodeNotice {
+                                Text(episodeNotice)
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 16)
+                                    .frame(minHeight: 44)
+                                    .background(.ultraThinMaterial, in: Capsule())
+                                    .accessibilityIdentifier("player.episodeNotice")
+                                    .allowsHitTesting(false)
+                            }
                             Spacer(minLength: 0)
                         }
                         .frame(width: region.width, height: region.height)
@@ -118,13 +129,18 @@ struct PlayerScreen: View {
         }
         .onDisappear {
             hideTask?.cancel()
+            episodeNoticeTask?.cancel()
             endBoostGesture()
             model.stop()
             Task { await appModel.flushLibrary() }
         }
         .onChange(of: scenePhase) { _, phase in
             model.setSceneActive(phase == .active)
-            if phase != .active { cancelBoostGesture(); showControls() }
+            if phase != .active {
+                episodeNoticeTask?.cancel()
+                episodeNotice = nil
+                cancelBoostGesture(); showControls()
+            }
         }
         .onChange(of: model.isPlaying) { _, _ in scheduleAutoHide() }
         .onChange(of: prefetchNetworkPolicy.allowsPrefetch) { _, allowed in
@@ -328,7 +344,7 @@ struct PlayerScreen: View {
                 toggleControlsVisibility()
             }
             .simultaneousGesture(speedBoostGesture)
-            .simultaneousGesture(seriesSwipeGesture)
+            .simultaneousGesture(verticalSwipeGesture)
             .accessibilityLabel("影片")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { showControls() }
@@ -345,16 +361,42 @@ struct PlayerScreen: View {
             touch
                 .accessibilityAction(named: Text("下一部推薦")) { onSeriesSwipe?(1) }
                 .accessibilityAction(named: Text("上一部推薦")) { onSeriesSwipe?(-1) }
+        } else if !isPreview {
+            touch
+                .accessibilityAction(named: Text("下一集")) { navigateEpisode(.next) }
+                .accessibilityAction(named: Text("上一集")) { navigateEpisode(.previous) }
         } else { touch }
     }
 
-    private var seriesSwipeGesture: some Gesture {
+    private var verticalSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 20).onEnded { value in
-            guard let onSeriesSwipe, !boostStarted,
+            guard !boostStarted, !holdingBoost, !showingEpisodes, !isScrubbing, scenePhase == .active,
                   Date().timeIntervalSince(lastBoostEndAt) > 0.25,
                   abs(value.translation.height) > 90,
                   abs(value.translation.height) > abs(value.translation.width) * 1.2 else { return }
-            onSeriesSwipe(value.translation.height < 0 ? 1 : -1)
+            if let onSeriesSwipe { onSeriesSwipe(value.translation.height < 0 ? 1 : -1) }
+            else if !isPreview { navigateEpisode(value.translation.height < 0 ? .next : .previous) }
+        }
+    }
+
+    private func navigateEpisode(_ direction: EpisodeNavigation.Direction) {
+        guard !showingEpisodes, !isScrubbing, scenePhase == .active else { return }
+        cancelBoostGesture()
+        let message: String
+        switch model.navigateEpisode(direction) {
+        case .episode(let episode): message = "第 \(episode.number) 集"
+        case .first: message = "已經是第一集了"
+        case .last: message = "已經是最後一集了"
+        case .unavailable(let episode): message = "第 \(episode.number) 集尚未開放"
+        case .missingCurrent: message = "分集尚未準備好，請稍後再試"
+        }
+        episodeNoticeTask?.cancel()
+        episodeNotice = message
+        if voiceOverEnabled { UIAccessibility.post(notification: .announcement, argument: message) }
+        episodeNoticeTask = Task { @MainActor in
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            guard !Task.isCancelled else { return }
+            episodeNotice = nil
         }
     }
 
