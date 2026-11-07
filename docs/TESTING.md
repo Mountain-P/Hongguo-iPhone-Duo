@@ -19,7 +19,7 @@
 
 測後已收合並正常重新啟動至首頁，未保留診斷啟動旗標；沒有新增真人帳號操作、收藏變更或正式觀看紀錄。本輪不是實機手勢、長播／耗電、所有折疊角度或精準單次滑動距離的驗收。手機部署結果如下。
 
-同一批 build 20 已經既有無線通道覆蓋安裝，App 清單讀回 0.8.1／20，沒有刪除 App 或重新登入。首次啟動遇到 RSD 連線配置失敗；重新確認通道已連線後，iOS 明確因手機鎖定拒絕啟動，已請使用者解鎖，不能將安裝成功當成啟動通過。證據為本機 `build/ios-real-device-0.8.1-build20-install.json`、`build/ios-real-device-0.8.1-build20-app.json`、`build/ios-real-device-0.8.1-build20-launch.json`、`build/ios-real-device-0.8.1-build20-details.json`、`build/ios-real-device-0.8.1-build20-launch-recheck.json`。裝置與簽署識別只保留本機。
+同一批 build 20 已經既有無線通道覆蓋安裝，App 清單讀回 0.8.1／20，沒有刪除 App 或重新登入。首次啟動遇到 RSD 連線配置失敗；重新確認通道已連線後，iOS 曾因手機鎖定拒絕啟動。2026-11-07 使用者解鎖後重新啟動成功，程序查詢確認同一個 Hongguo 程序仍在執行，版號再次讀回 0.8.1／20，102 個 App 原碼雜湊仍與建置驗證清單相符。這是安裝、版本與啟動證據，本次未重新驗收真機黑帶、觸控手勢、帳號同步或耗電。初次證據為本機 `build/ios-real-device-0.8.1-build20-install.json`、`build/ios-real-device-0.8.1-build20-app.json`、`build/ios-real-device-0.8.1-build20-launch.json`、`build/ios-real-device-0.8.1-build20-details.json`、`build/ios-real-device-0.8.1-build20-launch-recheck.json`；解鎖後為 `build/ios-real-device-0.8.1-build20-launch-unlocked.json`、`build/ios-real-device-0.8.1-build20-processes-unlocked.json`、`build/ios-real-device-0.8.1-build20-app-unlocked.json`。裝置與簽署識別只保留本機。
 
 ## 0.8.0 推薦、試看接續與中央控制
 
