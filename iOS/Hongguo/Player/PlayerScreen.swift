@@ -16,6 +16,7 @@ struct PlayerScreen: View {
     private let onSeriesSwipe: ((Int) -> Void)?
     private let isPreview: Bool
     private let onOpenSeries: (() -> Void)?
+    private let onTransitionFrameConsumed: ((UUID) -> Void)?
     @State private var showingEpisodes = false
     @State private var controlsVisible = true
     // A new preference version applies the fill-first default once to existing
@@ -43,11 +44,12 @@ struct PlayerScreen: View {
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
          onClose: (() -> Void)? = nil, onSeriesSwipe: ((Int) -> Void)? = nil,
          isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil,
-         transitionFrame: PlaybackTransitionFrame? = nil) {
+         transitionFrame: PlaybackTransitionFrame? = nil, onTransitionFrameConsumed: ((UUID) -> Void)? = nil) {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
         self.isPreview = isPreview
         self.onOpenSeries = onOpenSeries
+        self.onTransitionFrameConsumed = onTransitionFrameConsumed
         _transitionFrame = State(initialValue: transitionFrame?.matches(seriesID: series.id,
             episodeID: initialEpisodeID, seconds: resumeSeconds) == true ? transitionFrame : nil)
         _model = StateObject(wrappedValue: PlayerModel(series: series, episodes: episodes,
@@ -151,7 +153,7 @@ struct PlayerScreen: View {
             episodeNoticeTask?.cancel()
             endBoostGesture()
             cancelEpisodeSwipe()
-            transitionFrame = nil
+            discardTransitionFrame()
             model.stop()
             Task { await appModel.flushLibrary() }
         }
@@ -161,7 +163,7 @@ struct PlayerScreen: View {
                 episodeNoticeTask?.cancel()
                 episodeNotice = nil
                 cancelEpisodeSwipe()
-                transitionFrame = nil
+                discardTransitionFrame()
                 cancelBoostGesture(); showControls()
             }
         }
@@ -179,11 +181,11 @@ struct PlayerScreen: View {
         }
         .onChange(of: model.isBuffering) { _, _ in scheduleAutoHide() }
         .onChange(of: model.errorMessage) { _, message in
-            if message != nil { transitionFrame = nil }
+            if message != nil { discardTransitionFrame() }
             showControls()
         }
         .onChange(of: model.currentEpisode?.id) { _, episodeID in
-            if episodeID != transitionFrame?.episodeID { transitionFrame = nil }
+            if episodeID != transitionFrame?.episodeID { discardTransitionFrame() }
             cancelEpisodeSwipe()
         }
         .onChange(of: model.elapsed) { _, _ in finishTransitionIfReady() }
@@ -483,6 +485,12 @@ struct PlayerScreen: View {
         withAnimation(.easeOut(duration: 0.18)) { swipe = nil }
     }
 
+    private func discardTransitionFrame() {
+        guard let id = transitionFrame?.id else { return }
+        transitionFrame = nil
+        onTransitionFrameConsumed?(id)
+    }
+
     private func finishTransitionIfReady() {
         guard transitionFrame != nil, surfaceReady, model.isInitialSeekComplete else { return }
         // Native surface readiness and the completed initial seek must both belong to this route.
@@ -491,7 +499,7 @@ struct PlayerScreen: View {
             NSLog("PlaybackTransition formal ready=1 seekComplete=1 released=1")
         }
         #endif
-        transitionFrame = nil
+        discardTransitionFrame()
     }
 
     private func navigateEpisode(_ direction: EpisodeNavigation.Direction) {

@@ -163,7 +163,14 @@ struct RecommendationPreviewView: View {
             DetailView(series: series).toolbar(.visible, for: .navigationBar)
         }
         .onChange(of: playback.route?.id) { _, routeID in
-            if routeID != nil { cancelResize(); requiresManualResume = true; preview.suspend() }
+            if routeID != nil {
+                cancelResize(); requiresManualResume = true; preview.suspend()
+                if let frame = transitionFrame, let route = playback.route,
+                   !frame.matches(seriesID: route.detail.series.id,
+                       episodeID: route.continuation.episode.id, seconds: route.continuation.seconds) {
+                    transitionFrame = nil
+                }
+            }
             else if playback.preparingSeriesID == nil && playback.pendingChoice == nil { transitionFrame = nil }
             refreshEligibility()
         }
@@ -171,7 +178,10 @@ struct RecommendationPreviewView: View {
         .onChange(of: playback.pendingChoice?.id) { _, _ in discardFinishedTransition() }
         .overlay { if let choice = playback.pendingChoice { continuationChoice(choice) } }
         .overlay(alignment: .bottom) { followingError }
-        .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset, transitionFrame: transitionFrame)
+        .continuePlaybackPresentation(playback, context: playbackContext, bottomOverlayInset: bottomControlInset, transitionFrame: transitionFrame,
+            onTransitionFrameConsumed: { id in
+                if transitionFrame?.id == id { transitionFrame = nil }
+            })
     }
 
     private var feedViewport: some View {

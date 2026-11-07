@@ -34,8 +34,11 @@ final class AppModel: ObservableObject {
 
     var favorites: [Series] { library.favorites }
     var history: [WatchRecord] { library.history }
-    /// The same owner/source boundary as the displayed library, never a global account profile.
-    var recommendationScope: LibraryScope { .init(owner: selectedLibraryOwner, sourceID: libraryKey) }
+    /// Ranking and preview sessions also distinguish the selected catalogue.
+    /// The formal library keeps its existing playback-source key.
+    var recommendationScope: LibraryScope {
+        .init(owner: selectedLibraryOwner, sourceID: libraryKey + ".catalog." + catalogSource.rawValue)
+    }
     /// Capture at a new batch/refresh boundary. No progress tick changes a catalogue revision.
     var recommendationProfile: PersonalizedRecommendationProfile {
         .init(scope: recommendationScope, favorites: favorites, history: history)

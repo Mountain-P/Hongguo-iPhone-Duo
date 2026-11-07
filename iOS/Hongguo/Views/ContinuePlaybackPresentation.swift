@@ -31,6 +31,7 @@ private struct ContinuePlaybackPresentation: ViewModifier {
     var onSeriesSwipe: ((Int) -> Void)?
     var bottomOverlayInset: CGFloat = 0
     var transitionFrame: PlaybackTransitionFrame?
+    var onTransitionFrameConsumed: ((UUID) -> Void)?
 
     func body(content: Content) -> some View {
         content
@@ -58,7 +59,8 @@ private struct ContinuePlaybackPresentation: ViewModifier {
                              initialEpisodeID: selection.continuation.episode.id, resumeSeconds: selection.continuation.seconds,
                              service: selection.service, onProgress: selection.onProgress,
                              onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe,
-                             transitionFrame: matchingFrame(for: selection))
+                             transitionFrame: matchingFrame(for: selection),
+                             onTransitionFrameConsumed: onTransitionFrameConsumed)
                     .id(selection.id)
             }
     }
@@ -76,8 +78,10 @@ extension View {
     func continuePlaybackPresentation(_ launcher: ContinuePlaybackModel, context: ContinuePlaybackContext,
                                       onSeriesSwipe: ((Int) -> Void)? = nil,
                                       bottomOverlayInset: CGFloat = 0,
-                                      transitionFrame: PlaybackTransitionFrame? = nil) -> some View {
+                                      transitionFrame: PlaybackTransitionFrame? = nil,
+                                      onTransitionFrameConsumed: ((UUID) -> Void)? = nil) -> some View {
         modifier(ContinuePlaybackPresentation(launcher: launcher, context: context,
-            onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset, transitionFrame: transitionFrame))
+            onSeriesSwipe: onSeriesSwipe, bottomOverlayInset: bottomOverlayInset, transitionFrame: transitionFrame,
+            onTransitionFrameConsumed: onTransitionFrameConsumed))
     }
 }
