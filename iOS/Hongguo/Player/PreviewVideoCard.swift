@@ -2,6 +2,7 @@
 import AVFoundation
 import HongguoCore
 import SwiftUI
+import UIKit
 
 /// An inline first-episode preview. The pager owns which settled card is active.
 @MainActor
@@ -39,9 +40,7 @@ private struct PreviewVideoContent: View {
     let onOpenSeries: () -> Void
     @State private var controlsVisible = true
     @State private var hideTask: Task<Void, Never>?
-    @State private var holdingBoost = false
     @State private var boostStarted = false
-    @State private var suppressBoostUntilRelease = false
     @State private var ownerID = UUID()
     @State private var suspendedForPaging = false
     @State private var resumeAfterPaging = false
@@ -109,25 +108,20 @@ private struct PreviewVideoContent: View {
     }
 
     private var touchSurface: some View {
-        Color.clear.contentShape(Rectangle())
-            .onTapGesture {
+        PreviewGestureSurface(isEnabled: allowsInteraction && isActive && scenePhase == .active,
+            onTap: {
                 guard allowsInteraction, isActive, !boostStarted,
                       Date().timeIntervalSince(lastBoostEndAt) > 0.25 else { return }
                 togglePlayback()
-            }
-            // Keep the recognizer tree stable throughout a scroll. This hold
-            // has no DragGesture that could compete with the parent's paging.
-            .onLongPressGesture(minimumDuration: 0.35, maximumDistance: 18, pressing: { pressing in
-                holdingBoost = pressing
-                if !pressing { endBoost(); suppressBoostUntilRelease = false }
-            }, perform: {
-                guard allowsInteraction, isActive, holdingBoost, !boostStarted,
-                      !suppressBoostUntilRelease, scenePhase == .active, !model.isLoading,
+            }, onHoldBegan: {
+                guard allowsInteraction, isActive, !boostStarted,
+                      scenePhase == .active, !model.isLoading,
                       model.errorMessage == nil, model.duration > 0 else { return }
                 boostStarted = true
                 hideTask?.cancel()
                 model.beginSpeedBoost()
-            })
+            }, onHoldEnded: { endBoost() })
+            .accessibilityElement(children: .ignore)
             .accessibilityLabel("第 1 集試看影片")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction(named: Text(model.canPausePlayback ? "暫停" : "播放"), togglePlayback)
@@ -271,6 +265,9 @@ private struct PreviewVideoContent: View {
     private func togglePlayback() {
         guard allowsInteraction, isActive, scenePhase == .active else { return }
         cancelBoost()
+        if !model.canPausePlayback, model.duration > 0, model.elapsed >= model.duration - 0.25 {
+            model.seek(to: 0)
+        }
         model.togglePlayback()
         revealControls()
     }
@@ -282,7 +279,6 @@ private struct PreviewVideoContent: View {
     }
 
     private func cancelBoost(reveal: Bool = true) {
-        if holdingBoost || boostStarted { suppressBoostUntilRelease = true }
         endBoost(reveal: reveal)
     }
 
@@ -319,6 +315,86 @@ private struct PreviewVideoContent: View {
         }
         return PlayerViewingRegion.best(in: bounds, avoiding: frames, aspect: model.videoAspectRatio,
                                         anchor: CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+}
+
+/// Stable UIKit recognizers share touches with the ancestor ScrollView pan.
+/// Updating playback eligibility never replaces or disables the recognizers.
+@MainActor
+private struct PreviewGestureSurface: UIViewRepresentable {
+    let isEnabled: Bool
+    let onTap: () -> Void
+    let onHoldBegan: () -> Void
+    let onHoldEnded: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.isAccessibilityElement = false
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
+        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
+        hold.minimumPressDuration = 0.35
+        hold.allowableMovement = 18
+        for recognizer in [tap, hold] {
+            recognizer.delegate = context.coordinator
+            recognizer.cancelsTouchesInView = false
+            recognizer.delaysTouchesBegan = false
+            recognizer.delaysTouchesEnded = false
+            view.addGestureRecognizer(recognizer)
+        }
+        tap.require(toFail: hold)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.parent = self
+    }
+
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
+        coordinator.finishHold()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: PreviewGestureSurface
+        private var isHolding = false
+
+        init(_ parent: PreviewGestureSurface) { self.parent = parent }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            parent.isEnabled
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            otherGestureRecognizer is UIPanGestureRecognizer
+        }
+
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer.state == .ended, parent.isEnabled, !isHolding else { return }
+            parent.onTap()
+        }
+
+        @objc func held(_ recognizer: UILongPressGestureRecognizer) {
+            switch recognizer.state {
+            case .began:
+                guard parent.isEnabled else { return }
+                isHolding = true
+                parent.onHoldBegan()
+            case .ended, .cancelled, .failed:
+                finishHold()
+            default: break
+            }
+        }
+
+        func finishHold() {
+            guard isHolding else { return }
+            isHolding = false
+            parent.onHoldEnded()
+        }
     }
 }
 
