@@ -3,6 +3,24 @@ import Combine
 import Foundation
 import Network
 
+/// One connectivity observer for all retained players; no per-preview path monitors.
+@MainActor
+final class PlaybackNetworkAvailability {
+    static let shared = PlaybackNetworkAvailability()
+    private(set) var isAvailable = false
+    private let monitor = NWPathMonitor()
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let available = path.status == .satisfied
+            Task { @MainActor [weak self] in self?.isAvailable = available }
+        }
+        monitor.start(queue: DispatchQueue(label: "tw.mountainp.hongguo.playback-connectivity"))
+    }
+
+    deinit { monitor.cancel() }
+}
+
 /// Advisory policy only; it never changes the system's network configuration.
 @MainActor
 final class PlaybackPrefetchNetworkPolicy: ObservableObject {

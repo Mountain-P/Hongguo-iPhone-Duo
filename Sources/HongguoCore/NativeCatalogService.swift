@@ -9,13 +9,15 @@ public struct NativeCatalogService: CatalogService {
     private let website: DirectWebService
     private let transport: any HTTPTransport
     private let cache = NativeCatalogCache()
-    private let prepare: @Sendable (_ episodeID: String, _ contentType: String, _ fresh: Bool) async throws -> PlaybackSource
+    public private(set) var playbackQuality: NativePlaybackQuality
+    private let prepare: @Sendable (_ episodeID: String, _ contentType: String, _ fresh: Bool, _ quality: NativePlaybackQuality) async throws -> PlaybackSource
 
     public init(category: DirectWebService.Category = .realDrama, transport: any HTTPTransport = URLSessionTransport(),
                 quality: NativePlaybackQuality = .automatic) {
         self.website = DirectWebService(category: category, transport: transport)
         self.transport = transport
-        self.prepare = { episodeID, contentType, fresh in
+        self.playbackQuality = quality
+        self.prepare = { episodeID, contentType, fresh, quality in
             let source = try await NativeSourceResolver.shared.resolve(episodeID: episodeID, contentType: contentType, fresh: fresh, quality: quality)
             let stream = try await NativeProgressiveMedia.shared.prepare(source: source, episodeID: episodeID, fresh: fresh)
             return PlaybackSource(url: stream.assetURL, nativeStream: stream)
@@ -27,9 +29,26 @@ public struct NativeCatalogService: CatalogService {
          prepare: @escaping @Sendable (String, String, Bool) async throws -> URL) {
         self.website = DirectWebService(category: category, transport: transport)
         self.transport = transport
-        self.prepare = { episodeID, contentType, fresh in
+        self.playbackQuality = .automatic
+        self.prepare = { episodeID, contentType, fresh, _ in
             PlaybackSource(url: try await prepare(episodeID, contentType, fresh))
         }
+    }
+
+    init(category: DirectWebService.Category = .realDrama, transport: any HTTPTransport,
+         quality: NativePlaybackQuality = .automatic,
+         prepareSource: @escaping @Sendable (String, String, Bool, NativePlaybackQuality) async throws -> PlaybackSource) {
+        self.website = DirectWebService(category: category, transport: transport)
+        self.transport = transport
+        self.playbackQuality = quality
+        self.prepare = prepareSource
+    }
+
+    /// Keeps the same validated catalogue cache and transport while selecting a rendition.
+    public func selectingPlaybackQuality(_ quality: NativePlaybackQuality) -> NativeCatalogService {
+        var copy = self
+        copy.playbackQuality = quality
+        return copy
     }
 
     public func home(page: Int) async throws -> SeriesPage {
@@ -57,7 +76,7 @@ public struct NativeCatalogService: CatalogService {
         guard entry.detail.series.id == seriesID,
               entry.detail.episodes.contains(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
         try Task.checkCancellation()
-        let source = try await prepare(episodeID, entry.contentType, fresh)
+        let source = try await prepare(episodeID, entry.contentType, fresh, playbackQuality)
         try Task.checkCancellation()
         if let stream = source.nativeStream {
             guard source.url == stream.assetURL, stream.totalLength > 0, source.headers.isEmpty else {

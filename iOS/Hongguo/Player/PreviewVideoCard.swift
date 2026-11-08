@@ -183,6 +183,11 @@ private struct PreviewVideoContent: View {
                             preferenceMenu
                             Spacer(minLength: 0)
                             HStack(spacing: 8) {
+                                if model.supportsPlaybackQuality {
+                                    glass(PlaybackQualityMenu(model: model, compact: true), in: Circle())
+                                        .accessibilityIdentifier("preview.quality")
+                                        .accessibilityHidden(!isActive)
+                                }
                                 speedMenu.accessibilityHidden(!isActive)
                                 zoomMenu
                                 expandedButton
@@ -199,11 +204,17 @@ private struct PreviewVideoContent: View {
                 }
                 .frame(width: region.width, height: region.height)
                 .overlay(alignment: .top) {
-                    if isActive, model.isSpeedBoosting {
-                        glass(Text("2 倍速").font(.caption.weight(.semibold))
-                            .padding(.horizontal, 14).frame(minHeight: 44), in: Capsule())
-                            .padding(.top, region.height < 400 ? 12 : 20)
-                            .allowsHitTesting(false)
+                    if isActive {
+                        VStack(spacing: 8) {
+                            if model.isSpeedBoosting {
+                                glass(Text("2 倍速").font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 14).frame(minHeight: 44), in: Capsule())
+                            }
+                            PlaybackQualityStatus(model: model)
+                                .accessibilityIdentifier("preview.qualityNotice")
+                        }
+                        .padding(.top, region.height < 400 ? 12 : 20)
+                        .allowsHitTesting(false)
                     }
                 }
                 .overlay {
@@ -466,8 +477,7 @@ private struct PreviewVideoContent: View {
                 }.buttonStyle(.plain).accessibilityIdentifier("preview.openSeries"), in: Capsule())
             }
             if model.duration > 0 {
-                ProgressView(value: min(max(model.elapsed, 0), model.duration), total: model.duration)
-                    .tint(.white.opacity(0.8)).allowsHitTesting(false)
+                PlaybackBufferedProgress(elapsed: model.elapsed, duration: model.duration, ranges: model.bufferedRanges)
                     .accessibilityLabel("第一集播放進度")
             }
         }
@@ -531,7 +541,7 @@ private struct PreviewVideoContent: View {
 
     @ViewBuilder
     private var status: some View {
-        if model.isLoading || model.isBuffering {
+        if model.isLoading || model.showsBufferingIndicator {
             glass(ProgressView(model.isLoading ? "正在準備試看…" : "影片緩衝中…")
                 .font(.caption).tint(.white).padding(16), in: RoundedRectangle(cornerRadius: 16))
                 .offset(y: model.isBuffering && !model.isLoading ? -80 : 0)

@@ -132,6 +132,8 @@ struct PlayerScreen: View {
                             .position(x: region.midX, y: region.midY)
                         VStack(spacing: 8) {
                             speedBoostHint.padding(.top, 12)
+                            PlaybackQualityStatus(model: model)
+                                .accessibilityIdentifier("player.qualityNotice")
                             episodeSwipeFeedback
                             if let episodeNotice {
                                 Text(episodeNotice)
@@ -262,6 +264,11 @@ struct PlayerScreen: View {
             Button { model.skip(10, feedback: true); showControls() } label: { Label("前進十秒", systemImage: "goforward.10") }
                 .disabled(model.isLoading || model.duration <= 0)
             speedMenu
+            if model.supportsPlaybackQuality {
+                PlaybackQualityMenu(model: model)
+                    .accessibilityIdentifier("player.quality")
+                    .simultaneousGesture(TapGesture().onEnded { showControls() })
+            }
             Button {
                 fillsScreen.toggle()
                 showControls()
@@ -381,6 +388,7 @@ struct PlayerScreen: View {
                     .accessibilityLabel("已播放 \(timeLabel(model.elapsed))")
                 FinePlaybackScrubber(elapsed: model.elapsed, duration: model.duration,
                     disabled: model.isLoading || model.duration <= 0,
+                    bufferedRanges: model.bufferedRanges,
                     onEditingChanged: { editing, seconds in
                         if editing { clearSeekNotice(); cancelBoostGesture(); cancelEpisodeSwipe() }
                         isScrubbing = editing
@@ -629,7 +637,7 @@ struct PlayerScreen: View {
 
     @ViewBuilder
     private var statusOverlay: some View {
-        if model.isLoading || model.isBuffering {
+        if model.isLoading || model.showsBufferingIndicator {
             ProgressView(model.isLoading ? "正在準備影片…" : "影片緩衝中…")
                 .padding(20)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 16))

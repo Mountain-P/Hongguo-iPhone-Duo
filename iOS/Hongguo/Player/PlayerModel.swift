@@ -16,6 +16,13 @@ final class PlayerModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isPlaying = false
     @Published private(set) var isBuffering = false
+    @Published private(set) var showsBufferingIndicator = false
+    @Published private(set) var bufferedRanges: [PlaybackBufferedRange] = []
+    @Published private(set) var nativeVariant: NativeMediaVariant?
+    @Published private(set) var playbackQuality: NativePlaybackQuality = .automatic
+    @Published private(set) var isSwitchingQuality = false
+    @Published private(set) var qualityNotice: String?
+    var supportsPlaybackQuality: Bool { service is NativeCatalogService }
     // The requested transport remains pausable while AVPlayer changes between
     // waiting and playing; clock observations alone can briefly report neither.
     var canPausePlayback: Bool { playbackSpeed.wantsPlayback || isPlaying || isBuffering }
@@ -88,7 +95,7 @@ final class PlayerModel: ObservableObject {
     var playbackItemIdentity: UUID { generation }
 
     var handoffPlayback: PlaybackHandoffEligibility.Playback? {
-        guard let episode = currentEpisode else { return nil }
+        guard !isSwitchingQuality, let episode = currentEpisode else { return nil }
         return .init(seriesID: series.id, episodeID: episode.id, position: player.currentTime().seconds,
                      duration: duration, itemID: generation, isReady: isInitialSeekComplete, isSeeking: isSeeking)
     }
@@ -98,6 +105,7 @@ final class PlayerModel: ObservableObject {
     func promoteToFormalPlayback(detail: SeriesDetail, service: any CatalogService,
                                  onProgress: @escaping (Episode, Double, Double) -> Void) -> Bool {
         guard isPreview, isInitialSeekComplete, !isSeeking, detail.series.id == series.id,
+              (service as? NativeCatalogService)?.playbackQuality == (self.service as? NativeCatalogService)?.playbackQuality,
               let current = currentEpisode,
               let resolved = detail.episodes.first(where: { $0.id == current.id && $0.isAvailable }) else { return false }
         endSpeedBoost(); unlockSpeedBoost()
@@ -206,6 +214,142 @@ final class PlayerModel: ObservableObject {
         #endif
     }
 
+    private func updateBufferedRanges() {
+        let ranges: [PlaybackBufferedRange] = player.currentItem?.loadedTimeRanges.prefix(128).map {
+            let value = $0.timeRangeValue
+            return PlaybackBufferedRange(start: value.start.seconds, end: CMTimeRangeGetEnd(value).seconds)
+        } ?? []
+        let normalized = PlaybackBufferedRanges.normalized(ranges, duration: duration)
+        if normalized != bufferedRanges { bufferedRanges = normalized }
+    }
+
+    private func updatePlaybackHealth() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let eligible = didStart && hasStarted && sceneActive && playbackSpeed.wantsPlayback
+            && !isLoading && !reachedEnd && errorMessage == nil
+        let waiting = eligible && isBuffering
+        showsBufferingIndicator = bufferingIndicator.update(waiting: waiting, eligible: eligible, at: now)
+        let action = stallRecovery.update(.init(time: now, position: resumePosition, waiting: waiting,
+            wantsPlayback: playbackSpeed.wantsPlayback, sceneActive: sceneActive,
+            isReady: hasStarted && !isLoading, isSeeking: isSeeking,
+            networkAvailable: PlaybackNetworkAvailability.shared.isAvailable))
+        switch action {
+        case .reload:
+            guard let episode = currentEpisode, eligible else { return }
+            traceHealth("reload")
+            if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: true) }
+            beginLoad(episode, position: resumePosition, fresh: true, autoplay: playbackSpeed.wantsPlayback,
+                      continuingDiagnostics: true, preservingPosition: true)
+            return
+        case .stopWaiting:
+            traceHealth("exhausted")
+            errorMessage = "影片持續緩衝，請檢查網路後重新載入。"
+            if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
+            finishDiagnostics(outcome: .failed)
+            pauseAndSave()
+            return
+        case .none: break
+        }
+        guard waiting else {
+            healthTask?.cancel(); healthTask = nil
+            return
+        }
+        guard healthTask == nil else { return }
+        let requestGeneration = generation
+        healthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                guard let self, self.generation == requestGeneration else { return }
+                self.updateBufferedRanges()
+                self.updatePlaybackHealth()
+            }
+        }
+    }
+
+    private func traceHealth(_ action: String) {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-playback-health-diagnostics") {
+            NSLog("PlaybackHealth %@", action)
+        }
+        #endif
+    }
+
+    func switchPlaybackQuality(_ preference: NativePlaybackQuality) {
+        guard let native = service as? NativeCatalogService, let episode = currentEpisode,
+              hasStarted, sceneActive, !isLoading, !isSwitchingQuality,
+              playbackQuality != preference else { return }
+        clearQualityNotice()
+        cancelNextEpisodePrefetch()
+        let token = UUID(); qualityGeneration = token
+        let requestGeneration = generation
+        let seriesID = series.id
+        let candidateService = native.selectingPlaybackQuality(preference)
+        isSwitchingQuality = true
+        qualityTask = Task { @MainActor [weak self] in
+            do {
+                let source = try await candidateService.playback(seriesID: seriesID, episodeID: episode.id, fresh: false)
+                try Task.checkCancellation()
+                guard let self, self.qualityGeneration == token, self.generation == requestGeneration,
+                      self.currentEpisode?.id == episode.id, self.sceneActive else { return }
+                self.qualityTask = nil
+                self.isSwitchingQuality = false
+                guard let variant = source.nativeStream?.variant else {
+                    self.showQualityNotice("目前來源不支援切換畫質。")
+                    return
+                }
+                guard preference != .dataSaver || !variant.qualityFallback else {
+                    self.showQualityNotice("目前來源沒有較低畫質，保留現有影片。")
+                    return
+                }
+                let same = self.nativeVariant.map {
+                    $0.codec == variant.codec && $0.quality == variant.quality
+                        && $0.width == variant.width && $0.height == variant.height
+                } ?? false
+                self.service = candidateService
+                self.playbackQuality = preference
+                if same {
+                    self.showQualityNotice("目前已是所選模式的可用畫質。")
+                    self.updateNextEpisodePrefetch()
+                    return
+                }
+                let position = self.resumePosition
+                let autoplay = self.playbackSpeed.wantsPlayback
+                self.retryCount = 0
+                if self.stallRecovery.isExhausted { self.stallRecovery.reset() }
+                self.beginLoad(episode, position: position, fresh: false, autoplay: autoplay,
+                               preparedSource: source, preservingPosition: true)
+                self.showQualityNotice(preference == .dataSaver ? "已切換為流暢優先" : "已切換為畫質優先")
+                self.traceHealth("qualityChanged")
+            } catch {
+                guard let self, self.qualityGeneration == token, self.generation == requestGeneration else { return }
+                self.qualityTask = nil
+                self.isSwitchingQuality = false
+                guard !(error is CancellationError) else { return }
+                self.showQualityNotice("畫質切換未完成，繼續播放原影片。")
+            }
+        }
+    }
+
+    private func cancelQualitySwitch() {
+        qualityGeneration = UUID()
+        qualityTask?.cancel(); qualityTask = nil
+        isSwitchingQuality = false
+    }
+
+    private func showQualityNotice(_ text: String) {
+        qualityNoticeTask?.cancel()
+        qualityNotice = text
+        qualityNoticeTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            self?.qualityNotice = nil
+        }
+    }
+
+    private func clearQualityNotice() {
+        qualityNoticeTask?.cancel(); qualityNoticeTask = nil
+        qualityNotice = nil
+    }
+
     private var service: any CatalogService
     private var isPreview: Bool
     private let preferences = PlaybackPreferencesStore.shared
@@ -217,6 +361,7 @@ final class PlayerModel: ObservableObject {
     private var loader: AuthenticatedMediaLoader?
     private var progressiveLoader: NativeMediaAssetLoader?
     private var statusObservation: NSKeyValueObservation?
+    private var rangesObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
     private var progressObserver: Any?
     private var endObserver: NSObjectProtocol?
@@ -231,17 +376,25 @@ final class PlayerModel: ObservableObject {
     private var sceneActive = true
     private var retryCount = 0
     private var pendingResume: Double = 0
+    private var preservesResumePosition = false
     private var lastSavedAt = Date.distantPast
     private var loadStartedAt = Date()
     private var loggedPlaybackStart = false
     private var reachedEnd = false
-    private var seekGeneration = UUID()
     private var diagnosticsID: UUID?
     private var transitionVideoOutput: AVPlayerItemVideoOutput?
     @Published private(set) var episodeTransitionFrame: PlaybackTransitionFrame?
     private var isSeeking = false
     // AVPlayer's clock/periodic callbacks can lag behind an in-flight seek.
     private var pendingSeekTarget: Double?
+    private var seekCoordinator = PlaybackSeekCoordinator()
+    private var replaySeekToken: UUID?
+    private var healthTask: Task<Void, Never>?
+    private var stallRecovery = PlaybackStallRecoveryState()
+    private var bufferingIndicator = BufferingIndicatorPolicy()
+    private var qualityTask: Task<Void, Never>?
+    private var qualityNoticeTask: Task<Void, Never>?
+    private var qualityGeneration = UUID()
     private var pendingFormalActivation = false
     private let nextPrefetcher = NativePlaybackPrefetch()
     private var nextPrefetchState = EpisodePrefetchState()
@@ -260,6 +413,7 @@ final class PlayerModel: ObservableObject {
         self.service = service
         self.onProgress = onProgress
         self.isPreview = isPreview
+        self.playbackQuality = (service as? NativeCatalogService)?.playbackQuality ?? .automatic
         let saved = preferences.load().resolved(isPreview: isPreview)
         playbackSpeed.selectRate(saved.normalRate)
         autoNext = saved.autoNext
@@ -289,6 +443,7 @@ final class PlayerModel: ObservableObject {
                 self.isBuffering = self.hasStarted && self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 self.updateBufferPolicy(waiting: self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate)
                 self.updateLoaderReadAheadEligibility()
+                self.updatePlaybackHealth()
                 if let id = self.diagnosticsID {
                     PlaybackDiagnostics.shared.recordTransport(id: id,
                         waiting: self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate,
@@ -321,13 +476,16 @@ final class PlayerModel: ObservableObject {
     func select(_ episode: Episode, position: Double = 0) {
         guard episode.isAvailable else { return }
         retryCount = 0
+        stallRecovery.reset()
         beginLoad(episode, position: position, fresh: false, autoplay: true)
     }
 
     func retry() {
         guard let episode = currentEpisode else { return }
         retryCount = 0
-        beginLoad(episode, position: resumePosition, fresh: true, autoplay: true)
+        stallRecovery.reset()
+        beginLoad(episode, position: resumePosition, fresh: true, autoplay: true,
+                  preservingPosition: hasStarted || preservesResumePosition)
     }
 
     @discardableResult
@@ -335,31 +493,57 @@ final class PlayerModel: ObservableObject {
         guard hasStarted, sceneActive, !isLoading, errorMessage == nil,
               let target = PlaybackRelativeSeek.target(current: player.currentTime().seconds,
                   pendingTarget: pendingSeekTarget, offset: seconds, duration: duration) else { return false }
-        seek(to: target)
+        enqueueSeek(to: target, kind: .relative)
         if feedback { PlaybackHaptics.emit(.skip) }
         return true
     }
 
     func seek(to seconds: Double) {
-        guard hasStarted, seconds.isFinite else { return }
+        enqueueSeek(to: seconds, kind: .precise)
+    }
+
+    private func enqueueSeek(to seconds: Double, kind: PlaybackSeekCoordinator.Kind) {
+        guard hasStarted, sceneActive, !isLoading, errorMessage == nil, seconds.isFinite else { return }
         let target = min(max(0, seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
-        let requestGeneration = generation
-        let seekRequest = UUID(); seekGeneration = seekRequest
-        isSeeking = true
-        pendingSeekTarget = target
+        let request = seekCoordinator.submit(target: target, kind: kind)
+        isSeeking = seekCoordinator.isSeeking
+        pendingSeekTarget = seekCoordinator.pendingTarget
         elapsed = target
         reachedEnd = false
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+        updatePlaybackHealth()
+        if let request { performSeek(request) }
+        updateNextEpisodePrefetch()
+    }
+
+    private func performSeek(_ request: PlaybackSeekCoordinator.Request) {
+        let requestGeneration = generation
+        let tolerance = CMTime(seconds: request.toleranceSeconds, preferredTimescale: 600)
+        player.seek(to: CMTime(seconds: request.target, preferredTimescale: 600), toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
             Task { @MainActor [weak self] in
-                guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
-                self.isSeeking = false
-                self.pendingSeekTarget = nil
-                guard finished, self.playbackSpeed.wantsPlayback, self.sceneActive,
+                guard let self, self.generation == requestGeneration,
+                      self.seekCoordinator.activeRequest?.token == request.token else { return }
+                let next = self.seekCoordinator.complete(token: request.token, finished: finished)
+                let wasReplay = self.replaySeekToken == request.token
+                if wasReplay { self.replaySeekToken = nil }
+                self.isSeeking = self.seekCoordinator.isSeeking
+                self.pendingSeekTarget = self.seekCoordinator.pendingTarget
+                if let next { self.performSeek(next); return }
+                let actual = self.player.currentTime().seconds
+                if actual.isFinite { self.elapsed = max(0, actual) }
+                self.updatePlaybackHealth()
+                if !finished, wasReplay {
+                    if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
+                    self.finishDiagnostics(outcome: .failed)
+                    self.pauseAndSave()
+                    self.errorMessage = "無法從頭重播，請重新載入。"
+                    return
+                }
+                guard self.player.currentItem?.status == .readyToPlay,
+                      self.playbackSpeed.wantsPlayback, self.sceneActive,
                       self.player.timeControlStatus == .paused else { return }
                 self.resumePlayback()
             }
         }
-        updateNextEpisodePrefetch()
     }
 
     func togglePlayback() {
@@ -372,33 +556,16 @@ final class PlayerModel: ObservableObject {
     }
 
     private func restartFromBeginning() {
-        let requestGeneration = generation
-        let seekRequest = UUID(); seekGeneration = seekRequest
+        seekCoordinator.reset()
+        player.currentItem?.cancelPendingSeeks()
         if diagnosticsID == nil {
             diagnosticsID = PlaybackDiagnostics.shared.begin(context: .replay)
         }
         playbackSpeed.requestPlayback()
-        isSeeking = true
-        pendingSeekTarget = 0
         reachedEnd = false
-        elapsed = 0
-        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-            Task { @MainActor [weak self] in
-                guard let self, self.generation == requestGeneration, self.seekGeneration == seekRequest else { return }
-                self.isSeeking = false
-                self.pendingSeekTarget = nil
-                guard finished else {
-                    if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: false) }
-                    self.finishDiagnostics(outcome: .failed)
-                    self.pauseAndSave()
-                    self.errorMessage = "無法從頭重播，請重新載入。"
-                    return
-                }
-                if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
-                guard self.playbackSpeed.wantsPlayback, self.sceneActive else { return }
-                self.resumePlayback()
-            }
-        }
+        if let id = diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
+        enqueueSeek(to: 0, kind: .precise)
+        replaySeekToken = seekCoordinator.activeRequest?.token
     }
 
     var nextEpisode: Episode? {
@@ -425,6 +592,7 @@ final class PlayerModel: ObservableObject {
         player.pause()
         isPlaying = false
         isBuffering = false
+        updatePlaybackHealth()
         applyPlaybackRate()
         saveProgress()
     }
@@ -432,10 +600,12 @@ final class PlayerModel: ObservableObject {
     func setSceneActive(_ active: Bool) {
         sceneActive = active
         updateLoaderReadAheadEligibility()
-        if !active { episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave() }
+        if !active { cancelQualitySwitch(); episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave() }
     }
 
     func stop() {
+        cancelQualitySwitch()
+        clearQualityNotice()
         setLoaderReadAheadEnabled(false)
         pendingFormalActivation = false
         episodeTransitionFrame = nil
@@ -458,7 +628,9 @@ final class PlayerModel: ObservableObject {
     }
 
     private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool,
-                           continuingDiagnostics: Bool = false) {
+                           continuingDiagnostics: Bool = false, preparedSource: PlaybackSource? = nil,
+                           preservingPosition: Bool = false) {
+        cancelQualitySwitch()
         cancelNextEpisodePrefetch()
         if !continuingDiagnostics || diagnosticsID == nil {
             finishDiagnostics(outcome: .cancelled)
@@ -480,6 +652,7 @@ final class PlayerModel: ObservableObject {
         player.pause()
         clearItem(autoplay: autoplay && audioPolicy.permitsPlayback(sceneActive: sceneActive))
         currentEpisode = episode
+        preservesResumePosition = preservingPosition
         pendingResume = position.isFinite ? max(0, position) : 0
         elapsed = pendingResume
         duration = 0
@@ -492,7 +665,9 @@ final class PlayerModel: ObservableObject {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let source = try await service.playback(seriesID: series.id, episodeID: episode.id, fresh: fresh)
+                let source: PlaybackSource
+                if let preparedSource { source = preparedSource }
+                else { source = try await service.playback(seriesID: series.id, episodeID: episode.id, fresh: fresh) }
                 try Task.checkCancellation()
                 guard generation == requestGeneration else { return }
                 configure(source: source, generation: requestGeneration)
@@ -506,6 +681,7 @@ final class PlayerModel: ObservableObject {
     }
 
     private func configure(source: PlaybackSource, generation requestGeneration: UUID) {
+        nativeVariant = source.nativeStream?.variant
         let asset: AVURLAsset
         if let stream = source.nativeStream {
             let resourceLoader = NativeMediaAssetLoader(stream: stream)
@@ -519,6 +695,13 @@ final class PlayerModel: ObservableObject {
             asset = resourceLoader.makeAsset()
         }
         let item = AVPlayerItem(asset: asset)
+        rangesObservation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { [weak self, weak item] _, _ in
+            Task { @MainActor [weak self, weak item] in
+                guard let self, let item, self.generation == requestGeneration,
+                      self.player.currentItem === item else { return }
+                self.updateBufferedRanges()
+            }
+        }
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-playback-transition-diagnostics") {
             NSLog("PlayerPipeline configured preview=%d", isPreview ? 1 : 0)
@@ -557,6 +740,7 @@ final class PlayerModel: ObservableObject {
                 self.playbackSpeed.pause()
                 self.isPlaying = false
                 self.isBuffering = false
+                self.updatePlaybackHealth()
                 self.updateLoaderReadAheadEligibility()
                 if shouldAdvance { self.playNext() }
             }
@@ -572,8 +756,9 @@ final class PlayerModel: ObservableObject {
         progressObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.hasStarted else { return }
-                self.elapsed = time.seconds.isFinite ? max(0, time.seconds) : 0
+                if !self.isSeeking { self.elapsed = time.seconds.isFinite ? max(0, time.seconds) : 0 }
                 self.updateDuration()
+                self.updateBufferedRanges()
                 self.updateNextEpisodePrefetch()
                 if Date().timeIntervalSince(self.lastSavedAt) >= 5 { self.saveProgress() }
             }
@@ -584,8 +769,8 @@ final class PlayerModel: ObservableObject {
         guard generation == requestGeneration, !hasStarted, preparingGeneration != requestGeneration else { return }
         preparingGeneration = requestGeneration
         updateDuration()
-        let completed = duration > 0 && pendingResume >= duration - 1 && pendingResume / duration >= 0.98
-        let target = completed ? 0 : (duration > 0 ? min(pendingResume, max(0, duration - 0.5)) : pendingResume)
+        let target = PlaybackResumeTarget.target(position: pendingResume, duration: duration,
+                                                isLiveReload: preservesResumePosition) ?? 0
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration else { return }
@@ -598,6 +783,8 @@ final class PlayerModel: ObservableObject {
                 self.hasStarted = true
                 self.isLoading = false
                 self.updateLoaderReadAheadEligibility()
+                self.updateBufferedRanges()
+                self.updatePlaybackHealth()
                 if let id = self.diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: id) }
                 if self.sceneActive, self.playbackSpeed.wantsPlayback { self.resumePlayback() }
             }
@@ -613,7 +800,7 @@ final class PlayerModel: ObservableObject {
             let resumeAfterRecovery = playbackSpeed.wantsPlayback
             retryCount = 1
             beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery,
-                      continuingDiagnostics: true)
+                      continuingDiagnostics: true, preservingPosition: hasStarted || preservesResumePosition)
         } else {
             finishDiagnostics(outcome: .failed)
             isLoading = false
@@ -727,6 +914,7 @@ final class PlayerModel: ObservableObject {
     }
 
     private var resumePosition: Double {
+        if let pendingSeekTarget { return pendingSeekTarget }
         guard hasStarted else { return pendingResume }
         let current = player.currentTime().seconds
         return current.isFinite ? max(0, current) : elapsed
@@ -743,6 +931,14 @@ final class PlayerModel: ObservableObject {
     }
 
     private func clearItem(autoplay: Bool = false) {
+        healthTask?.cancel(); healthTask = nil
+        bufferingIndicator.reset()
+        showsBufferingIndicator = false
+        _ = stallRecovery.update(.init(time: ProcessInfo.processInfo.systemUptime, position: 0, waiting: false,
+            wantsPlayback: false, sceneActive: sceneActive, isReady: false, isSeeking: false, networkAvailable: false))
+        bufferedRanges = []
+        seekCoordinator.reset()
+        replaySeekToken = nil
         setLoaderReadAheadEnabled(false)
         bufferPolicy.reset()
         hasStarted = false
@@ -756,6 +952,7 @@ final class PlayerModel: ObservableObject {
         progressObserver = nil
         statusObservation?.invalidate()
         statusObservation = nil
+        rangesObservation?.invalidate(); rangesObservation = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         if let stalledObserver { NotificationCenter.default.removeObserver(stalledObserver) }
         endObserver = nil

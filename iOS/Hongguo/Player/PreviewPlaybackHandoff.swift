@@ -12,7 +12,8 @@ final class PreviewPlaybackHandoff: Identifiable {
 
     init?(model: PlayerModel, snapshot: PreviewPlaybackSnapshot,
           context: PlaybackHandoffEligibility.Context) {
-        guard let live = model.handoffPlayback, live.isReady, !live.isSeeking else { return nil }
+        guard context.quality == model.playbackQuality,
+              let live = model.handoffPlayback, live.isReady, !live.isSeeking else { return nil }
         let id = UUID()
         self.id = id; self.model = model
         eligibility = .init(requestID: id, context: context, snapshot: snapshot,

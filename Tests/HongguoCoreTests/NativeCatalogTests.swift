@@ -41,6 +41,39 @@ private actor CancellingCatalogueTransport: HTTPTransport {
     }
 }
 
+private actor NativeQualityPreparationRecorder {
+    struct Call: Equatable, Sendable {
+        let episodeID: String
+        let contentType: String
+        let fresh: Bool
+        let quality: NativePlaybackQuality
+    }
+    private(set) var calls: [Call] = []
+    func prepare(_ episodeID: String, _ contentType: String, _ fresh: Bool,
+                 _ quality: NativePlaybackQuality) -> PlaybackSource {
+        calls.append(.init(episodeID: episodeID, contentType: contentType, fresh: fresh, quality: quality))
+        return PlaybackSource(url: URL(fileURLWithPath: "/private/tmp/native-quality-fixture.mp4"))
+    }
+}
+
+private actor CancellingNativePreparation {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var calls = 0
+    func prepare() async throws -> URL {
+        calls += 1
+        started = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        try await Task.sleep(for: .seconds(30))
+        throw CatalogError.network
+    }
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+}
+
 struct NativeCatalogTests {
     @Test
     func completeNativeListDoesNotUseWebsitePreviewCount() throws {
@@ -140,6 +173,84 @@ struct NativeCatalogTests {
         let service = NativeCatalogService(transport: transport) { _, _, _ in URL(string: "https://example.com/video.mp4")! }
         do { _ = try await service.playback(seriesID: "100", episodeID: "200", fresh: false); Issue.record("Remote result accepted") }
         catch { #expect(error as? CatalogError == .unsafePlaybackURL) }
+    }
+
+    @Test
+    func qualityCopiesPreserveTheOriginalAndShareValidatedDetailWhileForwardingTheChosenQuality() async throws {
+        let recorder = NativeQualityPreparationRecorder()
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(contentType: "1005"))
+        let original = NativeCatalogService(transport: transport, prepareSource: { episodeID, contentType, fresh, quality in
+            await recorder.prepare(episodeID, contentType, fresh, quality)
+        })
+        _ = try await original.detail(id: "100")
+        let saver = original.selectingPlaybackQuality(.dataSaver)
+        let restored = saver.selectingPlaybackQuality(.automatic)
+        #expect(original.playbackQuality == .automatic)
+        #expect(saver.playbackQuality == .dataSaver)
+        #expect(restored.playbackQuality == .automatic)
+
+        _ = try await saver.playback(seriesID: "100", episodeID: "203", fresh: true)
+        _ = try await original.playback(seriesID: "100", episodeID: "200", fresh: false)
+        _ = try await restored.playback(seriesID: "100", episodeID: "201", fresh: false)
+        #expect(await transport.requests.count == 1)
+        #expect(await recorder.calls == [
+            .init(episodeID: "203", contentType: "1005", fresh: true, quality: .dataSaver),
+            .init(episodeID: "200", contentType: "1005", fresh: false, quality: .automatic),
+            .init(episodeID: "201", contentType: "1005", fresh: false, quality: .automatic)
+        ])
+    }
+
+    @Test
+    func changingQualityDoesNotWeakenCachedEpisodeOrCrossSeriesBindings() async throws {
+        let recorder = NativePreparationRecorder()
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
+        let original = NativeCatalogService(transport: transport) { episodeID, contentType, fresh in
+            await recorder.prepare(episodeID: episodeID, contentType: contentType, fresh: fresh)
+        }
+        _ = try await original.detail(id: "100")
+        let saver = original.selectingPlaybackQuality(.dataSaver)
+        do {
+            _ = try await saver.playback(seriesID: "100", episodeID: "888", fresh: true)
+            Issue.record("A quality copy prepared an episode outside the validated detail")
+        } catch { #expect(error as? CatalogError == .invalidID) }
+        #expect(await transport.requests.count == 1)
+        do {
+            _ = try await saver.playback(seriesID: "999", episodeID: "200", fresh: true)
+            Issue.record("A quality copy accepted a different series' response")
+        } catch { #expect(error as? CatalogError == .malformedResponse) }
+        #expect(await transport.requests.count == 2)
+        #expect(await recorder.calls.isEmpty)
+        // The failed copy requests do not remove or alter the original binding.
+        _ = try await original.playback(seriesID: "100", episodeID: "200", fresh: false)
+        #expect(await transport.requests.count == 2)
+        #expect(await recorder.calls == [.init(episodeID: "200", contentType: "1004", fresh: false)])
+    }
+
+    @Test
+    func qualityCopiesPreserveSourceDenialAndInFlightPreparationCancellation() async throws {
+        let denialTransport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
+        let denied = NativeCatalogService(transport: denialTransport) { _, _, _ in throw CatalogError.httpStatus(403) }
+        _ = try await denied.detail(id: "100")
+        do {
+            _ = try await denied.selectingPlaybackQuality(.dataSaver)
+                .playback(seriesID: "100", episodeID: "200", fresh: true)
+            Issue.record("Changing quality bypassed an explicit source denial")
+        } catch { #expect(error as? CatalogError == .httpStatus(403)) }
+        #expect(await denialTransport.requests.count == 1)
+
+        let gate = CancellingNativePreparation()
+        let cancellationTransport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
+        let original = NativeCatalogService(transport: cancellationTransport) { _, _, _ in try await gate.prepare() }
+        _ = try await original.detail(id: "100")
+        let copy = original.selectingPlaybackQuality(.dataSaver)
+        let task = Task { try await copy.playback(seriesID: "100", episodeID: "200", fresh: true) }
+        await gate.waitUntilStarted()
+        task.cancel()
+        do { _ = try await task.value; Issue.record("A cancelled quality preparation succeeded") }
+        catch { #expect(error is CancellationError) }
+        #expect(await gate.calls == 1)
+        #expect(await cancellationTransport.requests.count == 1)
+        #expect(original.playbackQuality == .automatic && copy.playbackQuality == .dataSaver)
     }
 }
 

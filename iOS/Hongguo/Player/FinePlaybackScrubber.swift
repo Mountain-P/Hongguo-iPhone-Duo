@@ -7,6 +7,7 @@ struct FinePlaybackScrubber: View {
     let elapsed: Double
     let duration: Double
     let disabled: Bool
+    var bufferedRanges: [PlaybackBufferedRange] = []
     let onEditingChanged: (Bool, Double) -> Void
     let onSeek: (Double) -> Void
     @Environment(\.scenePhase) private var scenePhase
@@ -23,6 +24,8 @@ struct FinePlaybackScrubber: View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
                 Capsule().fill(.white.opacity(0.25)).frame(height: scrub == nil ? 4 : 7)
+                PlaybackBufferedSegments(ranges: bufferedRanges, duration: duration,
+                                         height: scrub == nil ? 4 : 7)
                 Capsule().fill(Theme.accent)
                     .frame(width: max(0, geometry.size.width * fraction), height: scrub == nil ? 4 : 7)
                 Circle().fill(.white).frame(width: scrub == nil ? 12 : 19, height: scrub == nil ? 12 : 19)
@@ -108,5 +111,60 @@ struct FinePlaybackScrubber: View {
     private func timeLabel(_ value: Double) -> String {
         let seconds = value.isFinite ? Int(min(max(value, 0), 359_999)) : 0
         return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+}
+
+/// AVPlayer's loaded time ranges, independent of disk-cache occupancy.
+struct PlaybackBufferedSegments: View {
+    let ranges: [PlaybackBufferedRange]
+    let duration: Double
+    let height: CGFloat
+
+    var body: some View {
+        GeometryReader { geometry in
+            if duration.isFinite, duration > 0 {
+                ZStack(alignment: .leading) {
+                    ForEach(Array(ranges.enumerated()), id: \.offset) { _, range in
+                        if range.start.isFinite, range.end.isFinite, range.end > range.start {
+                            let start = min(max(range.start / duration, 0), 1)
+                            let end = min(max(range.end / duration, start), 1)
+                            Capsule().fill(.white.opacity(0.5))
+                                .frame(width: max(0, geometry.size.width * CGFloat(end - start)), height: height)
+                                .offset(x: geometry.size.width * CGFloat(start))
+                        }
+                    }
+                }
+                .frame(width: geometry.size.width, height: height, alignment: .leading)
+            }
+        }
+        .frame(height: height)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+struct PlaybackBufferedProgress: View {
+    let elapsed: Double
+    let duration: Double
+    let ranges: [PlaybackBufferedRange]
+
+    private var fraction: Double {
+        guard elapsed.isFinite, duration.isFinite, duration > 0 else { return 0 }
+        return min(max(elapsed / duration, 0), 1)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.25))
+                PlaybackBufferedSegments(ranges: ranges, duration: duration, height: 3)
+                Capsule().fill(.white.opacity(0.8))
+                    .frame(width: geometry.size.width * CGFloat(fraction))
+            }
+        }
+        .frame(height: 3)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityValue("\(Int(fraction * 100))%")
     }
 }

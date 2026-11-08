@@ -153,14 +153,22 @@ struct AccountLibraryTests {
         }
         let calls=0,invalid='';
         try{await library({...base,operation:'favorite',seriesID:'../1',favorite:true},{request:async()=>{calls++;return {code:0}}})}catch(e){invalid=e.code}
-        let timeout='';
-        try{await library({...base,operation:'history'},{budgetMS:10,request:async(signed,method,deadline,signal)=>new Promise((resolve,reject)=>{
-          calls++;signal.addEventListener('abort',()=>reject(signal.reason));})})}catch(e){timeout=e.code}
-        return {blocked,invalid,calls,timeout};
+        let timeout='',inFlightAbort=false;
+        const realNow=Date.now,frozenNow=realNow();
+        // Keep the deadline precheck from expiring during synchronous signing.
+        // The native setTimeout clock still aborts the entered request after its 10 ms budget.
+        try{
+          Date.now=()=>frozenNow;
+          try{await library({...base,operation:'history'},{budgetMS:10,request:async(signed,method,deadline,signal)=>new Promise((resolve,reject)=>{
+            calls++;const abort=()=>{inFlightAbort=true;reject(signal.reason)};
+            if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});})})}catch(e){timeout=e.code}
+        }finally{Date.now=realNow}
+        return {blocked,invalid,calls,timeout,inFlightAbort};
         """#)
         let value = try dictionary(Data(raw.utf8))
         #expect(value["blocked"] as? Int == 4 && value["invalid"] as? String == "INVALID_INPUT")
         #expect(value["calls"] as? Int == 1 && value["timeout"] as? String == "ETIMEDOUT")
+        #expect(value["inFlightAbort"] as? Bool == true)
     }
 
     @Test func nativeTransportKeepsCookiesOffRegistrationPreservesIDsAndBlocksRedirects() async throws {
