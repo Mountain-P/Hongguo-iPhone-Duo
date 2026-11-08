@@ -301,10 +301,7 @@ struct PlayerScreen: View {
 
     private var moreMenu: some View {
         Menu {
-            Button {
-                showingEpisodes = true
-                showControls()
-            } label: { Label("選集", systemImage: "square.grid.2x2") }
+            Button(action: presentEpisodePicker) { Label("選集", systemImage: "square.grid.2x2") }
             Button {
                 model.playNext()
                 showControls()
@@ -402,11 +399,39 @@ struct PlayerScreen: View {
             }
             .font(.caption.monospacedDigit())
             .frame(minHeight: 44)
+            if !isPreview {
+                Button(action: presentEpisodePicker) {
+                    HStack(spacing: 8) {
+                        Label("選集", systemImage: "list.bullet.rectangle")
+                        Spacer(minLength: 8)
+                        Text("共 \(model.episodes.count) 集")
+                            .font(.caption).foregroundStyle(.white.opacity(0.8))
+                        Image(systemName: "chevron.up")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(model.episodes.isEmpty)
+                .accessibilityLabel("選集")
+                .accessibilityValue("共 \(model.episodes.count) 集")
+                .accessibilityIdentifier("player.episodes")
+            }
             if isPreview, onSeriesSwipe != nil {
                 Text("上滑看下一部").font(.caption2).foregroundStyle(.white.opacity(0.7))
                     .frame(maxWidth: .infinity).padding(.bottom, 5)
             }
         }
+    }
+
+    private func presentEpisodePicker() {
+        clearSeekNotice()
+        cancelBoostGesture()
+        cancelEpisodeSwipe()
+        showingEpisodes = true
+        showControls()
     }
 
     @ViewBuilder
@@ -655,7 +680,7 @@ struct PlayerScreen: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                 if !isPreview {
-                    Button("選擇其他集數") { showingEpisodes = true }.buttonStyle(.bordered)
+                    Button("選擇其他集數", action: presentEpisodePicker).buttonStyle(.bordered)
                 }
             }
             .padding(24)
