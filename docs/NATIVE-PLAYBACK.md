@@ -1,4 +1,12 @@
-# 內建漸進播放（0.13.1／build 32）
+# 內建漸進播放（0.13.2／build 33）
+
+## 0.13.2 多工返回後手動恢復播放
+
+正式播放與試看共用的 `PlayerModel.togglePlayback()` 在明確要求從暫停繼續時，透過 `PlaybackInterruptionPolicy.activateForUserPlayback(sceneActive:activate:)` 先向系統呼叫 `AVAudioSession.setActive(true)`。背景時不要求啟用，只有啟用成功才解除舊 `isInterrupted` 並要求播放；啟用失敗保留中斷與暫停狀態，顯示約 3 秒的「暫時無法恢復音訊，請稍後再按播放」，播放鍵仍可重試。此提示與來源載入錯誤分開，不顯示重新取源錯誤頁，也不因此重建當前 item。
+
+正式播放返回前景只恢復前景資格，保持暫停；收到中斷結束通知本身也不授予播放意圖。手動恢復沿用當集、現場位置、選定與鎖定倍速，以及原片庫的進度 handler。片尾明確按播放仍沿用原有從頭重播規則，試看仍沿用既有卡片啟用及第一集規則；自動下一集與其他自動恢復路徑不藉此清除音訊中斷。
+
+舊政策收到中斷開始後會拒絕播放，直到收到結束通知；但 [Apple 的音訊中斷文件](https://developer.apple.com/library/archive/documentation/Audio/Conceptual/AudioSessionProgrammingGuide/HandlingAudioInterruptions/HandlingAudioInterruptions.html) 說明開始通知不保證有對應的結束通知，需在返回前景或使用者按播放時決定是否重新啟用音訊。因此「收到開始、沒有結束、保留模型再按播放」是本輪處理的可重現狀態路徑，尚不能視為手機此次回報已證實的唯一原因。此版本選擇在明確按播放時重新取得系統許可，避免單純回前景便搶回音訊。純狀態、實際 AVPlayer、模擬器及手機結果分開記於 [TESTING.md](TESTING.md)。
 
 ## 0.13.1 下方選集入口
 

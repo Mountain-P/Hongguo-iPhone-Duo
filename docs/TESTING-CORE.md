@@ -1,5 +1,13 @@
 # 內容核心驗證
 
+## 0.13.2 最終本機測試
+
+2026-11-09，`swift test --disable-sandbox`：Core 註冊 520 項／55 suites，519 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 111 項／7 suites 全通過，合計 **630 通過、1 略過、無失敗**，見 `build/core-0.13.2-final-tests.log`。
+
+`PlaybackInterruptionTests` 新增 5 項，連同原有 3 項共 8 項通過：收到開始但缺少結束通知後，明確播放且系統啟用成功才解除中斷；啟用拋錯保持中斷與暫停、下次可重試；背景不執行啟用 closure、不清狀態；沒有中斷通知也需取得系統許可；多次開始、重複往返與晚到結束通知不自行授予播放意圖。另核對正常倍速與鎖速保留。focused 紀錄 `build/core-0.13.2-interruption-tests.log` 與完整回歸重疊，不另加總。
+
+另以正式 PlayerModel、真正 macOS AVPlayer、合成影片及可注入音訊工作階段重現舊版 no-op，修正版 9 組檢查通過。音訊啟用與通知為替身，不能代替實機中斷驗收；實際範圍、模擬器多工操作與手機部署見 [TESTING.md](TESTING.md)。
+
 ## 0.13.1 最終本機測試
 
 2026-11-09，`swift test --disable-sandbox`：Core 註冊 515 項／55 suites，514 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 111 項／7 suites 全通過，合計 **625 通過、1 略過、無失敗**，見 `build/core-0.13.1-final-tests.log`。Core 播放政策未改。
