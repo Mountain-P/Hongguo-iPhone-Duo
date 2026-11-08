@@ -1,5 +1,15 @@
 # 內容核心驗證
 
+## 0.13.0 最終本機測試
+
+2026-11-08，`swift test --disable-sandbox`：Core 註冊 515 項／55 suites，514 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 101 項／6 suites 全通過，合計 **615 通過、1 略過、無失敗**，見 `build/core-0.13.0-final-tests.log`。
+
+新增 33 項 Core 測例：`PlaybackHealthTests` 13 項核對連續 12 秒有效等待才重載一次、再次等待終止、進度／seek／準備／暫停／背景／離線清除等待窗但不重置額度、非有限及倒退時間、450 ms 提示防閃，以及緩衝區間的真實缺口、裁切、合併與上限。`PlaybackSeekCoordinatorTests` 11 項核對唯一 active／最新 queued、快速反向、同位置取消舊目標、精確定位升級、失敗後接續、舊 token／reset／無效輸入與相對 ±150 ms／精確零容差；`PlaybackResumeTargetTests` 6 項區分歷史重播與當次重載，保留片尾位置、較短片長裁切及未知／無效時長。`NativeCatalogTests` 新增 3 項，核對畫質副本的參數傳遞與原服務隔離、共用已驗證目錄、跨劇集拒絕、403 及取消。
+
+完整測試初次在同時進行兩平台建置時，既有帳號 fixture 的 10 ms 預算曾在進入注入 request 前的 deadline 檢查先耗盡。測試現只在該呼叫期間固定 `Date.now` 並於 `finally` 還原，真實 10 ms abort 計時器保留；嚴格要求一次 request、`ETIMEDOUT` 及實際收到 in-flight abort。正式帳號程式、計時與簽章沒有改動，最終完整回歸重新通過。
+
+另以目前正式 `PlayerModel.swift`、真正 macOS AVPlayer 與 60 秒合成影片執行 7 組檢查，全數通過：暫停時連續相對與精確定位、播放中最新目標與 2 倍鎖速、取消定位注入後不遺失播放意圖、接近片尾的暫時錯誤重取與手動重載，以及背景拒絕定位。記錄與原碼／物件雜湊在本機 `build/player-continuity-0.13.0/`。音訊、觸覺、連線及 UI 診斷使用 shim；取消注入的目標最後仍到達，未確認 AVFoundation 回傳 `finished=false`，不把它算成該分支的實際重現。這些結果不代表 iOS 手勢、真實網路或效能提升；畫面與部署另見 [TESTING.md](TESTING.md)。
+
 ## 0.12.1 最終本機測試
 
 2026-11-08，`swift test --disable-sandbox`：Core 註冊 482 項／52 suites，481 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 101 項／6 suites 全通過，合計 **582 通過、1 略過、無失敗**，記錄 `build/core-0.12.1-final-tests.log`。

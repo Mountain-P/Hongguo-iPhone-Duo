@@ -1,5 +1,9 @@
 # 建置與安裝
 
+## 0.13.0／build 31
+
+加入持續緩衝的有界恢復、已緩衝範圍與提示防閃、當集畫質切換，以及單一執行中／最新待執行的定位協調。使用公開 AVFoundation／Network API 和既有內建取源，不增加套件、權限或外部服務；網路可用性由共用觀察器提供，不更改系統網路設定。畫質選擇只作用於目前播放器及其後續集數，不修改全域設定；簽署方式與建置前置條件保留。當版測試、畫面與手機部署見 [TESTING.md](TESTING.md)。
+
 ## 0.12.1／build 30
 
 一般播放器與試看加入左右雙點前後 10 秒及短暫方向提示，沿用公開 SwiftUI／UIKit 手勢和既有 seek／觸覺回饋，不增加套件、權限或外部服務。`generate_project.py` 收錄共用提示 View，簽署方式不變；當版測試、畫面與手機部署見 [TESTING.md](TESTING.md)。
@@ -18,7 +22,7 @@
 
 ## 前置條件
 
-- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.12.1／build 30；播放器交接、題材偏好與滿版操作不增加外部服務依賴，原有上下換集、畫質偏好及原生手機簡訊登入持續保留。
+- macOS、完整 Xcode 與 iOS 平台支援；本機驗證版本為 Xcode 27.2，並安裝 Duo 專用 runtime。當前程式版本為 0.13.0／build 31；播放器交接、題材偏好與滿版操作不增加外部服務依賴，原有上下換集、畫質偏好及原生手機簡訊登入持續保留。
 - iPhone 執行 iOS 17+；工程只啟用 iPhone device family。
 - 完整 App 建置需包含 Duo API 的 iOS 27.1+ SDK，本機使用 27.2。iOS 17 是執行下限；availability guard 不能讓舊 SDK 解析不存在的 API。
 - 選定自己的 Apple 開發團隊／簽署身分。專案不附任何開發者憑證、私鑰或 provisioning profile。
