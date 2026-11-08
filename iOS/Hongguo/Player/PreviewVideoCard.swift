@@ -247,7 +247,7 @@ private struct PreviewVideoContent: View {
         }
         .onChange(of: retainsFrame) { _, _ in synchronizeActivation(); updatePreviewQualification() }
         .onChange(of: allowsInteraction) { _, allowed in
-            if !allowed { zoom.cancelPinch(); clearSeekNotice() }
+            if !allowed { model.cancelQualityPreparation(); zoom.cancelPinch(); clearSeekNotice() }
             if allowed { clearHandoffFrame(reason: "interaction") }
             else if let handoffFrame { traceTransition("retained_preparing", frame: handoffFrame) }
             updatePreviewQualification()
@@ -622,6 +622,7 @@ private struct PreviewVideoContent: View {
 
     private func pauseRetainingFrame() {
         guard PreviewPlaybackOwner.isOwner(ownerID) else { return }
+        model.cancelQualityPreparation()
         clearSeekNotice()
         reportPositionSnapshot(allowLeaving: true)
         // With no decoded frame yet, cancellation is preferable to continuing

@@ -330,6 +330,12 @@ final class PlayerModel: ObservableObject {
         }
     }
 
+    /// Paging/route suspension cancels optional work without treating a pause as cancellation.
+    func cancelQualityPreparation() {
+        cancelQualitySwitch()
+        clearQualityNotice()
+    }
+
     private func cancelQualitySwitch() {
         qualityGeneration = UUID()
         qualityTask?.cancel(); qualityTask = nil
