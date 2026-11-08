@@ -10,12 +10,61 @@ struct ContinuePlaybackContext: Equatable, Sendable {
     var permitsStart: Bool { sceneActive && parentActive }
 }
 
+@MainActor
+protocol PlaybackRouteResource: AnyObject, Sendable {
+    func stop()
+}
+
+/// Route value copies share one resource even if SwiftUI rebuilds a cover.
+@MainActor
+final class PlaybackRouteSession {
+    private var resource: (any PlaybackRouteResource)?
+    private var isResolving = false
+    private(set) var isDisposed = false
+
+    func resolve<Resource: PlaybackRouteResource>(make: () -> Resource) -> Resource? {
+        guard !isDisposed else { return nil }
+        if let resource { return resource as? Resource }
+        guard !isResolving else { return nil }
+        isResolving = true
+        defer { isResolving = false }
+        let created = make()
+        guard !isDisposed else { created.stop(); return nil }
+        resource = created
+        return created
+    }
+
+    func dispose() {
+        guard !isDisposed else { return }
+        isDisposed = true
+        let previous = resource
+        resource = nil
+        previous?.stop()
+    }
+
+    deinit {
+        let abandoned = resource
+        Task { @MainActor in abandoned?.stop() }
+    }
+}
+
 struct ContinuePlaybackRoute: Identifiable {
     let id = UUID()
     let detail: SeriesDetail
     let continuation: PlaybackContinuation
     let service: any CatalogService
     let onProgress: (Episode, Double, Double) -> Void
+    let session: PlaybackRouteSession
+
+    @MainActor
+    init(detail: SeriesDetail, continuation: PlaybackContinuation, service: any CatalogService,
+         onProgress: @escaping (Episode, Double, Double) -> Void) {
+        self.detail = detail
+        self.continuation = continuation
+        self.service = service
+        self.onProgress = onProgress
+        self.session = PlaybackRouteSession()
+    }
 }
 
 private enum ContinuePlaybackError: Error, LocalizedError, Equatable {
@@ -87,7 +136,7 @@ final class ContinuePlaybackModel: ObservableObject {
         let identityChanged = context.map { $0.owner != value.owner || $0.revision != value.revision } ?? false
         context = value
         cancelPending()
-        if identityChanged || !value.parentActive { route = nil }
+        if identityChanged || !value.parentActive { clearRoute() }
         // Backgrounding cancels preparation. A displayed player remains mounted
         // and uses its existing scene pause policy instead of dismissing itself.
     }
@@ -206,6 +255,7 @@ final class ContinuePlaybackModel: ObservableObject {
                          progressFactory: @MainActor (SeriesDetail) -> ProgressHandler) {
         let progress = progressFactory(detail)
         launchIntent = nil; canRetry = false
+        clearRoute()
         route = .init(detail: detail, continuation: continuation, service: service, onProgress: progress)
     }
 
@@ -220,5 +270,10 @@ final class ContinuePlaybackModel: ObservableObject {
         pendingChoice = nil; pendingPreview = nil
     }
 
-    func dismiss() { cancelPending(); route = nil }
+    private func clearRoute() {
+        route?.session.dispose()
+        route = nil
+    }
+
+    func dismiss() { cancelPending(); clearRoute() }
 }

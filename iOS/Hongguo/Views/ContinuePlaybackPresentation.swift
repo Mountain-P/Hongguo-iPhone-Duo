@@ -58,14 +58,22 @@ private struct ContinuePlaybackPresentation: ViewModifier {
             }
             .fullScreenCover(item: Binding(get: { launcher.route }, set: { if $0 == nil { launcher.dismiss() } }),
                              onDismiss: { appModel.isImmersivePlayback = false }) { selection in
-                PlayerScreen(series: selection.detail.series, episodes: selection.detail.episodes,
-                             initialEpisodeID: selection.continuation.episode.id, resumeSeconds: selection.continuation.seconds,
-                             service: selection.service, onProgress: selection.onProgress,
-                             onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe,
-                             transitionFrame: matchingFrame(for: selection),
-                             onTransitionFrameConsumed: onTransitionFrameConsumed,
-                             handoff: handoff, handoffContext: handoffContext, sceneActive: context.sceneActive)
-                    .id(selection.id)
+                if let retained = selection.session.resolve(make: {
+                    PlayerScreen.makeModel(series: selection.detail.series, episodes: selection.detail.episodes,
+                        initialEpisodeID: selection.continuation.episode.id, resumeSeconds: selection.continuation.seconds,
+                        service: selection.service, onProgress: selection.onProgress, isPreview: false,
+                        handoff: handoff, context: handoffContext, sceneActive: context.sceneActive)
+                }) {
+                    PlayerScreen(series: selection.detail.series, episodes: selection.detail.episodes,
+                                 initialEpisodeID: selection.continuation.episode.id, resumeSeconds: selection.continuation.seconds,
+                                 service: selection.service, onProgress: selection.onProgress,
+                                 onClose: { launcher.dismiss() }, onSeriesSwipe: onSeriesSwipe,
+                                 transitionFrame: matchingFrame(for: selection),
+                                 onTransitionFrameConsumed: onTransitionFrameConsumed,
+                                 handoff: handoff, handoffContext: handoffContext, sceneActive: context.sceneActive,
+                                 retainedModel: retained, session: selection.session)
+                        .id(selection.id)
+                }
             }
     }
 

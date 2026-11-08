@@ -7,7 +7,7 @@ import HongguoPlayback
 import os
 
 @MainActor
-final class PlayerModel: ObservableObject {
+final class PlayerModel: ObservableObject, PlaybackRouteResource {
     let player = AVPlayer()
     @Published private(set) var series: Series
     @Published private(set) var episodes: [Episode]

@@ -1,6 +1,7 @@
 import SwiftUI
 import HongguoCore
 
+@MainActor
 private struct PlaybackRoute: Identifiable {
     let id = UUID()
     let detail: SeriesDetail
@@ -8,6 +9,7 @@ private struct PlaybackRoute: Identifiable {
     let seconds: Double
     let service: any CatalogService
     let onProgress: (Episode, Double, Double) -> Void
+    let session = PlaybackRouteSession()
 }
 
 @MainActor
@@ -105,11 +107,24 @@ struct DetailView: View {
         .refreshable { await load() }
         .onDisappear { locationTask?.cancel(); locationTask = nil }
         .sheet(isPresented: $showingPlaybackSetup) { NavigationStack { SettingsView(isSetupSheet: true) } }
-        .fullScreenCover(item: $route) { item in
-            PlayerScreen(series: item.detail.series, episodes: item.detail.episodes, initialEpisodeID: item.episode.id,
-                         resumeSeconds: item.seconds, service: item.service, onProgress: item.onProgress)
+        .fullScreenCover(item: Binding(get: { route }, set: { if $0 == nil { dismissPlayback() } })) { item in
+            if let retained = item.session.resolve(make: {
+                PlayerScreen.makeModel(series: item.detail.series, episodes: item.detail.episodes,
+                    initialEpisodeID: item.episode.id, resumeSeconds: item.seconds, service: item.service,
+                    onProgress: item.onProgress, isPreview: false, handoff: nil, context: nil, sceneActive: true)
+            }) {
+                PlayerScreen(series: item.detail.series, episodes: item.detail.episodes, initialEpisodeID: item.episode.id,
+                             resumeSeconds: item.seconds, service: item.service, onProgress: item.onProgress,
+                             onClose: dismissPlayback, retainedModel: retained, session: item.session)
+                    .id(item.id)
+            }
         }
         }
+    }
+
+    private func dismissPlayback() {
+        route?.session.dispose()
+        route = nil
     }
 
     private var hero: some View {
@@ -336,7 +351,7 @@ struct DetailView: View {
         if !keepSnapshot {
             episodeIndex = nil; selectedEpisodeGroupID = nil; locatedEpisodeID = nil
             episodeJumpText = ""; episodeJumpMessage = nil
-            route = nil; loadedService = nil; detail = nil
+            dismissPlayback(); loadedService = nil; detail = nil
         }
         isLoading = true; error = nil; refreshFailed = false
         defer { if request == loadID { isLoading = false } }
@@ -379,6 +394,7 @@ struct DetailView: View {
         guard hasCurrentSnapshot, let detail, let service = loadedService, episode.isAvailable else { return }
         let record = model.record(for: detail.series)
         guard let continuation = PlaybackContinuation.selected(seriesID: detail.series.id, episode: episode, record: record) else { return }
+        dismissPlayback()
         route = PlaybackRoute(detail: detail, episode: continuation.episode,
                               seconds: continuation.seconds,
                               service: service, onProgress: model.playbackProgressHandler(for: detail.series, episodes: detail.episodes))

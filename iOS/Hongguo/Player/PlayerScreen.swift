@@ -15,6 +15,7 @@ struct PlayerScreen: View {
     private let onClose: (() -> Void)?
     private let onSeriesSwipe: ((Int) -> Void)?
     private let isPreview: Bool
+    private let playbackSession: PlaybackRouteSession?
     private let onOpenSeries: (() -> Void)?
     private let onTransitionFrameConsumed: ((UUID) -> Void)?
     @State private var showingEpisodes = false
@@ -48,21 +49,23 @@ struct PlayerScreen: View {
          isPreview: Bool = false, onOpenSeries: (() -> Void)? = nil,
          transitionFrame: PlaybackTransitionFrame? = nil, onTransitionFrameConsumed: ((UUID) -> Void)? = nil,
          handoff: PreviewPlaybackHandoff? = nil, handoffContext: PlaybackHandoffEligibility.Context? = nil,
-         sceneActive: Bool = true) {
+         sceneActive: Bool = true, retainedModel: PlayerModel? = nil, session: PlaybackRouteSession? = nil) {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
         self.isPreview = isPreview
+        self.playbackSession = session
         self.onOpenSeries = onOpenSeries
         self.onTransitionFrameConsumed = onTransitionFrameConsumed
         _transitionFrame = State(initialValue: transitionFrame?.matches(seriesID: series.id,
-            episodeID: initialEpisodeID, seconds: resumeSeconds) == true ? transitionFrame : nil)
-        _model = StateObject(wrappedValue: Self.makeModel(series: series, episodes: episodes,
+            episodeID: retainedModel?.currentEpisode?.id ?? initialEpisodeID,
+            seconds: retainedModel?.elapsed ?? resumeSeconds) == true ? transitionFrame : nil)
+        _model = StateObject(wrappedValue: retainedModel ?? Self.makeModel(series: series, episodes: episodes,
             initialEpisodeID: initialEpisodeID, resumeSeconds: resumeSeconds, service: service,
             onProgress: onProgress, isPreview: isPreview, handoff: handoff,
             context: handoffContext, sceneActive: sceneActive))
     }
 
-    private static func makeModel(series: Series, episodes: [Episode], initialEpisodeID: String,
+    static func makeModel(series: Series, episodes: [Episode], initialEpisodeID: String,
                                   resumeSeconds: Double, service: any CatalogService,
                                   onProgress: @escaping (Episode, Double, Double) -> Void, isPreview: Bool,
                                   handoff: PreviewPlaybackHandoff?, context: PlaybackHandoffEligibility.Context?,
@@ -168,10 +171,12 @@ struct PlayerScreen: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task {
+            guard !Task.isCancelled, playbackSession?.isDisposed != true else { return }
             if isPreview { model.setAutoNext(false) }
             model.setPrefetchNetworkAllowed(!isPreview && prefetchNetworkPolicy.allowsPrefetch)
             model.setSceneActive(scenePhase == .active)
             model.start()
+            scheduleAutoHide()
         }
         .onDisappear {
             hideTask?.cancel()
@@ -180,7 +185,7 @@ struct PlayerScreen: View {
             endBoostGesture()
             cancelEpisodeSwipe()
             discardTransitionFrame()
-            model.stop()
+            if playbackSession == nil { model.stop() }
             Task { await appModel.flushLibrary() }
         }
         .onChange(of: scenePhase) { _, phase in
