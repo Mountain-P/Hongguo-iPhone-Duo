@@ -1,5 +1,13 @@
 # 內容核心驗證
 
+## 0.13.1 最終本機測試
+
+2026-11-09，`swift test --disable-sandbox`：Core 註冊 515 項／55 suites，514 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 111 項／7 suites 全通過，合計 **625 通過、1 略過、無失敗**，見 `build/core-0.13.1-final-tests.log`。Core 播放政策未改。
+
+新增 `PlaybackRouteSessionTests` 10 項，直接執行正式路由資源持有器與續播 launcher：路由值拷貝共用同一資源、只建立一次、保留第 5 集／58 秒／暫停的合成狀態、dispose 只停止一次、拒絕釋放後或類型不符的 factory、factory 重入及建立途中 dispose、遺棄時釋放，以及 launcher 關閉、身分／revision 變更與背景生命週期。既有 ContinuePlaybackModelTests 也參與完整回歸。
+
+上述使用可控替身驗證資源所有權與停止行為，不驗證 AVPlayer 解碼、SwiftUI cover 重建、實際旋轉或觸控。下方選集入口、實際換集與旋轉保留狀態、兩平台建置及手機部署另見 [TESTING.md](TESTING.md)。
+
 ## 0.13.0 最終本機測試
 
 2026-11-08，`swift test --disable-sandbox`：Core 註冊 515 項／55 suites，514 通過、1 項可選 `currentWebsiteSnapshot` 略過；AppSupport 101 項／6 suites 全通過，合計 **615 通過、1 略過、無失敗**，見 `build/core-0.13.0-final-tests.log`。
