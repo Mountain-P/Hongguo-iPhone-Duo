@@ -137,6 +137,8 @@ struct PlayerScreen: View {
                             speedBoostHint.padding(.top, 12)
                             PlaybackQualityStatus(model: model)
                                 .accessibilityIdentifier("player.qualityNotice")
+                            PlaybackAudioStatus(model: model)
+                                .accessibilityIdentifier("player.audioNotice")
                             episodeSwipeFeedback
                             if let episodeNotice {
                                 Text(episodeNotice)

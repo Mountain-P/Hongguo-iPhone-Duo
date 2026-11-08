@@ -22,6 +22,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     @Published private(set) var playbackQuality: NativePlaybackQuality = .automatic
     @Published private(set) var isSwitchingQuality = false
     @Published private(set) var qualityNotice: String?
+    @Published private(set) var audioPlaybackNotice: String?
     var supportsPlaybackQuality: Bool { service is NativeCatalogService }
     // The requested transport remains pausable while AVPlayer changes between
     // waiting and playing; clock observations alone can briefly report neither.
@@ -400,6 +401,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private var bufferingIndicator = BufferingIndicatorPolicy()
     private var qualityTask: Task<Void, Never>?
     private var qualityNoticeTask: Task<Void, Never>?
+    private var audioNoticeTask: Task<Void, Never>?
     private var qualityGeneration = UUID()
     private var pendingFormalActivation = false
     private let nextPrefetcher = NativePlaybackPrefetch()
@@ -554,11 +556,35 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
 
     func togglePlayback() {
         guard hasStarted, !isLoading, errorMessage == nil else { return }
-        if canPausePlayback { pauseAndSave() }
-        else if !audioPolicy.permitsPlayback(sceneActive: sceneActive) { return }
-        else if PlaybackReplay.shouldRestart(position: elapsed, duration: duration, reachedEnd: reachedEnd) {
+        if canPausePlayback { pauseAndSave(); return }
+        // iOS may suspend the audio session without delivering a matching end
+        // notification. Only a fresh user Play may reactivate it and clear the
+        // stale interruption; returning to the foreground never starts playback.
+        guard activateAudioForUserPlayback() else { return }
+        if PlaybackReplay.shouldRestart(position: elapsed, duration: duration, reachedEnd: reachedEnd) {
             restartFromBeginning()
         } else { resumePlayback() }
+    }
+
+    private func activateAudioForUserPlayback() -> Bool {
+        clearAudioPlaybackNotice()
+        do {
+            return try audioPolicy.activateForUserPlayback(sceneActive: sceneActive) {
+                try AVAudioSession.sharedInstance().setActive(true)
+            }
+        } catch {
+            audioPlaybackNotice = "暫時無法恢復音訊，請稍後再按播放。"
+            audioNoticeTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                self?.audioPlaybackNotice = nil
+            }
+            return false
+        }
+    }
+
+    private func clearAudioPlaybackNotice() {
+        audioNoticeTask?.cancel(); audioNoticeTask = nil
+        audioPlaybackNotice = nil
     }
 
     private func restartFromBeginning() {
@@ -592,6 +618,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func pauseAndSave() {
+        clearAudioPlaybackNotice()
         if let id = diagnosticsID { PlaybackDiagnostics.shared.recordPause(id: id) }
         cancelNextEpisodePrefetch()
         playbackSpeed.pause()
@@ -610,6 +637,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func stop() {
+        clearAudioPlaybackNotice()
         cancelQualitySwitch()
         clearQualityNotice()
         setLoaderReadAheadEnabled(false)
@@ -636,6 +664,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool,
                            continuingDiagnostics: Bool = false, preparedSource: PlaybackSource? = nil,
                            preservingPosition: Bool = false) {
+        clearAudioPlaybackNotice()
         cancelQualitySwitch()
         cancelNextEpisodePrefetch()
         if !continuingDiagnostics || diagnosticsID == nil {

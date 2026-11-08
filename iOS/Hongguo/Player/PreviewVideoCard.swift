@@ -212,6 +212,8 @@ private struct PreviewVideoContent: View {
                             }
                             PlaybackQualityStatus(model: model)
                                 .accessibilityIdentifier("preview.qualityNotice")
+                            PlaybackAudioStatus(model: model)
+                                .accessibilityIdentifier("preview.audioNotice")
                         }
                         .padding(.top, region.height < 400 ? 12 : 20)
                         .allowsHitTesting(false)

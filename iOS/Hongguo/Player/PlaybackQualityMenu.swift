@@ -85,3 +85,25 @@ struct PlaybackQualityStatus: View {
         }
     }
 }
+
+@MainActor
+struct PlaybackAudioStatus: View {
+    @ObservedObject var model: PlayerModel
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        if let notice = model.audioPlaybackNotice {
+            Text(notice)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background {
+                    if reduceTransparency { Capsule().fill(Color(white: 0.12)) }
+                    else { Capsule().fill(.ultraThinMaterial) }
+                }
+                .frame(maxWidth: 340)
+                .allowsHitTesting(false)
+        }
+    }
+}

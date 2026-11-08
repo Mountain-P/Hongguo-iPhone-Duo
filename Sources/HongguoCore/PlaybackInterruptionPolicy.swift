@@ -18,6 +18,17 @@ public struct PlaybackInterruptionPolicy: Sendable, Equatable {
 
     public func permitsPlayback(sceneActive: Bool) -> Bool { sceneActive && !isInterrupted }
 
+    /// A manual play command may recover an interruption whose ending notification
+    /// was missed while suspended, but only after the system grants audio again.
+    /// Merely returning to the foreground never calls this or grants play intent.
+    public mutating func activateForUserPlayback(sceneActive: Bool,
+                                                activate: () throws -> Void) rethrows -> Bool {
+        guard sceneActive else { return false }
+        try activate()
+        isInterrupted = false
+        return true
+    }
+
     public func shouldAdvanceAfterEnd(sceneActive: Bool, wantsPlayback: Bool, autoNext: Bool) -> Bool {
         permitsPlayback(sceneActive: sceneActive) && wantsPlayback && autoNext
     }
