@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 
-/// Only known transport failures qualify for the single fresh-source retry.
+/// Known transport failures qualify for the single fresh-source retry.
 /// Provider denial, invalid media and cancellation take precedence over an outer network error.
 public enum PlaybackRecovery {
     public static let assetErrorDomain = "HongguoNativeMediaAsset"
@@ -9,14 +9,31 @@ public enum PlaybackRecovery {
 
     public static func shouldRetry(_ error: (any Error)?, attempt: Int) -> Bool {
         guard attempt == 0, let error else { return false }
-        var errors: [any Error] = [error]
-        var current = error as NSError
-        for _ in 0..<8 {
-            guard let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError else { break }
-            errors.append(underlying); current = underlying
+        return isRetryable(error, fromAssetRead: false)
+    }
+
+    /// A version mismatch detected while reading a prepared asset terminates that
+    /// stream. The loader can report a sanitized transient failure so the player
+    /// requests a fresh source. Preparation has its own refresh budget.
+    public static func shouldRetryAssetRead(_ error: any Error) -> Bool {
+        isRetryable(error, fromAssetRead: true)
+    }
+
+    private static func isRetryable(_ error: any Error, fromAssetRead: Bool) -> Bool {
+        var current: (any Error)? = error
+        var retryable = false
+        for _ in 0...8 {
+            guard let cause = current else { break }
+            if fromAssetRead && (cause as? NativeProgressiveError) == .changedSource {
+                retryable = true
+            } else {
+                if isTerminal(cause) { return false }
+                if isTransient(cause) { retryable = true }
+            }
+            // Keep typed Swift errors when a wrapper carries them as its cause.
+            current = (cause as NSError).userInfo[NSUnderlyingErrorKey] as? any Error
         }
-        if errors.contains(where: isTerminal) { return false }
-        return errors.contains(where: isTransient)
+        return retryable
     }
 
     private static func isTerminal(_ error: any Error) -> Bool {

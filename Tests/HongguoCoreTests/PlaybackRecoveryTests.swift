@@ -12,6 +12,7 @@ struct PlaybackRecoveryTests {
             NSError(domain: PlaybackRecovery.assetErrorDomain, code: PlaybackRecovery.transientAssetErrorCode)]
         for error in errors {
             #expect(PlaybackRecovery.shouldRetry(error, attempt: 0))
+            #expect(PlaybackRecovery.shouldRetryAssetRead(error))
             #expect(!PlaybackRecovery.shouldRetry(error, attempt: 1))
             #expect(!PlaybackRecovery.shouldRetry(error, attempt: 2))
         }
@@ -38,5 +39,35 @@ struct PlaybackRecoveryTests {
         let avError = NSError(domain: "AVFoundationErrorDomain", code: -11800,
                               userInfo: [NSUnderlyingErrorKey: network])
         #expect(PlaybackRecovery.shouldRetry(avError, attempt: 0))
+    }
+
+    @Test func onlyAssetReadsClassifyAChangedSourceForFreshRecovery() {
+        let changed = NativeProgressiveError.changedSource
+        let wrapped = NSError(domain: "AVFoundationErrorDomain", code: -11800,
+                              userInfo: [NSUnderlyingErrorKey: changed])
+        #expect(PlaybackRecovery.shouldRetryAssetRead(changed))
+        #expect(PlaybackRecovery.shouldRetryAssetRead(wrapped))
+        #expect(!PlaybackRecovery.shouldRetry(changed, attempt: 0))
+        #expect(!PlaybackRecovery.shouldRetry(wrapped, attempt: 0))
+        #expect(!PlaybackRecovery.shouldRetryAssetRead(NativeProgressiveError.invalidRange))
+        #expect(!PlaybackRecovery.shouldRetryAssetRead(NativeProgressiveError.unsupportedRange))
+
+        let sanitized = NSError(domain: PlaybackRecovery.assetErrorDomain,
+                                code: PlaybackRecovery.transientAssetErrorCode)
+        #expect(PlaybackRecovery.shouldRetry(sanitized, attempt: 0))
+        #expect(!PlaybackRecovery.shouldRetry(sanitized, attempt: 1))
+    }
+
+    @Test func nestedDenialUnsafeURLAndCancellationOverrideAnAssetRetrySignal() {
+        let terminal: [any Error] = [CatalogError.unauthorized, CatalogError.httpStatus(403),
+            CatalogError.unsafePlaybackURL, NativeMediaError.unsafeURL, CancellationError(), URLError(.cancelled),
+            NSError(domain: PlaybackRecovery.assetErrorDomain, code: 429)]
+        for cause in terminal {
+            let wrapped = NSError(domain: PlaybackRecovery.assetErrorDomain,
+                                  code: PlaybackRecovery.transientAssetErrorCode,
+                                  userInfo: [NSUnderlyingErrorKey: cause])
+            #expect(!PlaybackRecovery.shouldRetryAssetRead(wrapped))
+            #expect(!PlaybackRecovery.shouldRetry(wrapped, attempt: 0))
+        }
     }
 }

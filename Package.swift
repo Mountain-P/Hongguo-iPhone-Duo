@@ -20,7 +20,7 @@ let package = Package(
                           "App/LibraryPersistence.swift", "App/AppError.swift", "App/CatalogModel.swift", "App/LibraryBrowserModel.swift",
                           "App/PosterImagePipeline.swift", "App/ContinuePlaybackModel.swift",
                           "App/RecommendationPreviewModel.swift"]),
-        .testTarget(name: "HongguoCoreTests", dependencies: ["HongguoCore"]),
+        .testTarget(name: "HongguoCoreTests", dependencies: ["HongguoCore", "HongguoPlayback"]),
         .testTarget(name: "HongguoAppSupportTests", dependencies: ["HongguoCore", "HongguoAppSupport"]),
         .executableTarget(name: "NativePlaybackCheck", dependencies: ["HongguoCore", "HongguoPlayback"], path: "Tools/NativePlaybackCheck"),
         .executableTarget(name: "CatalogDiscoveryCheck", dependencies: ["HongguoCore"], path: "Tools/CatalogDiscoveryCheck"),

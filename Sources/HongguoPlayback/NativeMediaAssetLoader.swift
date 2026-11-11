@@ -8,6 +8,31 @@ import UniformTypeIdentifiers
 /// The Core stream owns network policy, CENC processing and bounded range caching.
 /// Retain this loader for as long as its asset is in use, then call invalidate().
 public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    struct ReadAheadWindow {
+        static let chunkSize = 512 * 1024
+        private static let windowBytes = 16 * 1024 * 1024
+
+        private var next = 0
+        private var end = 0
+        var hasPendingRange: Bool { next < end }
+
+        mutating func extend(after cursor: Int, totalLength: Int) {
+            end = cursor + min(Self.windowBytes, totalLength - cursor)
+        }
+
+        mutating func skipConsumedChunks(before cursor: Int) {
+            next = max(next, cursor / Self.chunkSize * Self.chunkSize)
+        }
+
+        mutating func nextRange(after prefetched: Range<Int>?, totalLength: Int) -> Range<Int>? {
+            // A temporary failure must leave the attempted chunk eligible for the
+            // next demand. Advance only when the worker confirms a successful fetch.
+            if let prefetched { next = prefetched.upperBound }
+            guard hasPendingRange else { return nil }
+            return next..<(next + min(Self.chunkSize, totalLength - next))
+        }
+    }
+
     private final class Pending {
         let request: AVAssetResourceLoadingRequest
         let generation = UUID()
@@ -25,8 +50,6 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private let stream: NativeMediaStream
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.native-asset")
     private let chunkSize = 256 * 1024
-    private let aheadChunkSize = 512 * 1024
-    private let aheadWindow = 16 * 1024 * 1024
     // All AVFoundation loading-request references are read and mutated only on queue.
     private var pending: [ObjectIdentifier: Pending] = [:]
     private var stopped = false
@@ -34,8 +57,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private var readAheadStorageFailed = false
     private var readAheadTask: Task<Void, Never>?
     private var readAheadGeneration = UUID()
-    private var readAheadNext = 0
-    private var readAheadEnd = 0
+    private var readAheadWindow = ReadAheadWindow()
     private var latestDemandRequest: ObjectIdentifier?
     private var lastDemandEnd: Int?
 
@@ -141,7 +163,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         let identifier = ObjectIdentifier(loadingRequest)
         // A seek takes the foreground slot before its first bytes arrive. Cancelling
         // this loader's speculative consumer does not cancel an attached demand reader.
-        if let previous = lastDemandEnd, abs(start - previous) > aheadChunkSize {
+        if let previous = lastDemandEnd, abs(start - previous) > ReadAheadWindow.chunkSize {
             cancelReadAhead(); lastDemandEnd = nil
         }
         latestDemandRequest = identifier
@@ -213,20 +235,21 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
 
     private func extendReadAhead(after cursor: Int) {
         guard readAheadEnabled, !readAheadStorageFailed, !stopped, cursor < stream.totalLength else { return }
-        let start = cursor / aheadChunkSize * aheadChunkSize
-        readAheadEnd = cursor + min(aheadWindow, stream.totalLength - cursor)
+        readAheadWindow.extend(after: cursor, totalLength: stream.totalLength)
         if readAheadTask == nil {
-            readAheadNext = max(start, readAheadNext)
-            guard readAheadNext < readAheadEnd else { return }
+            readAheadWindow.skipConsumedChunks(before: cursor)
+            guard readAheadWindow.hasPendingRange else { return }
             let generation = UUID(); readAheadGeneration = generation
             let stream = stream
             readAheadTask = Task(priority: .utility) { [weak self] in
                 var completed = false
                 var storageFailed = false
                 do {
-                    while let range = await self?.nextReadAheadRange(generation: generation) {
+                    var prefetched: Range<Int>?
+                    while let range = await self?.nextReadAheadRange(after: prefetched, generation: generation) {
                         try Task.checkCancellation()
                         try await stream.prefetch(range: range)
+                        prefetched = range
                     }
                     completed = true
                 } catch PlaybackPrefetchError.unsupported { storageFailed = true }
@@ -236,17 +259,15 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         }
     }
 
-    private func nextReadAheadRange(generation: UUID) async -> Range<Int>? {
+    private func nextReadAheadRange(after prefetched: Range<Int>?, generation: UUID) async -> Range<Int>? {
         await withCheckedContinuation { continuation in
             queue.async { [weak self] in
                 guard let self, !self.stopped, self.readAheadEnabled,
-                      self.readAheadGeneration == generation, self.readAheadNext < self.readAheadEnd else {
+                      self.readAheadGeneration == generation else {
                     continuation.resume(returning: nil); return
                 }
-                let start = self.readAheadNext
-                let end = start + min(self.aheadChunkSize, self.stream.totalLength - start)
-                self.readAheadNext = end
-                continuation.resume(returning: start..<end)
+                let range = self.readAheadWindow.nextRange(after: prefetched, totalLength: self.stream.totalLength)
+                continuation.resume(returning: range)
             }
         }
     }
@@ -256,7 +277,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
             guard let self, self.readAheadGeneration == generation else { return }
             self.readAheadTask = nil
             if storageFailed { self.readAheadStorageFailed = true }
-            if continueIfExtended, self.readAheadNext < self.readAheadEnd, let cursor = self.lastDemandEnd {
+            if continueIfExtended, self.readAheadWindow.hasPendingRange, let cursor = self.lastDemandEnd {
                 self.extendReadAhead(after: cursor)
             }
         }
@@ -265,7 +286,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private func cancelReadAhead() {
         readAheadGeneration = UUID()
         readAheadTask?.cancel(); readAheadTask = nil
-        readAheadNext = 0; readAheadEnd = 0
+        readAheadWindow = ReadAheadWindow()
     }
 
     private func finish(request identifier: ObjectIdentifier, generation: UUID, error: (any Error)? = nil) {
@@ -287,7 +308,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
 
     private static func sanitized(_ error: any Error) -> NSError {
         if error is CancellationError { return failure(code: -999, message: "影片載入已取消。") }
-        if PlaybackRecovery.shouldRetry(error, attempt: 0) {
+        if PlaybackRecovery.shouldRetryAssetRead(error) {
             return failure(code: PlaybackRecovery.transientAssetErrorCode, message: "影片連線暫時中斷，請重試。")
         }
         if let media = error as? NativeMediaError {
