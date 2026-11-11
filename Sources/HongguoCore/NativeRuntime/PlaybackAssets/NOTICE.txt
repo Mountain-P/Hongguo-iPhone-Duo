@@ -1,5 +1,11 @@
 App playback source and signature attribution
 
+The primary anonymous playback adapter follows jackotom/hongguo-drama v7.0,
+commit 3f5927d0d605ff7742fde8cbd1bb92ffe951b080, src/native/app-source.js.
+playback-signature.js is copied unchanged from that commit, GPL-3.0-only.
+The copied module retains its original provenance header.
+https://github.com/jackotom/hongguo-drama/tree/3f5927d0d605ff7742fde8cbd1bb92ffe951b080/src/native
+
 The necessary signature, Spade URL and content-key routines in app-source.js
 are adapted from N3urda/hongguoTV server/vendor/hongguo.cjs, commit
  eea73e6a45569a2cbbb9440f7cd5290c459b0b70.

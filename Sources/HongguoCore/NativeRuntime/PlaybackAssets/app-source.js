@@ -27,6 +27,11 @@ const DEVICE = {
     update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
     compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
+const VIDEO_TAB_DEVICE = { ...DEVICE, version_code: '73932', version_name: '7.3.9.32',
+    manifest_version_code: '73932', update_version_code: '73932', pv_player: '73932' };
+
+const PRIMARY_INLINE_UA = VIDEO_UA.replace(DEVICE.version_code, '74332');
+
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
 function jsonBody(value) { try { return JSON.parse(value); } catch { return null; } }
@@ -160,6 +165,32 @@ function playbackRequest(payload, identity, host = new URL(VIDEO_API).hostname) 
         'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
         'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
     } };
+}
+
+// The current anonymous model request follows jackotom/hongguo-drama v7.0.
+// Only the playback route uses this signer; metadata and account helpers retain theirs.
+function primaryPlaybackRequest(vid, identity) {
+    const { signPlayer } = require('./playback-signature');
+    const requestTicket = Date.now();
+    const timestamp = Math.floor(requestTicket / 1000);
+    const device = { ...VIDEO_TAB_DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
+    const query = pythonUrlEncode({ ...device, video_id: vid, video_id_type: '0', device_level: '1',
+        need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0',
+        video_platform: '1024', source: '0', from_video_id: '', ts: String(timestamp), _rticket: String(requestTicket) });
+    const signed = signPlayer({ query, body: null, ts: timestamp });
+    return {
+        url: `${VIDEO_TAB_API}?${query}`,
+        method: 'GET',
+        headers: {
+            'User-Agent': VIDEO_UA.replace(DEVICE.version_code, device.version_code),
+            Accept: 'application/json; charset=utf-8,application/x-protobuf',
+            'x-ss-req-ticket': signed['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
+            'passport-sdk-version': '50561', 'x-ss-dp': String(device.aid),
+            'x-khronos': signed['x-khronos'], 'x-ladon': signed['x-ladon'], 'x-argus': signed['x-argus'],
+            'x-tt-dt': '', 'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
+            'x-tt-request-tag': 't=0;n=0',
+        },
+    };
 }
 
 function parseSearchInteger(value) {
@@ -471,15 +502,12 @@ function boundedSignal(signal, deadline, limit) {
 }
 
 const playbackRecovery = createPlaybackRecovery({
-    register: ({ scope, signal, deadline }) => registerPlaybackDevice(requestJson, {
-        isolated: true, captureCookies: scope === 'tab', signal, deadline,
+    register: ({ signal, deadline }) => registerPlaybackDevice(requestJson, {
+        isolated: true, signal, deadline,
     }),
     getModel: (vid, identity, { signal, deadline }) => {
-        const query = pythonUrlEncode({ ...DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid,
-            _rticket: String(Date.now()), video_id: vid, video_id_type: '0', device_level: '1',
-            need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '' });
-        return requestJson(`${VIDEO_TAB_API}?${query}`, { forbidRedirects: true,
-            headers: { 'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8', ...(identity.cookie ? { Cookie: identity.cookie } : {}) } },
+        const request = primaryPlaybackRequest(vid, identity);
+        return requestJson(request.url, { method: request.method, headers: request.headers, forbidRedirects: true },
         Math.min(deadline, Date.now() + 5000), boundedSignal(signal, deadline, 5000));
     },
     postModel: (vid, contentType, identity, host, { signal, deadline, hostIndex }) => {
@@ -496,13 +524,13 @@ const playbackRecovery = createPlaybackRecovery({
     consume: consumeAppPlayResponse,
 });
 
-async function consumeAppPlayResponse(response, vid, options, { signal, deadline }) {
+async function consumeAppPlayResponse(response, vid, options, { signal, deadline, route }) {
     checkActive(signal, deadline);
     if (Number(response.Code || response.code || 0) !== 0) throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
     const entry = response.data?.[vid];
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
-    if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
-    const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+    if (!model || typeof model !== 'object' || Array.isArray(model)) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
+    const inline = model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
     const readFallback = async () => {
         const fallback = parseFallback(model.fallback_api);
         if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
@@ -516,7 +544,8 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     };
     if (!inline) return parseAppPlayModel(await readFallback(), vid, options, false);
     try {
-        return parseAppPlayModel(model, vid, options, true);
+        const inlineUserAgent = route === 'video_tab' ? PRIMARY_INLINE_UA : PLAYBACK_UA;
+        return parseAppPlayModel(model, vid, { ...options, inlineUserAgent }, true);
     } catch (error) {
         // Only absent encryption metadata enables this recovery path; the fallback
         // must independently pass identity, duration, encryption and URL validation.
@@ -607,7 +636,7 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
                     if (seen.has(identity)) continue;
                     seen.add(identity);
                     variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, source: 'app', vid,
-                        userAgent: inline ? PLAYBACK_UA : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
+                        userAgent: inline ? (options.inlineUserAgent ?? PLAYBACK_UA) : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
                         ...(requestedQuality === 'auto' ? {} : { width: selected.width, height: selected.height }) });
                     if (options.playbackQuality) Object.assign(variants[variants.length - 1], {
                         width: selected.width || undefined, height: selected.height || undefined,

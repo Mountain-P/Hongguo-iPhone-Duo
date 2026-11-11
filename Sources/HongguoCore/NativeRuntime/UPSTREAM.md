@@ -10,6 +10,8 @@ The Buffer compatibility layer is pinned to these official npm tarballs. The ori
 - `base64-js` 1.5.1: https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz
 - `ieee754` 1.2.1: https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz
 
+The current primary anonymous playback request follows `src/native/app-source.js` in jackotom/hongguo-drama v7.0, commit `3f5927d0d605ff7742fde8cbd1bb92ffe951b080`. `playback-signature.js` is copied byte-for-byte from the same commit under GPL-3.0-only, with its original provenance header. The local adapter uses the pinned primary request profile and inline-media user agent with the existing registration, transport, parsing, and cancellation code. Explicit HTTP 401/403/429 and registration denials stop recovery. An empty HTTP 200 model response keeps its own error code. Existing account and metadata request helpers retain their separate profiles.
+
 `source-sha256.json` records the bundled JavaScript bytes. `runtime.js` and all Swift adapters are new local GPL-3.0-only code. The app evaluates only this bundled source using JavaScriptCore; it does not download executable JavaScript or include Node, npm, a browser engine, Go, or FFmpeg as a playback dependency.
 
 `runtime.js` supplies the subset of CommonJS, Buffer, URL, timers, Promise HTTP and AbortSignal used by the bundled modules. Native adapters replace `node:crypto` with CryptoKit hashes, Security random bytes and CommonCrypto AES-CBC/CTR/ECB; replace `node:zlib` with system zlib; and replace Axios with ephemeral URLSession transactions. The cipher shim buffers its update inputs until final, which preserves the bundled registration and URL-decryption call sequences; it is not a general replacement for every Node streaming API.

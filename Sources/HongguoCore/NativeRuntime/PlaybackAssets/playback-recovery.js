@@ -2,8 +2,10 @@
 // Protocol contract checked against aston314/hongguo-tv 36508246eeca2cf5ef1f29f7f17f8e985d50ae2e.
 // Anonymous video_tab identity is separate from each legacy POST resolution.
 const LEGACY_HOSTS = Object.freeze(['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
-const RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_HTTP = new Set([408, 425, 500, 502, 503, 504]);
 const RETRYABLE_NETWORK = new Set(['ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK']);
+const TERMINAL_HTTP = new Set([401, 403, 429]);
+const DENIAL_CODES = new Set(['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED']);
 
 function failure(code, message) { return Object.assign(new Error(message), { code }); }
 function checkActive(signal, deadline, now = Date.now) {
@@ -11,9 +13,10 @@ function checkActive(signal, deadline, now = Date.now) {
     if (now() >= deadline) throw failure('ETIMEDOUT', '播放准备超时，请重试');
 }
 function terminal(error) {
-    return [401, 403].includes(Number(error?.status))
-        || ['BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE'].includes(error?.code)
-        || ['BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.registrationFailure);
+    return TERMINAL_HTTP.has(Number(error?.status))
+        || DENIAL_CODES.has(error?.code) || DENIAL_CODES.has(error?.registrationFailure)
+        || ['NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE', 'ERR_CANCELED', 'ABORT_ERR'].includes(error?.code)
+        || error?.name === 'AbortError';
 }
 function retryable(error) {
     if (error?.stage && error.stage !== 'multi_video_model') return false;
@@ -45,7 +48,7 @@ function createPlaybackRecovery({ register, getModel, postModel, consume, now = 
             }
             const response = normalizeVideoTabEnvelope(vid, await getModel(vid, tabIdentity, { signal, deadline }));
             checkActive(signal, deadline, now);
-            const value = await consume(response, vid, options, { signal, deadline });
+            const value = await consume(response, vid, options, { signal, deadline, route: 'video_tab' });
             checkActive(signal, deadline, now);
             return { value, recovery: { route: 'video_tab', attempts: 1 } };
         } catch (error) {

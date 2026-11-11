@@ -126,10 +126,12 @@ final class NativeJSRuntime: @unchecked Sendable {
         context.setObject(clear, forKeyedSubscript: "_nativeClearTimer" as NSString)
         context.setObject(complete, forKeyedSubscript: "_nativeComplete" as NSString)
         let modules = ["buffer": "buffer/index", "base64-js": "base64-js/index", "ieee754": "ieee754/index",
-                       "app-source": "app-source", "playback-device": "playback-device", "playback-recovery": "playback-recovery", "sm3": "sm3", "download-quality": "download-quality", "new-releases": "new-releases", "account-library": "account-library", "native-phone-auth": "native-phone-auth"]
+                       "app-source": "app-source", "playback-device": "playback-device", "playback-recovery": "playback-recovery",
+                       "playback-signature": "playback-signature", "sm3": "sm3", "download-quality": "download-quality",
+                       "new-releases": "new-releases", "account-library": "account-library", "native-phone-auth": "native-phone-auth"]
         var sources: [String: String] = [:]
         for (name, path) in modules { sources[name] = try resource(path) }
-        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest, parseAppPlayModel };" }
+        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest, primaryPlaybackRequest, consumeAppPlayResponse, parseAppPlayModel };" }
         context.setObject(sources, forKeyedSubscript: "__moduleSources" as NSString)
         context.evaluateScript(try resource("runtime"))
         guard context.exception == nil else { throw NativeSourceError(code: "RUNTIME_BOOTSTRAP") }

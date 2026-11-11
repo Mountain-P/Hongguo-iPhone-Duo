@@ -29,6 +29,8 @@ public struct NativeSourceError: Error, Sendable, LocalizedError {
         switch code {
         case "NO_COMPATIBLE_SOURCE", "QUALITY_UNAVAILABLE": "本集暫未提供 iPhone 支援的影片格式。"
         case "BUSINESS_REJECTED", "HTTP_401", "HTTP_403": "來源目前未授權提供本集播放。"
+        case "EMPTY_RESPONSE": "來源未回傳影片資料，請稍後重試。"
+        case "HTTP_429": "來源暫時限制請求，請稍後重試。"
         case "ETIMEDOUT": "影片準備逾時，請重試。"
         case "APP_INPUT": "分集或內容類型無效。"
         default: "影片來源暫時無法使用，請稍後重試。"

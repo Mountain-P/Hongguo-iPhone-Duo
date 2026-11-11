@@ -58,6 +58,50 @@ struct NativeRuntimeTests {
         #expect(value["search"] as? String == "7.2.2.32")
     }
 
+    @Test func primaryPlaybackRequestUsesTheRegisteredProfileAndRequestedEpisode() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (() => {
+          Date.now = () => 1800000000999;
+          const identity = {device_id:'7000000000000000001',iid:'7000000000000000002',
+            cdid:'00000000-0000-4000-8000-000000000001',cookie:'sessionid=DO_NOT_USE',version_name:'9.9.9'};
+          const request = require('app-source').audit.primaryPlaybackRequest('7000000000000000003', identity);
+          const url = new URL(request.url);
+          return {method:request.method, emptyBody:request.body == null, host:url.hostname,
+            episode:url.searchParams.get('video_id'), profile:url.searchParams.get('version_name'),
+            signed:['x-argus','x-ladon'].every(name => typeof request.headers[name] === 'string' && request.headers[name].length > 8),
+            noCookie:!url.searchParams.has('cookie') && !Object.keys(request.headers).some(name => name.toLowerCase() === 'cookie')};
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["method"] as? String == "GET")
+        #expect(value["host"] as? String == "api5-normal-sinfonlineb.fqnovel.com")
+        #expect(value["episode"] as? String == "7000000000000000003")
+        #expect(value["profile"] as? String == "7.3.9.32")
+        for key in ["emptyBody", "signed", "noCookie"] { #expect(value[key] as? Bool == true) }
+    }
+
+    @Test func keyedInlineModelStillRequiresTheRequestedEpisodeAndTrustedMedia() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (async () => {
+          const consume = require('app-source').audit.consumeAppPlayResponse;
+          const model = url => ({video_list:{main:{main_url:url, codec_type:'h264',
+            width:1080, height:1920, encrypt:false}}});
+          const envelope = (id, url) => ({data:{[id]:{video_model:JSON.stringify(model(url))}}});
+          const accepted = 'https://unit.fqnovelvod.com/test.mp4';
+          const parse = response => consume(response, '100', {quality:'auto'}, {deadline:Date.now()+500});
+          const outcome = async response => {try {await parse(response);return 'accepted'} catch(error){return error.code}};
+          const source = await parse(envelope('100', accepted));
+          return {correct:source.url === accepted && source.codec === 'h264',
+            wrongEpisode:await outcome(envelope('101', accepted)),
+            wrongHost:await outcome(envelope('100', 'https://blocked.invalid/test.mp4'))};
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["correct"] as? Bool == true)
+        #expect(value["wrongEpisode"] as? String == "MISSING_MODEL")
+        #expect(value["wrongHost"] as? String == "SECURITY_BLOCKED")
+    }
+
     @Test func registrationEnvelopeDecryptsAndCookiesAreAccountFree() async throws {
         let result = try await NativeJSRuntime().evaluateForTesting(#"""
         (async () => {
@@ -132,6 +176,23 @@ struct NativeRuntimeTests {
         }
     }
 
+    @Test func playbackCompletionPreservesEmptyResponseAndHTTPDenials() async throws {
+        for (status, code, expected) in [(200, "EMPTY_RESPONSE", "EMPTY_RESPONSE"), (403, "BUSINESS_REJECTED", "HTTP_403"),
+                                         (429, "ERR_NETWORK", "HTTP_429")] {
+            let result = try await NativeJSRuntime().evaluateForTesting("""
+                (() => {
+                  require('app-source').fetchAppPlayUrl = async () => {
+                    throw Object.assign(new Error('fixture'), {status: \(status), code: '\(code)'});
+                  };
+                  __startResolve('100', '1004');
+                  return new Promise(() => {});
+                })()
+                """)
+            let value = try dictionary(Data(result.utf8))
+            #expect(value["error"] as? String == expected)
+        }
+    }
+
     @Test func javascriptRecoveryHonorsBoundsAndTerminalDenials() async throws {
         let result = try await NativeJSRuntime().evaluateForTesting(#"""
         (async () => {
@@ -141,11 +202,17 @@ struct NativeRuntimeTests {
           const resolve=createPlaybackRecovery({register:async({scope})=>{const i={id:registered.length};registered.push(scope);return i},
             getModel:async()=>{throw empty()},postModel:async(vid,type,i,host)=>{hosts.push(host);identities.push(i.id);throw empty()},consume:async()=>({})});
           try {await resolve('100')}catch(_){}
-          let deniedPosts=0;
-          const denied=createPlaybackRecovery({register:async()=>({}),getModel:async()=>{throw Object.assign(new Error('denied'),{status:403})},
-            postModel:async()=>{deniedPosts++},consume:async()=>({})});
-          try {await denied('100')}catch(_){}
-          return {registered,hosts,identities,deniedPosts,expected:LEGACY_HOSTS};
+          const deniedAttempts=[];
+          for (const denial of [{status:401},{status:403},{status:429},
+            {code:'DEVICE_REGISTRATION_FAILED',registrationFailure:'HTTP_429'},
+            {code:'BUSINESS_REJECTED'}]) {
+            let registrations=0, requests=0;
+            const rejected=Object.assign(new Error('denied'),denial);
+            const denied=createPlaybackRecovery({register:async()=>{registrations++;return{}},
+              getModel:async()=>{requests++;throw rejected},postModel:async()=>{requests++},consume:async()=>({})});
+            try {await denied('100')}catch(error){deniedAttempts.push({registrations,requests,original:error===rejected})}
+          }
+          return {registered,hosts,identities,deniedAttempts,expected:LEGACY_HOSTS};
         })()
         """#)
         let value = try dictionary(Data(result.utf8))
@@ -153,7 +220,13 @@ struct NativeRuntimeTests {
         #expect(value["identities"] as? [Int] == [1, 1, 2, 2])
         let hosts = try #require(value["expected"] as? [String])
         #expect(value["hosts"] as? [String] == hosts + hosts)
-        #expect(value["deniedPosts"] as? Int == 0)
+        let deniedAttempts = try #require(value["deniedAttempts"] as? [[String: Any]])
+        #expect(deniedAttempts.count == 5)
+        for denial in deniedAttempts {
+            #expect(denial["registrations"] as? Int == 1)
+            #expect(denial["requests"] as? Int == 1)
+            #expect(denial["original"] as? Bool == true)
+        }
     }
 
     private func data(_ hex: String) -> Data {

@@ -136,6 +136,15 @@
             global._nativeComplete(JSON.stringify({ url: source.url, contentKey: source.contentKey, userAgent: source.userAgent,
                 codec: source.codec, quality: source.quality, preference, qualityFallback: source.qualityFallback === true,
                 width: source.width, height: source.height }));
-        }, error => { global._nativeComplete(JSON.stringify({ error: error.status ? 'HTTP_' + error.status : String(error.code || 'SOURCE_UNAVAILABLE') })); });
+        }, error => {
+            const status = Number(error.status);
+            const registrationFailure = error.registrationFailure;
+            let code = String(error.code || 'SOURCE_UNAVAILABLE');
+            if (Number.isInteger(status) && status >= 400 && status <= 599) code = `HTTP_${status}`;
+            else if (['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(registrationFailure)) {
+                code = registrationFailure;
+            }
+            global._nativeComplete(JSON.stringify({ error: code }));
+        });
     };
 })(globalThis);
