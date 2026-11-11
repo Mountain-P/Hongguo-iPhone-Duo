@@ -118,7 +118,9 @@ struct SettingsView: View {
     private var playbackCacheSection: some View {
         Section("播放快取") {
             LabeledContent("已使用", value: ByteCountFormatter.string(fromByteCount: Int64(playbackCacheBytes), countStyle: .file))
-            Text("分段快取最多使用約 0.5 GB，空間不足會自動回收。播放時依倍速增加緩衝；主動預讀僅在非低數據、非低耗電的 Wi‑Fi 等網路啟用。")
+            Text("播放快取用來減少觀看時的卡頓，強制關閉 App 後會重新取源。要斷網觀看，請到「我的 → 離線下載」。")
+                .font(.footnote).foregroundStyle(.secondary)
+            Text("快取最多使用約 0.5 GB，空間不足會自動回收。主動預讀會依網路與電量狀態調整。")
                 .font(.footnote).foregroundStyle(.secondary)
             Button(isClearingPlaybackCache ? "正在清除…" : "清除播放快取") {
                 isClearingPlaybackCache = true

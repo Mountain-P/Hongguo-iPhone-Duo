@@ -164,14 +164,16 @@ struct NativeChunkDiskCacheTests {
         let old = directory.appendingPathComponent("\(id.uuidString.lowercased())-0")
         let link = directory.appendingPathComponent("\(UUID().uuidString.lowercased())-2")
         let unrelated = directory.appendingPathComponent("unrelated.txt"), outside = root.appendingPathComponent("outside")
+        let unicodeName = String(repeating: "影", count: 14)
         try Data([8]).write(to: old)
         try Data([4]).write(to: unrelated)
+        try Data([5]).write(to: directory.appendingPathComponent(unicodeName))
         try Data([7]).write(to: outside)
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
         let cache = NativeChunkDiskCache(directory: directory, freeSpaceProvider: { _ in Int64.max })
         #expect(await cache.lookup(streamID: id, index: 0, expectedBytes: 1).data == nil)
         #expect(await cache.byteCount == 0)
-        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["unrelated.txt"])
+        #expect(try Set(FileManager.default.contentsOfDirectory(atPath: directory.path)) == ["unrelated.txt", unicodeName])
         #expect(try Data(contentsOf: outside) == Data([7]))
     }
 

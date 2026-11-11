@@ -68,11 +68,12 @@ struct ContinuePlaybackRoute: Identifiable {
 }
 
 private enum ContinuePlaybackError: Error, LocalizedError, Equatable {
-    case recordRemoved, recordChanged
+    case recordRemoved, recordChanged, preparationTimedOut
     var errorDescription: String? {
         switch self {
         case .recordRemoved: "這筆觀看紀錄已移除，請從劇集詳情選擇播放。"
         case .recordChanged: "觀看紀錄已變更，請重新選擇播放位置。"
+        case .preparationTimedOut: "劇集準備逾時，請重試。"
         }
     }
 }
@@ -102,9 +103,11 @@ final class ContinuePlaybackModel: ObservableObject {
     @Published private(set) var pendingChoice: ContinuePlaybackChoice?
     @Published private(set) var canRetry = false
     private let loadDetail: @Sendable (any CatalogService, String) async throws -> SeriesDetail
+    private let preparationTimeout: Duration
     private var context: ContinuePlaybackContext?
     private var generation = UUID()
     private(set) var operation: Task<Void, Never>?
+    private var preparationDeadline: Task<Void, Never>?
     private struct LaunchIntent {
         let series: Series
         let requiresRecord: Bool
@@ -124,12 +127,19 @@ final class ContinuePlaybackModel: ObservableObject {
     private var launchIntent: LaunchIntent?
     private var pendingPreview: PendingPreview?
 
-    init(loadDetail: @escaping @Sendable (any CatalogService, String) async throws -> SeriesDetail = { service, id in
+    init(preparationTimeout: Duration = .seconds(30),
+         loadDetail: @escaping @Sendable (any CatalogService, String) async throws -> SeriesDetail = { service, id in
         if let bridge = service as? BridgeService { return try await bridge.verifiedDetail(id: id) }
         return try await service.detail(id: id)
-    }) { self.loadDetail = loadDetail }
+    }) {
+        self.preparationTimeout = preparationTimeout
+        self.loadDetail = loadDetail
+    }
 
-    deinit { operation?.cancel() }
+    deinit {
+        operation?.cancel()
+        preparationDeadline?.cancel()
+    }
 
     func updateContext(_ value: ContinuePlaybackContext) {
         guard context != value else { return }
@@ -168,6 +178,7 @@ final class ContinuePlaybackModel: ObservableObject {
         launchIntent = intent
         let request = generation
         let loader = loadDetail
+        let deadline = ContinuousClock.now.advanced(by: preparationTimeout)
         preparingSeriesID = intent.series.id
         operation = Task { @MainActor [weak self] in
             // Do not retain the model across an uncooperative transport suspension.
@@ -180,6 +191,12 @@ final class ContinuePlaybackModel: ObservableObject {
             catch {
                 self?.recordFailure(error, intent: intent, request: request)
             }
+        }
+        preparationDeadline = Task { @MainActor [weak self] in
+            do { try await Task.sleep(until: deadline, clock: .continuous) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            self?.expirePreparation(request: request)
         }
     }
 
@@ -217,7 +234,26 @@ final class ContinuePlaybackModel: ObservableObject {
 
     private func finish(request: UUID) {
         guard generation == request else { return }
+        clearPreparation()
+    }
+
+    private func clearPreparation() {
+        preparationDeadline?.cancel()
+        preparationDeadline = nil
         preparingSeriesID = nil; operation = nil
+    }
+
+    private func expirePreparation(request: UUID) {
+        guard generation == request, operation != nil, let intent = launchIntent else { return }
+        guard accepts(intent, request: request) else { discardCancelled(request: request); return }
+        // A transport may ignore cancellation. Invalidate its generation before
+        // exposing Retry so the old completion cannot affect the new request.
+        generation = UUID()
+        operation?.cancel()
+        clearPreparation()
+        failedSeriesID = intent.series.id
+        errorMessage = ContinuePlaybackError.preparationTimedOut.errorDescription
+        canRetry = true
     }
 
     private func discardCancelled(request: UUID) {
@@ -265,8 +301,9 @@ final class ContinuePlaybackModel: ObservableObject {
 
     func cancelPending() {
         canRetry = false; launchIntent = nil
-        generation = UUID(); operation?.cancel(); operation = nil
-        preparingSeriesID = nil; failedSeriesID = nil; errorMessage = nil
+        generation = UUID(); operation?.cancel()
+        clearPreparation()
+        failedSeriesID = nil; errorMessage = nil
         pendingChoice = nil; pendingPreview = nil
     }
 

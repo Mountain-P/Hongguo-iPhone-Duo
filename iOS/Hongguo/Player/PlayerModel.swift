@@ -362,8 +362,10 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private let preferences = PlaybackPreferencesStore.shared
     private let initialEpisodeID: String
     private let resumeSeconds: Double
+    private let startupTimeout: Duration
     private var onProgress: (Episode, Double, Double) -> Void
     private var loadTask: Task<Void, Never>?
+    private var startupWatchdog: Task<Void, Never>?
     private var generation = UUID()
     private var loader: AuthenticatedMediaLoader?
     private var progressiveLoader: NativeMediaAssetLoader?
@@ -413,11 +415,12 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,
-         isPreview: Bool = false) {
+         isPreview: Bool = false, startupTimeout: Duration = .seconds(30)) {
         self.series = series
         self.episodes = episodes.sorted { $0.number < $1.number }
         self.initialEpisodeID = initialEpisodeID
         self.resumeSeconds = resumeSeconds.isFinite ? max(0, resumeSeconds) : 0
+        self.startupTimeout = startupTimeout
         self.service = service
         self.onProgress = onProgress
         self.isPreview = isPreview
@@ -631,9 +634,15 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func setSceneActive(_ active: Bool) {
+        let wasActive = sceneActive
         sceneActive = active
         updateLoaderReadAheadEligibility()
-        if !active { cancelQualitySwitch(); episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave() }
+        if !active {
+            cancelStartupWatchdog()
+            cancelQualitySwitch(); episodeTransitionFrame = nil; endSpeedBoost(); pauseAndSave()
+        } else if !wasActive && isLoading {
+            monitorStartup(generation)
+        }
     }
 
     func stop() {
@@ -697,22 +706,48 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         loadStartedAt = Date()
         loggedPlaybackStart = false
         reachedEnd = false
+        monitorStartup(requestGeneration)
+        let service = self.service
+        let seriesID = series.id
         loadTask = Task { [weak self] in
-            guard let self else { return }
             do {
                 let source: PlaybackSource
                 if let preparedSource { source = preparedSource }
-                else { source = try await service.playback(seriesID: series.id, episodeID: episode.id, fresh: fresh) }
+                else { source = try await service.playback(seriesID: seriesID, episodeID: episode.id, fresh: fresh) }
                 try Task.checkCancellation()
-                guard generation == requestGeneration else { return }
-                configure(source: source, generation: requestGeneration)
+                guard let self, self.generation == requestGeneration else { return }
+                self.configure(source: source, generation: requestGeneration)
             } catch is CancellationError {
-                return
+                // Superseded requests have already changed generation or been
+                // cancelled. A source may also interrupt the current request.
+                guard let self, self.generation == requestGeneration, !Task.isCancelled else { return }
+                self.handleFailure(generation: requestGeneration, error: NSError(
+                    domain: NSURLErrorDomain, code: URLError.cancelled.rawValue,
+                    userInfo: [NSLocalizedDescriptionKey: "影片載入中斷，請重新取源。"]))
             } catch {
-                guard generation == requestGeneration, !Task.isCancelled else { return }
-                handleFailure(generation: requestGeneration, error: error)
+                guard let self, self.generation == requestGeneration, !Task.isCancelled else { return }
+                self.handleFailure(generation: requestGeneration, error: error)
             }
         }
+    }
+
+    private func monitorStartup(_ requestGeneration: UUID) {
+        cancelStartupWatchdog()
+        guard sceneActive, isLoading else { return }
+        let timeout = startupTimeout
+        startupWatchdog = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: timeout) } catch { return }
+            guard let self, !Task.isCancelled, self.sceneActive, self.isLoading,
+                  self.generation == requestGeneration else { return }
+            self.handleFailure(generation: requestGeneration, error: NSError(
+                domain: NSURLErrorDomain, code: URLError.timedOut.rawValue,
+                userInfo: [NSLocalizedDescriptionKey: "影片載入逾時，請重新取源。"]))
+        }
+    }
+
+    private func cancelStartupWatchdog() {
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
     }
 
     private func configure(source: PlaybackSource, generation requestGeneration: UUID) {
@@ -817,6 +852,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 self.elapsed = target
                 self.hasStarted = true
                 self.isLoading = false
+                self.cancelStartupWatchdog()
                 self.updateLoaderReadAheadEligibility()
                 self.updateBufferedRanges()
                 self.updatePlaybackHealth()
@@ -829,6 +865,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private func handleFailure(generation requestGeneration: UUID, error: (any Error)? = nil) {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
         if error is CancellationError { return }
+        cancelStartupWatchdog()
         let willRetry = PlaybackRecovery.shouldRetry(error, attempt: retryCount)
         if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: willRetry) }
         if willRetry {
@@ -838,6 +875,12 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                       continuingDiagnostics: true, preservingPosition: hasStarted || preservesResumePosition)
         } else {
             finishDiagnostics(outcome: .failed)
+            if isLoading {
+                generation = UUID()
+                loadTask?.cancel()
+                loadTask = nil
+                clearItem()
+            }
             isLoading = false
             errorMessage = error?.localizedDescription ?? "目前無法播放這一集。請重新取源，或選擇其他集數。"
             pauseAndSave()
@@ -966,6 +1009,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     private func clearItem(autoplay: Bool = false) {
+        cancelStartupWatchdog()
         healthTask?.cancel(); healthTask = nil
         bufferingIndicator.reset()
         showsBufferingIndicator = false

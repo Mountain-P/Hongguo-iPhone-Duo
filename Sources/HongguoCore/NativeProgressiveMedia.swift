@@ -293,7 +293,7 @@ public actor NativeMediaStream: Hashable {
         guard let diskCache, !range.isEmpty else { return }
         guard !readAheadStorageFailed else { throw PlaybackPrefetchError.unsupported }
         guard diskWriteCount < 2 else { throw NativeMediaError.busy }
-        guard await diskCache.allowsPrefetch else { throw PlaybackPrefetchError.unsupported }
+        try await checkDiskPrefetchAvailability(diskCache)
         var offset = max(range.lowerBound, prefix.count)
         while offset < range.upperBound {
             try Task.checkCancellation()
@@ -303,7 +303,7 @@ public actor NativeMediaStream: Hashable {
             let index = offset / chunkSize, start = index * chunkSize
             let end = min(totalLength, start + chunkSize)
             if cache[index] == nil {
-                guard await diskCache.allowsPrefetch else { throw PlaybackPrefetchError.unsupported }
+                try await checkDiskPrefetchAvailability(diskCache)
                 let raw = try await sharedChunk(index: index, range: start..<end, wantsClearBytes: false)
                 guard raw.storedOnDisk else {
                     if raw.writeBusy { throw NativeMediaError.busy }
@@ -314,6 +314,14 @@ public actor NativeMediaStream: Hashable {
             offset = min(end, range.upperBound)
         }
         try Task.checkCancellation()
+    }
+
+    private func checkDiskPrefetchAvailability(_ diskCache: NativeChunkDiskCache) async throws {
+        switch await diskCache.prefetchAvailability {
+        case .available: return
+        case .opening: throw NativeMediaError.busy
+        case .unavailable: throw PlaybackPrefetchError.unsupported
+        }
     }
 
     private func cacheClearChunk(_ raw: Data, index: Int, range: Range<Int>) throws -> Data {
@@ -379,7 +387,8 @@ public actor NativeMediaStream: Hashable {
             // chunk goes straight to HTTP rather than waiting for a guaranteed miss.
             if !bypassDisk, let diskCache {
                 let lookup = await diskCache.lookup(streamID: self.id, index: index, expectedBytes: range.count)
-                raw = lookup.data; diskGeneration = lookup.generation
+                raw = lookup.data
+                diskGeneration = lookup.acceptsWrites ? lookup.generation : nil
             }
             try Task.checkCancellation()
             guard flights[index]?.id == id else { return }
@@ -441,10 +450,10 @@ public actor NativeMediaStream: Hashable {
                 let abandoned = flights.values; flights.removeAll()
                 for flight in abandoned { flight.task?.cancel() }
                 optionalDiskWrites.values.forEach { $0.cancel() }
-                if let diskCache { await diskCache.remove(streamID: self.id) }
                 for flight in abandoned {
                     flight.waiters.values.forEach { $0.continuation.resume(throwing: error) }
                 }
+                if let diskCache { await diskCache.remove(streamID: self.id) }
             } else {
                 let completed = flights.removeValue(forKey: index)
                 completed?.waiters.values.forEach { $0.continuation.resume(throwing: error) }

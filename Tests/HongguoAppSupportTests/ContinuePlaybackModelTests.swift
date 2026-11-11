@@ -471,6 +471,38 @@ struct ContinuePlaybackModelTests {
         #expect(launcher.route?.detail.series.id == "200" && !launcher.canRetry)
     }
 
+    @Test func hangingDetailExposesManualRetryAndRejectsItsLateCompletion() async throws {
+        let latestDetail = detail()
+        let service = ContinueServiceProbe(immediateDetails: [2: latestDetail])
+        let launcher = ContinuePlaybackModel(preparationTimeout: .milliseconds(150))
+        let box = ContinueBox(record: record(seconds: 10))
+        defer { Task { await service.release("100", detail: latestDetail) } }
+
+        launch(launcher, service: service, box: box)
+        let expired = try #require(launcher.operation)
+        await service.waitForCalls(1)
+        for _ in 0..<200 where !launcher.canRetry { try await Task.sleep(for: .milliseconds(10)) }
+        try #require(launcher.canRetry)
+        #expect(expired.isCancelled && launcher.operation == nil && launcher.preparingSeriesID == nil)
+        #expect(launcher.errorMessage == "劇集準備逾時，請重試。")
+        #expect(launcher.route == nil && box.factories == 0)
+        #expect(await service.detailCalls == 1)
+
+        box.record = record(seconds: 45)
+        launcher.retry()
+        let retry = try #require(launcher.operation)
+        await retry.value
+        let route = try #require(launcher.route)
+        #expect(route.continuation.seconds == 45)
+        #expect(await service.detailCalls == 2)
+
+        // The first request returned after the replacement despite being cancelled.
+        await service.release("100", detail: detail(seriesID: "200"))
+        await expired.value
+        #expect(launcher.route?.id == route.id && box.factories == 1)
+        #expect(launcher.operation == nil && launcher.errorMessage == nil && !launcher.canRetry)
+    }
+
     @Test func aCancelledStaleStartCannotCancelAFreshPendingLaunch() async throws {
         let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: nil)
         launch(launcher, service: service, box: box, requiresRecord: false, selection: .preview(preview(position: 25)))
@@ -564,10 +596,14 @@ private actor ContinueServiceProbe: CatalogService {
     private(set) var videoCalls = 0
     private var gates: [String: CheckedContinuation<SeriesDetail, any Error>] = [:]
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private let immediateDetails: [Int: SeriesDetail]
+    init(immediateDetails: [Int: SeriesDetail] = [:]) { self.immediateDetails = immediateDetails }
+
     func detail(id: String) async throws -> SeriesDetail {
         detailCalls += 1
         let ready = waiters.filter { $0.0 <= detailCalls }; waiters.removeAll { $0.0 <= detailCalls }
         ready.forEach { $0.1.resume() }
+        if let detail = immediateDetails[detailCalls] { return detail }
         return try await withCheckedThrowingContinuation { gates[id] = $0 }
     }
     func waitForCalls(_ count: Int) async {

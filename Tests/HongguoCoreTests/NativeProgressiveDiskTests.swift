@@ -19,6 +19,39 @@ struct NativeProgressiveDiskTests {
         return (directory, NativeChunkDiskCache(directory: directory, byteLimit: limit, freeSpaceProvider: { _ in Int64.max }))
     }
 
+    @Test func coldCacheOpeningDoesNotDelayFirstDemandOrPermanentlyDisableReadAhead() async throws {
+        let fixture = fixture(), bytes = ControlledProgressiveBytes(fixture.data), gate = ProgressiveDiskWriteGate()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Hongguo.ProgressiveColdCache.\(UUID())")
+        defer { gate.release(); try? FileManager.default.removeItem(at: directory) }
+        gate.arm()
+        let disk = NativeChunkDiskCache(directory: directory, freeSpaceProvider: { _ in Int64.max }, opensInBackground: true,
+                                        prepareDirectory: { directory in
+            _ = gate.capacity()
+            return NativeChunkDiskCache.prepareDirectory(directory)
+        })
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes, diskCache: disk)
+        #expect(!gate.entered)
+        #expect(await bytes.ranges == [0..<(256 * 1024)])
+
+        let returned = ProgressiveCompletionFlag()
+        let demand = Task {
+            defer { returned.mark() }
+            return try await stream.read(range: 600_000..<600_128)
+        }
+        try await wait { gate.entered }
+        try await wait { returned.completed }
+        #expect(try await demand.value == fixture.data.subdata(in: 600_000..<600_128))
+        #expect(await stream.pendingDiskWriteCount == 0)
+        await #expect(throws: NativeMediaError.busy) { try await stream.prefetch(range: (2 * chunk)..<(3 * chunk)) }
+        #expect(await bytes.ranges.count == 2)
+
+        gate.release()
+        try await wait { await disk.allowsPrefetch }
+        try await stream.prefetch(range: (2 * chunk)..<(3 * chunk))
+        #expect(await disk.byteCount == chunk)
+        #expect(await bytes.ranges.count == 3)
+    }
+
     @Test func rawReadAheadUsesDiskWithoutDecryptingAndDemandUsesThePrefetchedBytes() async throws {
         let fixture = fixture(encrypted: true), bytes = ControlledProgressiveBytes(fixture.data)
         let (directory, disk) = try disk(); defer { try? FileManager.default.removeItem(at: directory) }
@@ -202,16 +235,21 @@ struct NativeProgressiveDiskTests {
         let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes, diskCache: disk)
         await bytes.holdPayload(); gate.arm()
         let success = Task { try await stream.read(range: 600_000..<600_128) }
-        let denied = Task { try await stream.read(range: (3 * chunk)..<(3 * chunk + 16)) }
+        let denialReturned = ProgressiveCompletionFlag()
+        let denied = Task {
+            defer { denialReturned.mark() }
+            return try await stream.read(range: (3 * chunk)..<(3 * chunk + 16))
+        }
         try await wait { await bytes.pendingCount == 2 }
         await bytes.release(start: chunk)
         _ = try await success.value
         try await wait { gate.entered }
         await bytes.release(start: 3 * chunk, error: CatalogError.httpStatus(403))
-        // The terminal handler has synchronously revoked every flight before disk cleanup.
-        try await wait { await stream.pendingReaderCount == 0 }
-        gate.release()
+        // A blocked optional write must not delay delivery of the terminal error.
+        try await wait { denialReturned.completed }
         await #expect(throws: CatalogError.httpStatus(403)) { try await denied.value }
+        #expect(await stream.pendingReaderCount == 0)
+        gate.release()
         try await wait { await stream.pendingDiskWriteCount == 0 }
         #expect(await disk.byteCount == 0)
         #expect(await disk.lookup(streamID: stream.id, index: 1, expectedBytes: chunk).data == nil)
