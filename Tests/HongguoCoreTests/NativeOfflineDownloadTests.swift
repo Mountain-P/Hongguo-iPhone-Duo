@@ -84,6 +84,53 @@ private actor OfflineHeldTransfer: NativeOfflineMediaDownloading {
 }
 
 struct NativeOfflineDownloadTests {
+    @Test func importedVideoSurvivesSourceRemovalAndReopening() async throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("episode.mp4")
+        let library = directory.appendingPathComponent("library", isDirectory: true)
+        let bytes = clearMP4()
+        try bytes.write(to: source)
+        let queue = try OfflineDownloads(directory: library) { _, _, _, _ in
+            Issue.record("Local import must not use the network provider")
+            throw CatalogError.network
+        }
+        try await queue.importVideo(from: source, title: "匯入測試")
+        let item = try #require(await queue.snapshot().first)
+        #expect(item.state == .completed)
+        #expect(item.key.scope == OfflineDownloads.importedScope)
+        #expect(try Data(contentsOf: source) == bytes)
+        try FileManager.default.removeItem(at: source)
+        try await queue.recordProgress(for: item.key, position: 3, duration: 10)
+
+        let reopened = try OfflineDownloads(directory: library) { _, _, _, _ in throw CatalogError.network }
+        let saved = try #require(try await reopened.localURL(for: item.key))
+        #expect(try Data(contentsOf: saved) == bytes)
+        #expect(await reopened.snapshot().first?.position == 3)
+        try await reopened.delete(item.key)
+        #expect(!FileManager.default.fileExists(atPath: saved.path))
+    }
+
+    @Test func protectedOrOversizeImportsNeverEnterTheLibrary() async throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("episode.mp4")
+        let library = directory.appendingPathComponent("library", isDirectory: true)
+        let protected = clearMP4(sampleEntry: "encv")
+        let queue = try OfflineDownloads(directory: library,
+            limits: .init(maximumBytesPerItem: Int64(protected.count))) { _, _, _, _ in throw CatalogError.network }
+        try protected.write(to: source)
+        await #expect(throws: OfflineDownloadError.invalidFile) {
+            try await queue.importVideo(from: source, title: "加密測試")
+        }
+        try (protected + Data([0])).write(to: source)
+        await #expect(throws: OfflineDownloadError.fileTooLarge) {
+            try await queue.importVideo(from: source, title: "超過上限")
+        }
+        #expect(await queue.snapshot().isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: library.appendingPathComponent("staging").path).isEmpty)
+    }
+
     @Test func exactEpisodeTransfersWithoutCredentialsAndStagesUnmodifiedMP4() async throws {
         let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("episode.stage")

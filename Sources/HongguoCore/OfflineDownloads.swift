@@ -56,7 +56,7 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
 }
 
 public enum OfflineDownloadError: Error, LocalizedError, Equatable, Sendable {
-    case invalidItem, tooManyItems, storageFull, fileTooLarge, invalidFile, storageUnavailable, invalidIndex
+    case invalidItem, tooManyItems, storageFull, fileTooLarge, invalidFile, storageUnavailable, invalidIndex, busy
 
     public var errorDescription: String? {
         switch self {
@@ -67,6 +67,7 @@ public enum OfflineDownloadError: Error, LocalizedError, Equatable, Sendable {
         case .invalidFile: "離線影片不完整，請重新下載。"
         case .storageUnavailable: "目前無法存取離線下載，請稍後再試。"
         case .invalidIndex: "無法讀取離線下載清單，已保留現有檔案。"
+        case .busy: "片庫正在下載或匯入影片，請稍後再試。"
         }
     }
 }
@@ -74,6 +75,7 @@ public enum OfflineDownloadError: Error, LocalizedError, Equatable, Sendable {
 /// One queue owns one application-private directory. The provider writes the
 /// complete playable file at its assigned staging URL and respects the byte cap.
 public actor OfflineDownloads {
+    public static let importedScope = "local.import.v1"
     public typealias Progress = @Sendable (Int64, Int64?) async -> Void
     public typealias Provider = @Sendable (OfflineDownloadItem, URL, Int64, @escaping Progress) async throws -> Void
 
@@ -117,6 +119,7 @@ public actor OfflineDownloads {
     private let provider: Provider
     private var records: [Record]
     private var job: Job?
+    private var isImporting = false
     private var observers: [UUID: AsyncStream<[OfflineDownloadItem]>.Continuation] = [:]
 
     public init(directory: URL, limits: Limits = .init(), provider: @escaping Provider) throws {
@@ -166,6 +169,46 @@ public actor OfflineDownloads {
         startNext()
     }
 
+    /// Copies a user-selected file into the same private, integrity-checked library.
+    public func importVideo(from source: URL, title: String) async throws {
+        guard source.isFileURL, source.pathExtension.lowercased() == "mp4" else {
+            throw OfflineDownloadError.invalidFile
+        }
+        guard !isImporting, job == nil else { throw OfflineDownloadError.busy }
+        guard records.count < limits.maximumItems else { throw OfflineDownloadError.tooManyItems }
+        let fileID = UUID()
+        let id = fileID.uuidString
+        let key = OfflineDownloadKey(scope: Self.importedScope, seriesID: id, episodeID: id)
+        var item = OfflineDownloadItem(key: key, seriesTitle: title, episodeNumber: 1)
+        guard Disk.valid(item) else { throw OfflineDownloadError.invalidItem }
+        let maximumBytes = try transferLimit()
+        let folder = disk.staging.appendingPathComponent(id, isDirectory: true)
+        let destination = folder.appendingPathComponent("import.mp4")
+        try disk.createDirectory(folder)
+        isImporting = true
+        defer {
+            disk.remove(folder)
+            isImporting = false
+            startNext()
+        }
+        let copy = Task.detached(priority: .utility) {
+            try Disk.prepareImport(source: source, destination: destination, maximumBytes: maximumBytes)
+        }
+        let (size, checksum) = try await withTaskCancellationHandler {
+            try await copy.value
+        } onCancel: { copy.cancel() }
+        try Task.checkCancellation()
+        guard records.count < limits.maximumItems else { throw OfflineDownloadError.tooManyItems }
+        guard try disk.availableBytes() >= limits.reserveBytes else { throw OfflineDownloadError.storageFull }
+        let final = disk.movie(fileID)
+        try disk.move(destination, to: final)
+        item.state = .completed
+        item.receivedBytes = size
+        item.totalBytes = size
+        do { try commit(records + [Record(item: item, fileID: fileID, checksum: checksum)]) }
+        catch { disk.remove(final); throw error }
+    }
+
     public func cancel(_ key: OfflineDownloadKey) throws {
         guard let index = index(for: key), [.queued, .downloading].contains(records[index].item.state) else { return }
         var updated = records
@@ -176,7 +219,7 @@ public actor OfflineDownloads {
     }
 
     public func retry(_ key: OfflineDownloadKey) throws {
-        guard let index = index(for: key), [.failed, .cancelled].contains(records[index].item.state),
+        guard key.scope != Self.importedScope, let index = index(for: key), [.failed, .cancelled].contains(records[index].item.state),
               !records[index].item.isOfflineUnsupported else { return }
         var updated = records
         var record = updated.remove(at: index)
@@ -240,7 +283,7 @@ public actor OfflineDownloads {
     }
 
     private func startNext() {
-        guard job == nil else { return }
+        guard job == nil, !isImporting else { return }
         while let index = records.firstIndex(where: { $0.item.state == .queued }) {
             let token = UUID()
             let folder = disk.staging.appendingPathComponent(token.uuidString, isDirectory: true)
@@ -531,6 +574,40 @@ public actor OfflineDownloads {
             guard let size = try regularFileSize(url) else { throw OfflineDownloadError.invalidFile }
             guard size <= maximumBytes else { throw OfflineDownloadError.fileTooLarge }
             return size
+        }
+
+        static func prepareImport(source: URL, destination: URL, maximumBytes: Int64) throws -> (Int64, Data) {
+            var coordinationError: NSError?
+            var outcome: Result<(Int64, Data), any Error>?
+            NSFileCoordinator().coordinate(readingItemAt: source, options: .withoutChanges, error: &coordinationError) { url in
+                outcome = Result {
+                    let size = try validatedSize(url, maximumBytes: maximumBytes)
+                    guard FileManager.default.createFile(atPath: destination.path, contents: nil,
+                                                         attributes: [.posixPermissions: 0o600]) else {
+                        throw OfflineDownloadError.storageUnavailable
+                    }
+                    let input = try FileHandle(forReadingFrom: url)
+                    defer { try? input.close() }
+                    let output = try FileHandle(forWritingTo: destination)
+                    defer { try? output.close() }
+                    var hash = SHA256()
+                    var copied: Int64 = 0
+                    while let bytes = try input.read(upToCount: 1024 * 1024), !bytes.isEmpty {
+                        try Task.checkCancellation()
+                        guard Int64(bytes.count) <= size - copied else { throw OfflineDownloadError.invalidFile }
+                        try output.write(contentsOf: bytes)
+                        hash.update(data: bytes)
+                        copied += Int64(bytes.count)
+                    }
+                    guard copied == size else { throw OfflineDownloadError.invalidFile }
+                    let media = try Data(contentsOf: destination, options: .mappedIfSafe)
+                    do { try NativeMP4.validateOfflineClear(data: media, maximumBytes: maximumBytes) }
+                    catch is NativeMediaError { throw OfflineDownloadError.invalidFile }
+                    return (copied, Data(hash.finalize()))
+                }
+            }
+            guard coordinationError == nil, let outcome else { throw OfflineDownloadError.storageUnavailable }
+            return try outcome.get()
         }
 
         static func hashFile(_ url: URL, size: Int64) throws -> Data {

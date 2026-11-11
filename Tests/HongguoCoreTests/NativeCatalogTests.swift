@@ -129,12 +129,71 @@ struct NativeCatalogTests {
     @Test
     func playbackWithoutPriorDetailLoadsBindingAndPreservesSourceDenial() async throws {
         let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
-        let service = NativeCatalogService(transport: transport) { _, _, _ in throw CatalogError.httpStatus(403) }
+        let recorder = NativePreparationRecorder()
+        let service = NativeCatalogService(transport: transport) { episode, type, fresh in
+            _ = await recorder.prepare(episodeID: episode, contentType: type, fresh: fresh)
+            throw CatalogError.httpStatus(403)
+        }
         do {
             _ = try await service.playback(seriesID: "100", episodeID: "203", fresh: false)
             Issue.record("An explicit denial was lost")
         } catch { #expect(error as? CatalogError == .httpStatus(403)) }
         #expect(await transport.requests.count == 1)
+        #expect(await recorder.calls == [.init(episodeID: "203", contentType: "1004", fresh: false)])
+    }
+
+    @Test
+    func unsafeInitialPreparationRequeriesTheSameEpisodeAndQualityOnce() async throws {
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(contentType: "1005"))
+        let recorder = NativeQualityPreparationRecorder()
+        let service = NativeCatalogService(transport: transport, quality: .dataSaver, prepareSource: { episode, type, fresh, quality in
+            let source = await recorder.prepare(episode, type, fresh, quality)
+            guard fresh else { throw NativeMediaError.unsafeURL }
+            return source
+        })
+        let source = try await service.playback(seriesID: "100", episodeID: "203", fresh: false)
+        #expect(source.url.isFileURL)
+        #expect(await transport.requests.count == 1)
+        #expect(await recorder.calls == [
+            .init(episodeID: "203", contentType: "1005", fresh: false, quality: .dataSaver),
+            .init(episodeID: "203", contentType: "1005", fresh: true, quality: .dataSaver)
+        ])
+    }
+
+    @Test
+    func unsafePreparationCannotRetryAnExplicitRefreshOrPrefetchOrLoop() async throws {
+        let cases: [(fresh: Bool, prefetchBudget: Int?, expected: [Bool])] = [
+            (false, nil, [false, true]), (true, nil, [true]),
+            (false, NativePlaybackPrefetch.maximumPreparationBytes, [false])
+        ]
+        for entry in cases {
+            let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
+            let recorder = NativePreparationRecorder()
+            let service = NativeCatalogService(transport: transport) { episode, type, refresh in
+                _ = await recorder.prepare(episodeID: episode, contentType: type, fresh: refresh)
+                throw NativeMediaError.unsafeURL
+            }
+            await #expect(throws: NativeMediaError.unsafeURL) {
+                try await NativePrefetchContext.$maximumBytes.withValue(entry.prefetchBudget) {
+                    try await service.playback(seriesID: "100", episodeID: "203", fresh: entry.fresh)
+                }
+            }
+            #expect(await recorder.calls.map(\.fresh) == entry.expected)
+        }
+    }
+
+    @Test
+    func cancellationAtAnUnsafePreparationStopsBeforeRefresh() async throws {
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML())
+        let recorder = NativePreparationRecorder()
+        let service = NativeCatalogService(transport: transport) { episode, type, fresh in
+            _ = await recorder.prepare(episodeID: episode, contentType: type, fresh: fresh)
+            withUnsafeCurrentTask { $0?.cancel() }
+            throw NativeMediaError.unsafeURL
+        }
+        let task = Task { try await service.playback(seriesID: "100", episodeID: "203", fresh: false) }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await recorder.calls.map(\.fresh) == [false])
     }
 
     @Test

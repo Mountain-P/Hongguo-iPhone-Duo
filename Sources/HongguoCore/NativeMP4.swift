@@ -114,10 +114,11 @@ public struct NativeMP4StreamPlan: Sendable {
 
 public enum NativeMP4 {
     /// Checks a complete, self-contained clear MP4 without modifying any bytes.
-    static func validateOfflineClear(data: Data, codec: String) throws {
+    static func validateOfflineClear(data: Data, codec: String? = nil,
+                                     maximumBytes: Int64 = Int64(NativeMediaStore.maximumBytes)) throws {
         try Task.checkCancellation()
-        guard data.count <= NativeMediaStore.maximumBytes else { throw NativeMediaError.tooLarge }
-        let parser = NativeMP4Parser(data: data, sourceCodec: codec.lowercased())
+        guard data.count <= maximumBytes else { throw NativeMediaError.tooLarge }
+        let parser = NativeMP4Parser(data: data, sourceCodec: codec?.lowercased())
         guard try parser.prepare(clearOnly: true).videoEntries > 0 else { throw NativeMediaError.malformedMP4 }
     }
 
@@ -287,13 +288,13 @@ private struct NativeMP4EncryptionInfo {
 
 private final class NativeMP4Parser {
     private let data: Data
-    private let sourceCodec: String
+    private let sourceCodec: String?
     private let coverage: [Range<Int>]?
     private let maximumSamples = 250_000
     private var boxCount = 0
     private var auxiliaryBytes = 0
 
-    init(data: Data, sourceCodec: String, coverage: [Range<Int>]? = nil) {
+    init(data: Data, sourceCodec: String?, coverage: [Range<Int>]? = nil) {
         self.data = data; self.sourceCodec = sourceCodec; self.coverage = coverage
     }
 
@@ -502,6 +503,8 @@ private final class NativeMP4Parser {
     private func validateVideoCodec(_ code: String) throws {
         let avc = ["avc1", "avc3"].contains(code)
         let hevc = ["hvc1", "hev1"].contains(code)
+        guard avc || hevc else { throw NativeMediaError.unsupportedCodec }
+        guard let sourceCodec else { return }
         let sourceAVC = ["h264", "avc", "avc1", "avc3"].contains(sourceCodec)
         guard (avc && sourceAVC) || (hevc && !sourceAVC) else { throw NativeMediaError.unsupportedCodec }
     }

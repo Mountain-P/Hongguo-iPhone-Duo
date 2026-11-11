@@ -1,5 +1,6 @@
 import SwiftUI
 import HongguoCore
+import UniformTypeIdentifiers
 
 @MainActor
 final class OfflineDownloadModel: ObservableObject {
@@ -8,6 +9,7 @@ final class OfflineDownloadModel: ObservableObject {
     @Published private(set) var items: [OfflineDownloadItem] = []
     @Published private(set) var isReady = false
     @Published private(set) var storageUnavailable = false
+    @Published private(set) var isImporting = false
     @Published var error: String?
 
     private var storage: OfflineDownloads?
@@ -47,7 +49,9 @@ final class OfflineDownloadModel: ObservableObject {
                 let updates = await library.updates()
                 await library.start()
                 for await current in updates {
-                    self?.items = current.filter { $0.key.scope == Self.scope }
+                    self?.items = current.filter {
+                        $0.key.scope == Self.scope || $0.key.scope == OfflineDownloads.importedScope
+                    }
                     self?.isReady = true
                 }
             } catch {
@@ -58,7 +62,7 @@ final class OfflineDownloadModel: ObservableObject {
     }
 
     func item(seriesID: String, episodeID: String) -> OfflineDownloadItem? {
-        items.first { $0.key.seriesID == seriesID && $0.key.episodeID == episodeID }
+        items.first { $0.key.scope == Self.scope && $0.key.seriesID == seriesID && $0.key.episodeID == episodeID }
     }
 
     func enqueue(series: Series, episodes: [Episode]) async -> Bool {
@@ -82,6 +86,31 @@ final class OfflineDownloadModel: ObservableObject {
         catch { report(error) }
     }
 
+    func importVideo(_ url: URL) async {
+        guard let storage, !isImporting else { return }
+        isImporting = true
+        let hasScopedAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasScopedAccess { url.stopAccessingSecurityScopedResource() }
+            isImporting = false
+        }
+
+        let name = url.deletingPathExtension().lastPathComponent
+            .components(separatedBy: .controlCharacters).joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await storage.importVideo(from: url, title: name.isEmpty ? "匯入影片" : name)
+        } catch is CancellationError {
+            return
+        } catch OfflineDownloadError.invalidFile {
+            error = "此檔案不是可播放的 MP4，或影片不完整。"
+        } catch let failure as OfflineDownloadError {
+            report(failure)
+        } catch {
+            self.error = "無法讀取影片。請確認「檔案」中的影片可以開啟後再試。"
+        }
+    }
+
     func retry(_ key: OfflineDownloadKey) async {
         do { try await storage?.retry(key) }
         catch { report(error) }
@@ -101,7 +130,7 @@ final class OfflineDownloadModel: ObservableObject {
             $0.key.seriesID == item.key.seriesID && $0.key.scope == item.key.scope && $0.state == .completed
         }
         guard let selected = saved.first(where: { $0.key == item.key }) else {
-            error = "這一集的離線檔案無法播放，請重新下載。"
+            error = OfflinePlaybackError.missingFile(in: item.key.scope).errorDescription
             return nil
         }
         let episodes = saved.sorted {
@@ -112,13 +141,13 @@ final class OfflineDownloadModel: ObservableObject {
         return OfflinePlaybackRoute(detail: detail, episodeID: item.key.episodeID, resume: resume,
             service: OfflinePlaybackService(detail: detail, scope: item.key.scope, storage: storage)) {
                 [weak self] episode, position, duration in
-                self?.recordProgress(seriesID: item.key.seriesID, episodeID: episode.id, position: position, duration: duration)
+                let key = OfflineDownloadKey(scope: item.key.scope, seriesID: item.key.seriesID, episodeID: episode.id)
+                self?.recordProgress(for: key, position: position, duration: duration)
             }
     }
 
-    private func recordProgress(seriesID: String, episodeID: String, position: Double, duration: Double) {
+    private func recordProgress(for key: OfflineDownloadKey, position: Double, duration: Double) {
         guard let storage else { return }
-        let key = OfflineDownloadKey(scope: Self.scope, seriesID: seriesID, episodeID: episodeID)
         let previous = progressWrite
         progressWrite = Task { [weak self] in
             await previous?.value
@@ -149,14 +178,20 @@ struct OfflinePlaybackService: CatalogService {
             throw CatalogError.invalidID
         }
         let key = OfflineDownloadKey(scope: scope, seriesID: seriesID, episodeID: episodeID)
-        guard let url = try await storage.localURL(for: key) else { throw OfflinePlaybackError.missingFile }
+        guard let url = try await storage.localURL(for: key) else { throw OfflinePlaybackError.missingFile(in: scope) }
         return .init(url: url)
     }
 }
 
 private enum OfflinePlaybackError: LocalizedError {
-    case missingFile
-    var errorDescription: String? { "這一集的離線檔案無法播放，請重新下載。" }
+    case missingFile(in: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingFile(OfflineDownloads.importedScope): "找不到匯入的影片，請重新從「檔案」匯入。"
+        case .missingFile: "這一集的離線檔案無法播放，請重新下載。"
+        }
+    }
 }
 
 @MainActor
@@ -179,7 +214,9 @@ struct OfflineEpisodeSelectionView: View {
     @State private var submitting = false
 
     var body: some View {
-        let existingIDs = Set(downloads.items.lazy.filter { $0.key.seriesID == detail.series.id }.map(\.key.episodeID))
+        let existingIDs = Set(downloads.items.lazy.filter {
+            $0.key.scope == OfflineDownloadModel.scope && $0.key.seriesID == detail.series.id
+        }.map(\.key.episodeID))
         let selectableIDs = Set(detail.episodes.lazy.filter { $0.isAvailable && !existingIDs.contains($0.id) }.map(\.id))
         let selectedIDs = selected.intersection(selectableIDs)
         let allSelected = !selectableIDs.isEmpty && selectedIDs == selectableIDs
@@ -263,8 +300,11 @@ struct OfflineDownloadsView: View {
     @State private var route: OfflinePlaybackRoute?
     @State private var opening: OfflineDownloadKey?
     @State private var pendingDeletion: OfflineDownloadItem?
+    @State private var showingImporter = false
 
     var body: some View {
+        let importedVideos = downloads.items.filter(\.isImportedVideo)
+
         List {
             if !downloads.isReady {
                 if downloads.storageUnavailable {
@@ -273,9 +313,20 @@ struct OfflineDownloadsView: View {
                 } else {
                     ProgressView("正在開啟離線片庫…")
                 }
-            } else if downloads.items.isEmpty {
-                ContentUnavailableView("尚未下載劇集", systemImage: "arrow.down.circle",
-                    description: Text("到劇集詳情選擇「選集下載」，即可在這裡離線觀看。"))
+            } else if downloads.items.isEmpty && !downloads.isImporting {
+                ContentUnavailableView("尚無離線影片", systemImage: "arrow.down.circle",
+                    description: Text("從「檔案」匯入 MP4，或到劇集詳情選擇「選集下載」。"))
+            }
+            if downloads.isImporting {
+                ProgressView("正在匯入影片…")
+                    .accessibilityIdentifier("offline.import.progress")
+            }
+            if !importedVideos.isEmpty {
+                Section("匯入影片") {
+                    ForEach(importedVideos) { item in
+                        row(item)
+                    }
+                }
             }
             ForEach(groups, id: \.key) { group in
                 Section(group.items.first?.seriesTitle ?? "") {
@@ -287,6 +338,25 @@ struct OfflineDownloadsView: View {
         }
         .navigationTitle("離線下載")
         .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showingImporter = true } label: {
+                    Label("匯入影片", systemImage: "square.and.arrow.down")
+                }
+                .disabled(!downloads.isReady || downloads.isImporting || opening != nil)
+                .accessibilityIdentifier("offline.import")
+            }
+        }
+        .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.mpeg4Movie]) { result in
+            switch result {
+            case .success(let url):
+                Task { await downloads.importVideo(url) }
+            case .failure(let error) where (error as? CocoaError)?.code == .userCancelled:
+                break
+            case .failure:
+                downloads.error = "無法開啟選取的影片，請回到「檔案」確認後再試。"
+            }
+        }
         .fullScreenCover(item: Binding(get: { route }, set: { if $0 == nil { closePlayback() } })) { item in
             if let retained = item.session.resolve(make: {
                 PlayerModel(series: item.detail.series, episodes: item.detail.episodes, initialEpisodeID: item.episodeID,
@@ -298,11 +368,12 @@ struct OfflineDownloadsView: View {
                 .id(item.id)
             }
         }
-        .confirmationDialog("刪除離線下載？", isPresented: Binding(get: { pendingDeletion != nil },
+        .confirmationDialog(pendingDeletion?.isImportedVideo == true ? "刪除匯入的影片？" : "刪除離線下載？",
+            isPresented: Binding(get: { pendingDeletion != nil },
             set: { if !$0 { pendingDeletion = nil } }), titleVisibility: .visible, presenting: pendingDeletion) { item in
             Button("刪除", role: .destructive) { Task { await downloads.delete(item.key) } }
         } message: { item in
-            Text("\(item.seriesTitle) · 第 \(item.episodeNumber) 集")
+            Text(item.isImportedVideo ? item.seriesTitle : "\(item.seriesTitle) · 第 \(item.episodeNumber) 集")
         }
         .alert("離線下載", isPresented: Binding(get: { downloads.isReady && downloads.error != nil },
             set: { if !$0 { downloads.error = nil } })) { Button("好") { downloads.error = nil } }
@@ -310,9 +381,10 @@ struct OfflineDownloadsView: View {
     }
 
     private var groups: [(key: String, items: [OfflineDownloadItem])] {
-        let grouped = Dictionary(grouping: downloads.items, by: \.key.seriesID)
+        let episodes = downloads.items.filter { !$0.isImportedVideo }
+        let grouped = Dictionary(grouping: episodes, by: \.key.seriesID)
         var seen = Set<String>()
-        return downloads.items.map(\.key.seriesID).filter { seen.insert($0).inserted }.map { id in
+        return episodes.map(\.key.seriesID).filter { seen.insert($0).inserted }.map { id in
             (id, grouped[id, default: []].sorted {
                 ($0.episodeNumber, $0.key.episodeID) < ($1.episodeNumber, $1.key.episodeID)
             })
@@ -321,7 +393,8 @@ struct OfflineDownloadsView: View {
 
     private func row(_ item: OfflineDownloadItem) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text(episodeLabel(item.episodeNumber, item.episodeTitle)).font(.headline)
+            Text(item.isImportedVideo ? item.seriesTitle : episodeLabel(item.episodeNumber, item.episodeTitle))
+                .font(.headline)
             OfflineDownloadStatus(item: item)
             HStack(spacing: 12) {
                 switch item.state {
@@ -343,7 +416,7 @@ struct OfflineDownloadsView: View {
                     Button("取消") { Task { await downloads.cancel(item.key) } }
                         .accessibilityIdentifier("offline.cancel.\(item.key.episodeID)")
                 case .failed, .cancelled:
-                    if !item.isOfflineUnsupported {
+                    if !item.isImportedVideo && !item.isOfflineUnsupported {
                         Button("重試") { Task { await downloads.retry(item.key) } }
                             .accessibilityIdentifier("offline.retry.\(item.key.episodeID)")
                     }
@@ -382,9 +455,12 @@ private struct OfflineDownloadStatus: View {
                 } else {
                     ProgressView(item.receivedBytes > 0 ? "下載中 · \(size)" : "正在取得來源…")
                 }
-            case .completed: Label("已下載 · \(size)", systemImage: "checkmark.circle.fill")
+            case .completed:
+                Label(item.isImportedVideo ? "已匯入 · \(size)" : "已下載 · \(size)", systemImage: "checkmark.circle.fill")
             case .failed:
-                if item.isOfflineUnsupported {
+                if item.isImportedVideo {
+                    Text("匯入的影片無法播放，可重新從「檔案」匯入。")
+                } else if item.isOfflineUnsupported {
                     Text("來源未提供離線版本，可回劇集詳情線上觀看。")
                 } else {
                     Text(item.failure ?? "下載失敗")
@@ -399,6 +475,10 @@ private struct OfflineDownloadStatus: View {
     private var size: String {
         ByteCountFormatter.string(fromByteCount: item.receivedBytes, countStyle: .file)
     }
+}
+
+private extension OfflineDownloadItem {
+    var isImportedVideo: Bool { key.scope == OfflineDownloads.importedScope }
 }
 
 private func episodeLabel(_ number: Int, _ title: String) -> String {

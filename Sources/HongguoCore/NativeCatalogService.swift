@@ -103,7 +103,15 @@ public struct NativeCatalogService: CatalogService {
         guard entry.detail.series.id == seriesID,
               entry.detail.episodes.contains(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
         try Task.checkCancellation()
-        let source = try await prepare(episodeID, entry.contentType, fresh, playbackQuality)
+        let source: PlaybackSource
+        do {
+            source = try await prepare(episodeID, entry.contentType, fresh, playbackQuality)
+        } catch NativeMediaError.unsafeURL where !fresh && NativePrefetchContext.maximumBytes == nil {
+            // The rejected address stays blocked. Ask for a fresh source for the
+            // same verified episode once, using the existing URL policy again.
+            try Task.checkCancellation()
+            source = try await prepare(episodeID, entry.contentType, true, playbackQuality)
+        }
         try Task.checkCancellation()
         if let stream = source.nativeStream {
             guard source.url == stream.assetURL, stream.totalLength > 0, source.headers.isEmpty else {
