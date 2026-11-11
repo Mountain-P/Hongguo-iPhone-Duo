@@ -2,9 +2,9 @@
 
 為 iPhone Duo 打造的原生紅果短劇 App。收合時隨手看，展開後自在選劇；從海報、演員到播放器，都使用適應螢幕的 SwiftUI 介面與系統控制列。
 
-**目前版本：0.14.0／build 35（2026-11-12）。** 影片直接在 iPhone 取源、載入及播放，不需設定播放服務，也不必讓電腦持續開機。
+**目前版本：0.14.1／build 36（2026-11-12）。** 影片直接在 iPhone 取源、載入及播放，不需設定播放服務，也不必讓電腦持續開機。
 
-在劇集詳情按「選集下載」，勾選想離線看的集數。在「我的 → 離線下載」可看進度、取消、重試、刪除，或直接播放已下載的分集。播放位置保存在這部 iPhone，重開 App 可繼續觀看。離線下載適用於內建來源提供的未加密 MP4。
+在劇集詳情按「選集下載」，可個別勾選或按「全選」。在「我的 → 離線下載」可看進度、取消、重試、刪除，或直接播放已下載的分集。播放位置保存在這部 iPhone，重開 App 可繼續觀看。離線下載適用於內建來源提供的未加密 MP4。來源未提供離線版本時，清單會提示可回劇集詳情線上觀看。
 
 0.13.3 更新主要播放請求，處理劇集清單可讀、開啟後卻取不到影片資料的問題。取源遇到空回應或來源限制時會顯示對應提示。實測記錄見 [驗證紀錄](docs/TESTING.md)。
 
@@ -143,6 +143,6 @@ swift test --disable-sandbox --disable-xctest
 sh scripts/build-ios.sh simulator
 ```
 
-播放由 SwiftUI、AVFoundation 與內建 Core 完成，不需 Node 或 FFmpeg 作為 iPhone 執行依賴。工程與測試說明見 [播放流程](docs/NATIVE-PLAYBACK.md)、[核心測試](docs/TESTING-CORE.md)及 [實測結果](docs/TESTING.md)。App 未整合廣告或第三方分析 SDK，目前不提供離線下載。後續改善記錄於 [ROADMAP.md](docs/ROADMAP.md)。
+播放由 SwiftUI、AVFoundation 與內建 Core 完成，不需 Node 或 FFmpeg 作為 iPhone 執行依賴。工程與測試說明見 [播放流程](docs/NATIVE-PLAYBACK.md)、[核心測試](docs/TESTING-CORE.md)及 [實測結果](docs/TESTING.md)。App 未整合廣告或第三方分析 SDK。後續改善記錄於 [ROADMAP.md](docs/ROADMAP.md)。
 
 本專案以 [GPL-3.0](LICENSE) 開源；四個參考專案、固定來源與授權聲明見 [SOURCES.md](docs/SOURCES.md)。本專案為獨立開源客戶端，劇集、海報與影片權利屬各自權利人；內容可用性以來源當次回應為準。

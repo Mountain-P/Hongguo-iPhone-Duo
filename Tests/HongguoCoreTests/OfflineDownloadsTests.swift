@@ -5,6 +5,25 @@ import Testing
 @testable import HongguoCore
 
 struct OfflineDownloadsTests {
+    @Test func unsupportedSourceIsNotRetriedAndDoesNotBlockOtherEpisodes() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let unsupported = episode(1)
+        let available = episode(2)
+        let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            if item.key == unsupported.key { throw NativeSourceError(code: "OFFLINE_CLEAR_UNAVAILABLE") }
+            try await writeFixture(item, destination, maximum, progress)
+        }
+        try await queue.enqueue([unsupported, available])
+        try await wait { await queue.snapshot().map(\.state) == [.failed, .completed] }
+        #expect(await queue.snapshot().first?.isOfflineUnsupported == true)
+        #expect(try await queue.localURL(for: unsupported.key) == nil)
+        try await queue.retry(unsupported.key)
+        #expect(await queue.snapshot().map(\.key) == [unsupported.key, available.key])
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await reopened.snapshot().first?.isOfflineUnsupported == true)
+    }
+
     @Test func serialQueueRejectsCancelledWorkAndRetriesAtTheTail() async throws {
         let directory = temporaryLibrary()
         let transfer = ControlledOfflineTransfer()

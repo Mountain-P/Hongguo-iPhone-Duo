@@ -179,6 +179,11 @@ struct OfflineEpisodeSelectionView: View {
     @State private var submitting = false
 
     var body: some View {
+        let existingIDs = Set(downloads.items.lazy.filter { $0.key.seriesID == detail.series.id }.map(\.key.episodeID))
+        let selectableIDs = Set(detail.episodes.lazy.filter { $0.isAvailable && !existingIDs.contains($0.id) }.map(\.id))
+        let selectedIDs = selected.intersection(selectableIDs)
+        let allSelected = !selectableIDs.isEmpty && selectedIDs == selectableIDs
+
         NavigationStack {
             List {
                 if downloads.storageUnavailable {
@@ -198,38 +203,47 @@ struct OfflineEpisodeSelectionView: View {
                                     else if !episode.isAvailable { Text("來源尚未開放").font(.caption).foregroundStyle(.secondary) }
                                 }
                                 Spacer()
-                                if item == nil && episode.isAvailable {
-                                    Image(systemName: selected.contains(episode.id) ? "checkmark.circle.fill" : "circle")
+                                if selectableIDs.contains(episode.id) {
+                                    Image(systemName: selectedIDs.contains(episode.id) ? "checkmark.circle.fill" : "circle")
                                         .accessibilityHidden(true)
                                 }
                             }
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(!downloads.isReady || submitting || item != nil || !episode.isAvailable)
-                        .accessibilityAddTraits(selected.contains(episode.id) ? .isSelected : [])
+                        .disabled(!downloads.isReady || submitting || !selectableIDs.contains(episode.id))
+                        .accessibilityAddTraits(selectedIDs.contains(episode.id) ? .isSelected : [])
                         .accessibilityIdentifier("offline.select.\(episode.id)")
                     }
                 } header: {
-                    Text(detail.series.title)
+                    HStack {
+                        Text(detail.series.title)
+                        Spacer()
+                        Button(allSelected ? "取消全選" : "全選") {
+                            selected = allSelected ? [] : selectableIDs
+                        }
+                        .disabled(!downloads.isReady || submitting || selectableIDs.isEmpty)
+                        .accessibilityIdentifier("offline.selectAll")
+                    }
                 } footer: {
-                    Text("可下載來源提供的未加密影片。在「我的 → 離線下載」查看進度或管理已下載的集數。")
+                    Text("部分分集只提供線上播放。下載結果會顯示在「我的 → 離線下載」。")
                 }
             }
+            .onChange(of: selectableIDs) { _, eligibleIDs in selected.formIntersection(eligibleIDs) }
             .navigationTitle("選集下載")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("關閉") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(selected.isEmpty ? "下載" : "下載 \(selected.count) 集") {
-                        let episodes = detail.episodes.filter { selected.contains($0.id) }
+                    Button(selectedIDs.isEmpty ? "下載" : "下載 \(selectedIDs.count) 集") {
+                        let episodes = detail.episodes.filter { selectedIDs.contains($0.id) }
                         submitting = true
                         Task {
                             if await downloads.enqueue(series: detail.series, episodes: episodes) { dismiss() }
                             submitting = false
                         }
                     }
-                    .disabled(selected.isEmpty || submitting || !downloads.isReady)
+                    .disabled(selectedIDs.isEmpty || submitting || !downloads.isReady)
                     .accessibilityIdentifier("offline.enqueue")
                 }
             }
@@ -329,8 +343,10 @@ struct OfflineDownloadsView: View {
                     Button("取消") { Task { await downloads.cancel(item.key) } }
                         .accessibilityIdentifier("offline.cancel.\(item.key.episodeID)")
                 case .failed, .cancelled:
-                    Button("重試") { Task { await downloads.retry(item.key) } }
-                        .accessibilityIdentifier("offline.retry.\(item.key.episodeID)")
+                    if !item.isOfflineUnsupported {
+                        Button("重試") { Task { await downloads.retry(item.key) } }
+                            .accessibilityIdentifier("offline.retry.\(item.key.episodeID)")
+                    }
                 }
                 if item.state != .queued && item.state != .downloading {
                     Button(role: .destructive) { pendingDeletion = item } label: {
@@ -367,7 +383,12 @@ private struct OfflineDownloadStatus: View {
                     ProgressView(item.receivedBytes > 0 ? "下載中 · \(size)" : "正在取得來源…")
                 }
             case .completed: Label("已下載 · \(size)", systemImage: "checkmark.circle.fill")
-            case .failed: Text(item.failure ?? "下載失敗")
+            case .failed:
+                if item.isOfflineUnsupported {
+                    Text("來源未提供離線版本，可回劇集詳情線上觀看。")
+                } else {
+                    Text(item.failure ?? "下載失敗")
+                }
             case .cancelled: Text("已取消")
             }
         }

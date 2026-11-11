@@ -27,9 +27,13 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
     public fileprivate(set) var receivedBytes: Int64 = 0
     public fileprivate(set) var totalBytes: Int64?
     public fileprivate(set) var failure: String?
+    private var offlineUnsupported: Bool?
     public fileprivate(set) var position: Double = 0
     public fileprivate(set) var duration: Double = 0
     public var id: OfflineDownloadKey { key }
+    public var isOfflineUnsupported: Bool {
+        state == .failed && (offlineUnsupported == true || failure == "來源未提供可離線儲存的未加密 MP4。")
+    }
 
     public init(key: OfflineDownloadKey, seriesTitle: String, episodeNumber: Int, episodeTitle: String = "",
                 position: Double = 0, duration: Double = 0) {
@@ -41,11 +45,13 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
         self.duration = duration
     }
 
-    fileprivate mutating func resetTransfer(to state: OfflineDownloadState, failure: String? = nil) {
+    fileprivate mutating func resetTransfer(to state: OfflineDownloadState, failure: String? = nil,
+                                            offlineUnsupported: Bool? = nil) {
         self.state = state
         receivedBytes = 0
         totalBytes = nil
         self.failure = failure
+        self.offlineUnsupported = offlineUnsupported
     }
 }
 
@@ -170,7 +176,8 @@ public actor OfflineDownloads {
     }
 
     public func retry(_ key: OfflineDownloadKey) throws {
-        guard let index = index(for: key), [.failed, .cancelled].contains(records[index].item.state) else { return }
+        guard let index = index(for: key), [.failed, .cancelled].contains(records[index].item.state),
+              !records[index].item.isOfflineUnsupported else { return }
         var updated = records
         var record = updated.remove(at: index)
         // A corrupt movie may still be present after earlier cleanup was refused.
@@ -333,16 +340,18 @@ public actor OfflineDownloads {
     /// with its error so a temporarily unavailable disk can be retried.
     @discardableResult
     private func fail(index: Int, error: any Error) -> Bool {
-        let description = (error as? OfflineDownloadError)?.errorDescription
-            ?? (error as? NativeMediaError)?.errorDescription ?? (error as? CatalogError)?.errorDescription
-            ?? (error as? NativeSourceError)?.errorDescription
+        let source = error as? NativeSourceError
+        let media = error as? NativeMediaError
+        let unsupported = source?.code == "OFFLINE_CLEAR_UNAVAILABLE" || media == .unsupportedEncryption
+        let description = (error as? OfflineDownloadError)?.errorDescription ?? media?.errorDescription
+            ?? (error as? CatalogError)?.errorDescription ?? source?.errorDescription
             ?? "下載中斷，請稍後再試。"
         var updated = records
-        updated[index].item.resetTransfer(to: .failed, failure: description)
+        updated[index].item.resetTransfer(to: .failed, failure: description, offlineUnsupported: unsupported ? true : nil)
         updated[index].checksum = nil
         do { try commit(updated); return true }
         catch {
-            updated[index].item.failure = OfflineDownloadError.storageUnavailable.localizedDescription
+            updated[index].item.resetTransfer(to: .failed, failure: OfflineDownloadError.storageUnavailable.localizedDescription)
             records = updated
             publish()
             return false
