@@ -531,6 +531,10 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
     if (!model || typeof model !== 'object' || Array.isArray(model)) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
     const inline = model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
+    if (options.offlineDirect === true) {
+        if (!inline || model.key_seed) throw offlineSourceUnavailable();
+        return parseAppPlayModel(model, vid, { ...options, inlineUserAgent: PRIMARY_INLINE_UA }, true);
+    }
     const readFallback = async () => {
         const fallback = parseFallback(model.fallback_api);
         if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
@@ -562,6 +566,16 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     }
 }
 
+function offlineSourceUnavailable() {
+    return Object.assign(new Error('来源未提供未加密的直连 MP4'), { code: 'OFFLINE_CLEAR_UNAVAILABLE' });
+}
+
+function isExplicitlyClear(item) {
+    if (item.spade_a || item.encrypt_info?.spade_a) return false;
+    const flags = [item.encrypt, item.encrypt_info?.encrypt].filter(value => value != null);
+    return flags.length > 0 && flags.every(value => [false, 0, '0', 'false'].includes(value));
+}
+
 function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata = inline, minimumPixels = 0) {
     const requestedQuality = normalizeDownloadQuality(options.quality);
     // Local iOS policy: choose from actual compatible model rows, not invented resolutions.
@@ -580,7 +594,10 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     }).filter(row => row.codecRank < 3 && (!minimumPixels || Math.min(row.width, row.height) >= minimumPixels)
         && (row.codecRank !== 2 || (row.width > 0 && row.height > 0 && typeof info.video_id === 'string'
             && info.video_id.trim() && Number.isFinite(Number(info.video_duration)) && Number(info.video_duration) > 0)));
-    const rows = compatibleRows.filter(row => (!dataSaver || row.codecRank < 2)
+    const offlineDirect = options.offlineDirect === true;
+    const eligibleRows = offlineDirect ? compatibleRows.filter(row => row.codecRank < 2 && isExplicitlyClear(row.item)) : compatibleRows;
+    if (offlineDirect && !eligibleRows.length) throw offlineSourceUnavailable();
+    const rows = eligibleRows.filter(row => (!dataSaver || row.codecRank < 2)
         && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
         if (dataSaver) {
             const aKnown = a.width > 0 && a.height > 0, bKnown = b.width > 0 && b.height > 0;

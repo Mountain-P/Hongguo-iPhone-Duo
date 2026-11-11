@@ -44,8 +44,9 @@ final class NativeJSRuntime: @unchecked Sendable {
         return try NativeNewReleaseParser.parse(raw)
     }
 
-    func resolve(episodeID: String, contentType: String, quality preference: NativePlaybackQuality = .automatic) async throws -> NativeMediaSource {
-        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.rawValue])
+    func resolve(episodeID: String, contentType: String, quality preference: NativePlaybackQuality = .automatic,
+                 offlineDirect: Bool = false) async throws -> NativeMediaSource {
+        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.rawValue, offlineDirect])
         let raw = try await run(script: "__startResolve(..." + String(decoding: arguments, as: UTF8.self) + ")")
         try Task.checkCancellation()
         guard let data = raw.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NativeSourceError(code: "INVALID_RESPONSE") }
@@ -63,6 +64,7 @@ final class NativeJSRuntime: @unchecked Sendable {
                 return UInt8(hex[first..<last], radix: 16)!
             })
         } else { key = nil }
+        if offlineDirect, key != nil { throw NativeSourceError(code: "OFFLINE_CLEAR_UNAVAILABLE") }
         func dimension(_ key: String) -> Int? {
             guard let number = object[key] as? NSNumber, (1...16_384).contains(number.intValue) else { return nil }
             return number.intValue

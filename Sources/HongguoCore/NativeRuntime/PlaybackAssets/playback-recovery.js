@@ -53,7 +53,7 @@ function createPlaybackRecovery({ register, getModel, postModel, consume, now = 
             return { value, recovery: { route: 'video_tab', attempts: 1 } };
         } catch (error) {
             checkActive(signal, deadline, now);
-            if (terminal(error)) throw error;
+            if (options.offlineDirect === true || terminal(error)) throw error;
             lastError = error;
         }
         let attempts = 0;

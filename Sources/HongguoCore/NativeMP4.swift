@@ -113,6 +113,14 @@ public struct NativeMP4StreamPlan: Sendable {
 }
 
 public enum NativeMP4 {
+    /// Checks a complete, self-contained clear MP4 without modifying any bytes.
+    static func validateOfflineClear(data: Data, codec: String) throws {
+        try Task.checkCancellation()
+        guard data.count <= NativeMediaStore.maximumBytes else { throw NativeMediaError.tooLarge }
+        let parser = NativeMP4Parser(data: data, sourceCodec: codec.lowercased())
+        guard try parser.prepare(clearOnly: true).videoEntries > 0 else { throw NativeMediaError.malformedMP4 }
+    }
+
     public static func prepareStream(prefix: Data, totalLength: Int, contentKey: Data?, codec: String,
                                      auxiliary: [NativeMP4ByteRegion] = []) throws -> NativeMP4StreamPlan {
         try Task.checkCancellation()
@@ -289,7 +297,7 @@ private final class NativeMP4Parser {
         self.data = data; self.sourceCodec = sourceCodec; self.coverage = coverage
     }
 
-    func prepare() throws -> NativeMP4Preparation {
+    func prepare(clearOnly: Bool = false) throws -> NativeMP4Preparation {
         guard data.count >= 24 else { throw NativeMediaError.malformedMP4 }
         let top = try boxes(in: 0..<data.count)
         guard top.filter({ $0.type == "ftyp" }).count == 1,
@@ -305,6 +313,11 @@ private final class NativeMP4Parser {
         guard media.contains(where: { !$0.isEmpty }) else { throw NativeMediaError.malformedMP4 }
         let movieChildren = try boxes(in: moov.body)
         guard !movieChildren.contains(where: { $0.type == "mvex" }) else { throw NativeMediaError.unsupportedEncryption }
+        if clearOnly {
+            guard top.first?.type == "ftyp", media.count == 1 else { throw NativeMediaError.malformedMP4 }
+            guard !top.contains(where: { $0.type == "pssh" }),
+                  !movieChildren.contains(where: { $0.type == "pssh" }) else { throw NativeMediaError.unsupportedEncryption }
+        }
         var result = NativeMP4Preparation()
         for track in movieChildren where track.type == "trak" {
             try Task.checkCancellation()
@@ -317,6 +330,10 @@ private final class NativeMP4Parser {
             guard try u8(stsd.bodyStart) == 0 else { throw NativeMediaError.unsupportedEncryption }
             let descriptions = try boxes(in: (stsd.bodyStart + 8)..<stsd.end)
             guard descriptions.count == (try count32(stsd.bodyStart + 4, limit: 32)) else { throw NativeMediaError.malformedMP4 }
+            if clearOnly {
+                result.videoEntries += try validateClearTrack(minf: minf, table: table, descriptions: descriptions, media: media)
+                continue
+            }
             var encryptedDescriptions: [NativeMP4EncryptionInfo] = []
             var hasClearDescription = false
             for entry in descriptions {
@@ -383,9 +400,73 @@ private final class NativeMP4Parser {
         return result
     }
 
+    private func validateClearTrack(minf: NativeMP4Box, table: [NativeMP4Box], descriptions: [NativeMP4Box],
+                                    media: [Range<Int>]) throws -> Int {
+        guard !descriptions.isEmpty else { throw NativeMediaError.malformedMP4 }
+        guard !table.contains(where: { ["senc", "saiz", "saio", "pssh"].contains($0.type) }) else {
+            throw NativeMediaError.unsupportedEncryption
+        }
+        for group in table where group.type == "sgpd" || group.type == "sbgp" {
+            try require(group.bodyStart, 8, within: group.body)
+            if try fourcc(group.bodyStart + 4) == "seig" { throw NativeMediaError.unsupportedEncryption }
+        }
+        let dinf = try requiredChild("dinf", of: minf)
+        let dref = try requiredChild("dref", of: dinf)
+        try require(dref.bodyStart, 8, within: dref.body)
+        let references = try boxes(in: (dref.bodyStart + 8)..<dref.end)
+        guard try u32(dref.bodyStart) == 0,
+              references.count == (try count32(dref.bodyStart + 4, limit: 32)), !references.isEmpty else {
+            throw NativeMediaError.malformedMP4
+        }
+        // An offline file must never require AVFoundation to open an external data reference.
+        for reference in references {
+            guard reference.type == "url ", reference.body.count == 4,
+                  try u32(reference.bodyStart) == 1 else { throw NativeMediaError.malformedMP4 }
+        }
+        var videos = 0
+        for entry in descriptions {
+            if ["encv", "enca", "enct", "encs", "drms", "drmi"].contains(entry.type) {
+                throw NativeMediaError.unsupportedEncryption
+            }
+            if ["avc1", "avc3", "hvc1", "hev1"].contains(entry.type) {
+                try validateVideoCodec(entry.type)
+                videos += 1
+            } else if entry.type != "mp4a" { throw NativeMediaError.unsupportedCodec }
+            try require(entry.bodyStart, 8, within: entry.body)
+            guard try (1...references.count).contains(Int(u16(entry.bodyStart + 6))) else {
+                throw NativeMediaError.malformedMP4
+            }
+            guard try !sampleEntryChildren(entry).contains(where: { ["sinf", "schm", "schi", "tenc", "pssh"].contains($0.type) }) else {
+                throw NativeMediaError.unsupportedEncryption
+            }
+        }
+        let samples: [NativeMP4Sample]
+        do { samples = try sampleIndex(table: table, descriptionCount: descriptions.count, media: media) }
+        catch NativeMediaError.missingEncryptionMetadata { throw NativeMediaError.malformedMP4 }
+        guard samples.contains(where: { !$0.range.isEmpty }), let stts = try unique("stts", in: table) else {
+            throw NativeMediaError.malformedMP4
+        }
+        try require(stts.bodyStart, 8, within: stts.body)
+        let timingCount = try count32(stts.bodyStart + 4, limit: maximumSamples)
+        try require(stts.bodyStart + 8, timingCount * 8, within: stts.body)
+        guard try u32(stts.bodyStart) == 0 else { throw NativeMediaError.malformedMP4 }
+        var timedSamples = 0
+        var hasDuration = false
+        for index in 0..<timingCount {
+            if index % 512 == 0 { try Task.checkCancellation() }
+            let offset = stts.bodyStart + 8 + index * 8
+            let count = Int(try u32(offset))
+            guard count > 0, count <= samples.count - timedSamples else { throw NativeMediaError.malformedMP4 }
+            timedSamples += count
+            if try u32(offset + 4) > 0 { hasDuration = true }
+        }
+        guard timedSamples == samples.count, hasDuration else { throw NativeMediaError.malformedMP4 }
+        return videos
+    }
+
     private func sampleEntryChildren(_ entry: NativeMP4Box) throws -> [NativeMP4Box] {
         let headerSize: Int
-        if entry.type == "encv" { headerSize = 78 }
+        if ["encv", "avc1", "avc3", "hvc1", "hev1"].contains(entry.type) { headerSize = 78 }
         else {
             try require(entry.bodyStart, 28, within: entry.body)
             switch try u16(entry.bodyStart + 8) {

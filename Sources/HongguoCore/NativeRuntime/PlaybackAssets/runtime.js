@@ -126,13 +126,13 @@
                 ...(Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? { status: error.status } : {}) }));
         });
     };
-    global.__startResolve = (episodeID, contentType, preference = 'automatic') => {
-        if (!['automatic', 'dataSaver'].includes(preference)) {
+    global.__startResolve = (episodeID, contentType, preference = 'automatic', offlineDirect = false) => {
+        if (!['automatic', 'dataSaver'].includes(preference) || typeof offlineDirect !== 'boolean') {
             global._nativeComplete(JSON.stringify({ error: 'APP_INPUT' }));
             return;
         }
         controller = new AbortController();
-        global.require('app-source').fetchAppPlayUrl(episodeID, { contentType, quality: 'auto', playbackQuality: preference, signal: controller.signal }).then(source => {
+        global.require('app-source').fetchAppPlayUrl(episodeID, { contentType, quality: 'auto', playbackQuality: preference, offlineDirect, signal: controller.signal }).then(source => {
             global._nativeComplete(JSON.stringify({ url: source.url, contentKey: source.contentKey, userAgent: source.userAgent,
                 codec: source.codec, quality: source.quality, preference, qualityFallback: source.qualityFallback === true,
                 width: source.width, height: source.height }));

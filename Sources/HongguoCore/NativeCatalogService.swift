@@ -65,6 +65,33 @@ public struct NativeCatalogService: CatalogService {
         try await loadDetail(id: id).detail
     }
 
+    /// Downloads a fresh, explicitly clear MP4 for this exact episode to a new staging file.
+    public func downloadOffline(seriesID: String, episodeID: String, to destination: URL, maximumBytes: Int64,
+                                progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+        try await downloadOffline(seriesID: seriesID, episodeID: episodeID, to: destination, maximumBytes: maximumBytes,
+                                  resolve: { episodeID, contentType, quality in
+            try await NativeJSRuntime().resolve(episodeID: episodeID, contentType: contentType,
+                                                quality: quality, offlineDirect: true)
+        }, downloader: NativeMediaHTTPDownload(), progress: progress)
+    }
+
+    func downloadOffline(seriesID: String, episodeID: String, to destination: URL, maximumBytes: Int64,
+                         resolve: @Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource,
+                         downloader: any NativeOfflineMediaDownloading,
+                         progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+        try validateID(seriesID)
+        try validateID(episodeID)
+        try Task.checkCancellation()
+        let file = try NativeOfflineFile(destination: destination, maximumBytes: maximumBytes)
+        let entry = try await loadDetail(id: seriesID)
+        guard entry.detail.series.id == seriesID,
+              let episode = entry.detail.episodes.first(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
+        guard episode.isAvailable else { throw CatalogError.protectedPlayback }
+        try Task.checkCancellation()
+        let source = try await resolve(episodeID, entry.contentType, playbackQuality)
+        try await file.write(source: source, downloader: downloader, progress: progress)
+    }
+
     public func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
         try validateID(seriesID)
         try validateID(episodeID)

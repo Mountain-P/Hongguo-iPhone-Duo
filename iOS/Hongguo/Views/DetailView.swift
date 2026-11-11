@@ -12,6 +12,11 @@ private struct PlaybackRoute: Identifiable {
     let session = PlaybackRouteSession()
 }
 
+private struct DownloadSelection: Identifiable {
+    let detail: SeriesDetail
+    var id: String { detail.series.id }
+}
+
 @MainActor
 struct DetailView: View {
     let series: Series
@@ -25,6 +30,7 @@ struct DetailView: View {
     @State private var route: PlaybackRoute?
     @State private var loadedService: (any CatalogService)?
     @State private var showingPlaybackSetup = false
+    @State private var downloadSelection: DownloadSelection?
     @State private var episodeIndex: EpisodeSelection?
     @State private var selectedEpisodeGroupID: Int?
     @State private var locatedEpisodeID: String?
@@ -107,6 +113,9 @@ struct DetailView: View {
         .refreshable { await load() }
         .onDisappear { locationTask?.cancel(); locationTask = nil }
         .sheet(isPresented: $showingPlaybackSetup) { NavigationStack { SettingsView(isSetupSheet: true) } }
+        .sheet(item: $downloadSelection) { selection in
+            OfflineEpisodeSelectionView(detail: selection.detail)
+        }
         .fullScreenCover(item: Binding(get: { route }, set: { if $0 == nil { dismissPlayback() } })) { item in
             if let retained = item.session.resolve(make: {
                 PlayerScreen.makeModel(series: item.detail.series, episodes: item.detail.episodes,
@@ -213,6 +222,13 @@ struct DetailView: View {
                 Text("\(detail.episodes.count) 集").font(.caption2).foregroundStyle(Theme.muted)
             }
             if detail.episodes.isEmpty { Text("來源尚未提供分集資料。").font(.subheadline).foregroundStyle(Theme.muted) }
+            if loadedService is NativeCatalogService, detail.episodes.contains(where: \.isAvailable) {
+                Button { downloadSelection = DownloadSelection(detail: detail) } label: {
+                    Label("選集下載", systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("detail.downloadEpisodes")
+            }
             if let index, !index.episodes.isEmpty {
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 12) {

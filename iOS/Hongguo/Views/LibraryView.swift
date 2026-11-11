@@ -101,6 +101,15 @@ struct LibraryView: View {
             VStack(spacing: 0) {
                 profileHeader
                 VStack(alignment: .leading, spacing: 18) {
+                    NavigationLink {
+                        OfflineDownloadsView()
+                    } label: {
+                        Label("離線下載", systemImage: "arrow.down.circle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .accessibilityIdentifier("library.offlineDownloads")
                     libraryOwnerPicker
                     if model.showingAccountLibrary {
                         accountSyncPanel
