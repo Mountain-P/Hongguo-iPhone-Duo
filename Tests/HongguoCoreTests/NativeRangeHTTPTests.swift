@@ -3,7 +3,13 @@ import Foundation
 import Testing
 @testable import HongguoCore
 
-private struct RangeScenario: Sendable { var status = 206; var excess = false; var delay: Double = 0.03 }
+private struct RangeScenario: Sendable {
+    var status = 206
+    var excess = false
+    var delay: Double = 0.03
+    var responseOutsidePolicy = false
+    var redirectOutsidePolicy = false
+}
 private final class RangeScenarios: @unchecked Sendable {
     static let shared = RangeScenarios()
     private let lock = NSLock()
@@ -43,9 +49,18 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
         let first = Int(range[0])!, last = Int(range[1])!
         var headers = ["Content-Type": "video/mp4", "Content-Range": "bytes \(first)-\(last)/1000", "Content-Length": String(last - first + 1), "ETag": "fixture"]
         if scenario.status == 403 { headers["Content-Type"] = "application/json"; headers["Content-Length"] = "999999999" }
-        let response = HTTPURLResponse(url: url, statusCode: scenario.status, httpVersion: "HTTP/1.1", headerFields: headers)!
+        let blockedURL = URL(string: "https://blocked.invalid" + url.path)!
+        if scenario.redirectOutsidePolicy { headers["Location"] = blockedURL.absoluteString }
+        let responseURL = scenario.responseOutsidePolicy ? blockedURL : url
+        let response = HTTPURLResponse(url: responseURL, statusCode: scenario.status, httpVersion: "HTTP/1.1", headerFields: headers)!
         DispatchQueue.global().asyncAfter(deadline: .now() + scenario.delay) { [self] in
             guard !lock.withLock({ stopped }) else { return }
+            if scenario.redirectOutsidePolicy {
+                var redirected = request
+                redirected.url = blockedURL
+                client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
+                return
+            }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             guard !lock.withLock({ stopped }) else { return }
             client?.urlProtocol(self, didLoad: Data(repeating: 0x55, count: last - first + 1 + (scenario.excess ? 1 : 0)))
@@ -106,5 +121,54 @@ struct NativeRangeHTTPTests {
         let count = RangeScenarios.shared.counts(url.path).requests
         await #expect(throws: CatalogError.httpStatus(403)) { try await client.fetch(range: 32..<48) }
         #expect(RangeScenarios.shared.counts(url.path).requests == count)
+    }
+
+    @Test func rejectedFinalResponseRetiresActiveAndQueuedReads() async throws {
+        let (client, url) = try client(.init(responseOutsidePolicy: true)); defer { client.close() }
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<6 {
+                group.addTask {
+                    await #expect(throws: NativeMediaError.unsafeURL) {
+                        try await client.fetch(range: (16 * index)..<(16 * (index + 1)))
+                    }
+                }
+            }
+        }
+        let requests = RangeScenarios.shared.counts(url.path).requests
+        #expect((1...2).contains(requests))
+        await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 200..<216) }
+        #expect(RangeScenarios.shared.counts(url.path).requests == requests)
+    }
+
+    @Test func rejectedRedirectDoesNotFollowTargetOrStartMoreReads() async throws {
+        let (client, url) = try client(.init(status: 302, redirectOutsidePolicy: true)); defer { client.close() }
+        await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
+        await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 32..<48) }
+        #expect(RangeScenarios.shared.counts(url.path).requests == 1)
+    }
+
+    @Test func rejectionReasonsPreserveTheExistingURLAndRedirectLimits() {
+        let allowed = URL(string: "https://unit.fqnovelvod.com:443/v?fixture=true")!
+        #expect(NativeMediaPolicy.rejection(of: allowed) == nil)
+        #expect(NativeMediaPolicy.rejection(of: nil) == .missingURL)
+        for (address, reason): (String, NativeMediaPolicy.Rejection) in [
+            ("http://unit.fqnovelvod.com/v", .scheme),
+            ("https://user@unit.fqnovelvod.com/v", .credentials),
+            ("https://unit.fqnovelvod.com/v#fixture", .fragment),
+            ("https://unit.fqnovelvod.com:444/v", .port),
+            ("https://fqnovelvod.com.blocked.invalid/v", .host),
+            ("https://unit.fqnovelvod.com/" + String(repeating: "x", count: 32_768), .urlLength)
+        ] {
+            #expect(NativeMediaPolicy.rejection(of: URL(string: address)) == reason)
+        }
+        #expect(NativeMediaPolicy.redirectRejection(of: allowed, hops: 3) == nil)
+        #expect(NativeMediaPolicy.redirectRejection(of: allowed, hops: 4) == .redirectLimit)
+        for (agent, reason): (String, NativeMediaPolicy.Rejection) in [
+            ("Fixture\u{0001}", .userAgentControlCharacter),
+            (String(repeating: "x", count: 2049), .userAgentLength)
+        ] {
+            let source = NativeMediaSource(url: allowed, contentKey: nil, userAgent: agent, codec: "h264", quality: "1080p")
+            #expect(NativeMediaPolicy.sourceRejection(source) == reason)
+        }
     }
 }

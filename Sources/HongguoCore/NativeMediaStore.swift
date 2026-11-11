@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 import CryptoKit
+import OSLog
 
 public enum NativeMediaError: Error, LocalizedError, Equatable, Sendable {
     case unsafeURL, unsupportedCodec, invalidKey, tooLarge, invalidResponse
@@ -144,17 +145,55 @@ public actor NativeMediaStore {
 }
 
 enum NativeMediaPolicy {
+    enum Rejection: String {
+        case missingURL, scheme, credentials, fragment, port, urlLength, host
+        case userAgentLength, userAgentControlCharacter, redirectLimit
+    }
+
+    enum Stage: String { case source, rangeRedirect, rangeResponse }
+
     private static let domains = ["qznovelvod.com", "fqnovelvod.com", "douyinvod.com"]
+    private static let logger = Logger(subsystem: "tw.mountainp.hongguo", category: "media-policy")
+
     static func allows(_ url: URL) -> Bool {
-        guard url.scheme?.lowercased() == "https", url.user == nil, url.password == nil, url.fragment == nil,
-              url.port == nil || url.port == 443, url.absoluteString.count <= 32_768,
-              let host = url.host?.lowercased(), !host.isEmpty else { return false }
-        return domains.contains { host == $0 || host.hasSuffix("." + $0) }
+        rejection(of: url) == nil
+    }
+
+    static func rejection(of url: URL?) -> Rejection? {
+        guard let url else { return .missingURL }
+        guard url.scheme?.lowercased() == "https" else { return .scheme }
+        guard url.user == nil, url.password == nil else { return .credentials }
+        guard url.fragment == nil else { return .fragment }
+        guard url.port == nil || url.port == 443 else { return .port }
+        guard url.absoluteString.count <= 32_768 else { return .urlLength }
+        guard let host = url.host?.lowercased(), domains.contains(where: { host == $0 || host.hasSuffix("." + $0) }) else {
+            return .host
+        }
+        return nil
+    }
+
+    static func redirectRejection(of url: URL?, hops: Int) -> Rejection? {
+        guard hops <= 3 else { return .redirectLimit }
+        return rejection(of: url)
+    }
+
+    static func sourceRejection(_ source: NativeMediaSource) -> Rejection? {
+        if let reason = rejection(of: source.url) { return reason }
+        guard source.userAgent.utf8.count <= 2048 else { return .userAgentLength }
+        guard !source.userAgent.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return .userAgentControlCharacter
+        }
+        return nil
+    }
+
+    static func report(_ reason: Rejection, stage: Stage, status: Int = 0, hops: Int = 0) {
+        // Never interpolate URLs, header values, source objects, or raw errors here.
+        logger.notice("Rejected media stage=\(stage.rawValue, privacy: .public) reason=\(reason.rawValue, privacy: .public) status=\(status, privacy: .public) hops=\(hops, privacy: .public)")
     }
 
     static func validate(_ source: NativeMediaSource) throws {
-        guard allows(source.url), source.userAgent.utf8.count <= 2048,
-              !source.userAgent.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+        if let reason = sourceRejection(source) {
+            report(reason, stage: .source)
             throw NativeMediaError.unsafeURL
         }
         guard ["h264", "avc", "avc1", "avc3", "hevc", "h265", "hvc1", "hev1", "bytevc1"].contains(source.codec.lowercased()) else {

@@ -42,9 +42,12 @@ enum NativeRangeHeaders {
     }
     static func parse(_ response: HTTPURLResponse, requested: Range<Int>, knownTotal: Int?, validators: NativeRangeValidators?) throws -> Parsed {
         guard requested.lowerBound >= 0, requested.upperBound > requested.lowerBound else { throw NativeProgressiveError.invalidRange }
-        guard let url = response.url, NativeMediaPolicy.allows(url) else { throw NativeMediaError.unsafeURL }
         if response.statusCode == 401 { throw CatalogError.unauthorized }
         if response.statusCode == 403 { throw CatalogError.httpStatus(403) }
+        if let reason = NativeMediaPolicy.rejection(of: response.url) {
+            NativeMediaPolicy.report(reason, stage: .rangeResponse, status: response.statusCode)
+            throw NativeMediaError.unsafeURL
+        }
         guard response.statusCode == 206 else {
             if response.statusCode == 200 { throw NativeProgressiveError.unsupportedRange }
             throw NativeMediaError.httpStatus(response.statusCode)
@@ -178,7 +181,7 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
             completionHandler(.allow)
         } catch {
             completionHandler(.cancel)
-            if Self.isTerminal(error) { stopAll(error) }
+            if Self.isTerminal(error) { retire(session, with: error) }
             else { finish(transfer, error: error) }
         }
     }
@@ -202,8 +205,11 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         guard let transfer = transfer(task), !transfer.finished else { completionHandler(nil); return }
         transfer.redirects += 1
-        guard transfer.redirects <= 3, let url = request.url, NativeMediaPolicy.allows(url) else {
-            completionHandler(nil); finish(transfer, error: NativeMediaError.unsafeURL); return
+        if let reason = NativeMediaPolicy.redirectRejection(of: request.url, hops: transfer.redirects) {
+            completionHandler(nil)
+            NativeMediaPolicy.report(reason, stage: .rangeRedirect, status: response.statusCode, hops: transfer.redirects)
+            retire(session, with: NativeMediaError.unsafeURL)
+            return
         }
         var safe = request
         safe.httpMethod = "GET"; safe.httpBody = nil
@@ -219,10 +225,17 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
         if case CatalogError.unauthorized = error { return true }
         if case CatalogError.httpStatus(403) = error { return true }
         if case NativeProgressiveError.changedSource = error { return true }
+        if case NativeMediaError.unsafeURL = error { return true }
         return false
     }
 
+    private func retire(_ session: URLSession, with error: any Error) {
+        stopAll(error)
+        session.invalidateAndCancel()
+    }
+
     private func stopAll(_ error: any Error) {
+        guard terminalError == nil else { return }
         terminalError = error
         for transfer in Array(transfers.values) { finish(transfer, error: error, startNext: false) }
         waiting.removeAll()
@@ -241,5 +254,5 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
 
     /// Called when the owning stream is released. Queued work has its own
     /// continuations and remains alive until cancellation has been delivered.
-    func close() { queue.async { [self] in stopAll(CancellationError()); session.invalidateAndCancel() } }
+    func close() { queue.async { [self] in retire(session, with: CancellationError()) } }
 }

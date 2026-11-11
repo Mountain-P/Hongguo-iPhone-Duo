@@ -58,9 +58,24 @@ struct PlaybackRecoveryTests {
         #expect(!PlaybackRecovery.shouldRetry(sanitized, attempt: 1))
     }
 
-    @Test func nestedDenialUnsafeURLAndCancellationOverrideAnAssetRetrySignal() {
-        let terminal: [any Error] = [CatalogError.unauthorized, CatalogError.httpStatus(403),
-            CatalogError.unsafePlaybackURL, NativeMediaError.unsafeURL, CancellationError(), URLError(.cancelled),
+    @Test func onlyAnAssetReadRejectionCanRequestANewValidatedSource() {
+        let blocked = NativeMediaError.unsafeURL
+        let wrapped = NSError(domain: "AVFoundationErrorDomain", code: -11800,
+                              userInfo: [NSUnderlyingErrorKey: blocked])
+        #expect(PlaybackRecovery.shouldRetryAssetRead(blocked))
+        #expect(PlaybackRecovery.shouldRetryAssetRead(wrapped))
+        #expect(!PlaybackRecovery.shouldRetry(blocked, attempt: 0))
+        #expect(!PlaybackRecovery.shouldRetry(wrapped, attempt: 0))
+        #expect(!PlaybackRecovery.shouldRetryAssetRead(CatalogError.unsafePlaybackURL))
+        #expect(!PlaybackRecovery.shouldRetryAssetRead(URLError(.redirectToNonExistentLocation)))
+    }
+
+    @Test func nestedDenialAndCancellationOverrideAnAssetRetrySignal() {
+        let terminal: [any Error] = [CatalogError.unauthorized, CatalogError.httpStatus(401),
+            CatalogError.httpStatus(403), NativeMediaError.httpStatus(401), NativeMediaError.httpStatus(403),
+            CatalogError.unsafePlaybackURL, CancellationError(), URLError(.cancelled),
+            NSError(domain: PlaybackRecovery.assetErrorDomain, code: 401),
+            NSError(domain: PlaybackRecovery.assetErrorDomain, code: 403),
             NSError(domain: PlaybackRecovery.assetErrorDomain, code: 429)]
         for cause in terminal {
             let wrapped = NSError(domain: PlaybackRecovery.assetErrorDomain,

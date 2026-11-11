@@ -12,9 +12,9 @@ public enum PlaybackRecovery {
         return isRetryable(error, fromAssetRead: false)
     }
 
-    /// A version mismatch detected while reading a prepared asset terminates that
-    /// stream. The loader can report a sanitized transient failure so the player
-    /// requests a fresh source. Preparation has its own refresh budget.
+    /// A version mismatch or rejected URL while reading a prepared asset can
+    /// trigger one new source lookup through the player. The blocked URL stays
+    /// blocked, and the new source goes through regular validation.
     public static func shouldRetryAssetRead(_ error: any Error) -> Bool {
         isRetryable(error, fromAssetRead: true)
     }
@@ -24,7 +24,8 @@ public enum PlaybackRecovery {
         var retryable = false
         for _ in 0...8 {
             guard let cause = current else { break }
-            if fromAssetRead && (cause as? NativeProgressiveError) == .changedSource {
+            if fromAssetRead && ((cause as? NativeProgressiveError) == .changedSource
+                                 || (cause as? NativeMediaError) == .unsafeURL) {
                 retryable = true
             } else {
                 if isTerminal(cause) { return false }
