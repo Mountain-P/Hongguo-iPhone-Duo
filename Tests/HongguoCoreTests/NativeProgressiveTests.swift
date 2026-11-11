@@ -72,8 +72,10 @@ struct NativeProgressiveTests {
         #expect(await backupBytes.ranges.count == 1)
     }
 
-    @Test(arguments: [true, false])
-    func freshPreparationAvoidsTheHostThatFailedMidstream(_ validatorChanged: Bool) async throws {
+    enum RouteFailure: CaseIterable, Sendable { case validatorChanged, unsafeURL, starvation }
+
+    @Test(arguments: RouteFailure.allCases)
+    func freshPreparationAvoidsTheHostThatFailedMidstream(_ failure: RouteFailure) async throws {
         let primaryFixture = streamFixture(payload: Data(repeating: 0x11, count: 900_000), samples: 1)
         let backupFixture = streamFixture(payload: Data(repeating: 0x22, count: 900_000), samples: 1)
         let primaryBytes = ProgressiveBytes(primaryFixture.data), backupBytes = ProgressiveBytes(backupFixture.data)
@@ -84,28 +86,32 @@ struct NativeProgressiveTests {
         let media = NativeProgressiveMedia(now: { clock.now }, makeFetcher: { $0.url == primary.url ? primaryBytes : backupBytes })
         let original = try await media.preparePlayback(source: primary, episodeID: "123", fresh: false)
         let range = 600_000..<600_020
-        if validatorChanged {
+        switch failure {
+        case .validatorChanged:
             await primaryBytes.setChanged()
             await #expect(throws: NativeProgressiveError.changedSource) { try await original.read(range: range) }
-        } else {
+        case .unsafeURL:
             await primaryBytes.setFailure(NativeMediaError.unsafeURL)
             await #expect(throws: NativeMediaError.unsafeURL) { try await original.read(range: range) }
             await primaryBytes.setFailure(nil)
+        case .starvation:
+            original.noteBufferStarvation()
         }
-        #expect(await primaryBytes.ranges.count == 2)
+        let primaryRequests = failure == .starvation ? 1 : 2
+        #expect(await primaryBytes.ranges.count == primaryRequests)
         #expect(await backupBytes.ranges.isEmpty)
 
         let recovered = try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
         #expect(recovered != original)
         #expect(try await recovered.read(range: range) == backupFixture.data.subdata(in: range))
-        #expect(await primaryBytes.ranges.count == 2)
+        #expect(await primaryBytes.ranges.count == primaryRequests)
         #expect(await backupBytes.ranges.count == 2)
 
         _ = try await media.preparePlayback(source: primary, episodeID: "124", fresh: true)
-        #expect(await primaryBytes.ranges.count == 3)
+        #expect(await primaryBytes.ranges.count == primaryRequests + 1)
         clock.advance(61)
         _ = try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
-        #expect(await primaryBytes.ranges.count == 4)
+        #expect(await primaryBytes.ranges.count == primaryRequests + 2)
     }
 
     @Test func preparationFetchesOnlyPrefixAndFirstReadsUseThatPrefix() async throws {

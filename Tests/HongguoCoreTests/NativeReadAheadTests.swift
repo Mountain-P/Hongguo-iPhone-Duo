@@ -4,13 +4,17 @@ import HongguoCore
 
 private actor BusyReadAheadProbe {
     private let failures: Int
+    private let failure: NativeMediaError
     private(set) var requests: [Range<Int>] = []
 
-    init(failures: Int) { self.failures = failures }
+    init(failures: Int, failure: NativeMediaError = .busy) {
+        self.failures = failures
+        self.failure = failure
+    }
 
     func prefetch(_ range: Range<Int>) throws {
         requests.append(range)
-        if requests.count <= failures { throw NativeMediaError.busy }
+        if requests.count <= failures { throw failure }
     }
 }
 
@@ -31,6 +35,15 @@ private actor BusyReadAheadProbe {
             try await NativeMediaAssetLoader.prefetchWithBackoff(range) { try await probe.prefetch($0) }
         }
         #expect(await probe.requests == Array(repeating: range, count: 5))
+    }
+
+    @Test func temporaryNetworkFailureRetriesTheSameRangeOnlyOnce() async {
+        let probe = BusyReadAheadProbe(failures: 2, failure: .network)
+        let range = chunk..<(2 * chunk)
+        await #expect(throws: NativeMediaError.network) {
+            try await NativeMediaAssetLoader.prefetchWithBackoff(range) { try await probe.prefetch($0) }
+        }
+        #expect(await probe.requests == [range, range])
     }
 
     @Test(arguments: [(rate: Float(1), count: 4), (rate: Float(2), count: 8)])

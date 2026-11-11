@@ -87,6 +87,10 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         return asset
     }
 
+    public func noteBufferStarvation() {
+        stream.noteBufferStarvation()
+    }
+
     /// Network/scene/power policy is owned by the active player. This can be called
     /// from any queue; speculation never starts merely because an asset was created.
     public func setReadAheadEnabled(_ enabled: Bool, memoryOnly: Bool = false, playbackRate: Float = 1) {
@@ -262,10 +266,9 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                 do {
                     var prefetched: Range<Int>?
                     while let range = await self?.nextReadAheadRange(after: prefetched, generation: generation) {
-                        if memoryOnly {
-                            _ = try await stream.read(range: range)
-                        } else {
-                            try await Self.prefetchWithBackoff(range) { try await stream.prefetch(range: $0) }
+                        try await Self.prefetchWithBackoff(range) {
+                            if memoryOnly { _ = try await stream.read(range: $0) }
+                            else { try await stream.prefetch(range: $0) }
                         }
                         prefetched = range
                     }
@@ -280,6 +283,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     static func prefetchWithBackoff(_ range: Range<Int>,
                                     prefetch: (Range<Int>) async throws -> Void) async throws {
         var delay = Duration.milliseconds(50)
+        var retriedTransport = false
         while true {
             try Task.checkCancellation()
             do {
@@ -290,6 +294,8 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                 // while AVFoundation has no further successful reads to wake us.
                 try await Task.sleep(for: delay)
                 delay *= 2
+            } catch where !retriedTransport && PlaybackRecovery.shouldRetry(error, attempt: 0) {
+                retriedTransport = true
             }
         }
     }

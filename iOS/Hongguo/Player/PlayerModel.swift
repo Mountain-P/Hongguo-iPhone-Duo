@@ -243,9 +243,13 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         switch action {
         case .reload:
             guard let episode = currentEpisode, eligible else { return }
+            let position = resumePosition
+            if bufferedSeconds(at: position) <= 0.5 * Double(effectiveSpeed) {
+                progressiveLoader?.noteBufferStarvation()
+            }
             traceHealth("reload")
             if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: true) }
-            beginLoad(episode, position: resumePosition, fresh: true, autoplay: playbackSpeed.wantsPlayback,
+            beginLoad(episode, position: position, fresh: true, autoplay: playbackSpeed.wantsPlayback,
                       continuingDiagnostics: true, preservingPosition: true)
             return
         case .stopWaiting:
@@ -942,16 +946,19 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         if audioPolicy.receive(event) == .pause { pauseAndSave() }
     }
 
-    private func updateNextEpisodePrefetch() {
-        guard let currentEpisode else { cancelNextEpisodePrefetch(); return }
-        let bufferAhead = player.currentItem?.loadedTimeRanges.reduce(0.0) { best, value in
+    private func bufferedSeconds(at position: Double) -> Double {
+        player.currentItem?.loadedTimeRanges.reduce(0.0) { best, value in
             let range = value.timeRangeValue
             let start = range.start.seconds, end = CMTimeRangeGetEnd(range).seconds
-            guard start.isFinite, end.isFinite, start <= elapsed + 0.25, end > elapsed else { return best }
-            return max(best, end - elapsed)
+            guard start.isFinite, end.isFinite, start <= position + 0.25, end > position else { return best }
+            return max(best, end - position)
         } ?? 0
+    }
+
+    private func updateNextEpisodePrefetch() {
+        guard let currentEpisode else { cancelNextEpisodePrefetch(); return }
         let context = EpisodePrefetchState.Context(elapsed: elapsed, duration: duration, rate: effectiveSpeed,
-            bufferedAhead: bufferAhead,
+            bufferedAhead: bufferedSeconds(at: elapsed),
             allowed: !isPreview && service is NativeCatalogService && autoNext && sceneActive && hasStarted
                 && playbackSpeed.wantsPlayback && isPlaying && !isLoading && !isBuffering
                 && errorMessage == nil && prefetchNetworkAllowed)

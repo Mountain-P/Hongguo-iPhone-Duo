@@ -324,6 +324,10 @@ public actor NativeMediaStream: Hashable {
     var pendingDiskWriteCount: Int { diskWriteCount }
     public func trimCachedChunks() { cache.removeAll(); cacheBytes = 0 }
 
+    public nonisolated func noteBufferStarvation() {
+        onRouteFailure?()
+    }
+
     public func read(range: Range<Int>) async throws -> Data {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound <= totalLength else { throw NativeProgressiveError.invalidRange }
