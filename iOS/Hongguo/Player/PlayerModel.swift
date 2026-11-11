@@ -194,24 +194,30 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     private func updateLoaderReadAheadEligibility() {
-        setLoaderReadAheadEnabled(prefetchNetworkAllowed && sceneActive && hasStarted
-            && playbackSpeed.wantsPlayback && !isLoading && errorMessage == nil)
+        let canReadAhead = (prefetchNetworkAllowed || !isPreview) && sceneActive && hasStarted
+            && playbackSpeed.wantsPlayback && !isLoading && errorMessage == nil
+        setLoaderReadAheadEnabled(canReadAhead, memoryOnly: !prefetchNetworkAllowed)
     }
 
-    private func setLoaderReadAheadEnabled(_ requested: Bool) {
+    private func setLoaderReadAheadEnabled(_ requested: Bool, memoryOnly: Bool = false) {
         let enabled = requested && progressiveLoader != nil
-        guard loaderReadAheadEnabled != enabled else { return }
-        progressiveLoader?.setReadAheadEnabled(enabled)
+        let memoryOnly = enabled && memoryOnly
+        let rate = enabled ? effectiveSpeed : 1
+        guard loaderReadAheadEnabled != enabled || loaderReadAheadMemoryOnly != memoryOnly
+            || loaderReadAheadRate != rate else { return }
+        progressiveLoader?.setReadAheadEnabled(enabled, memoryOnly: memoryOnly, playbackRate: rate)
         loaderReadAheadEnabled = enabled
+        loaderReadAheadMemoryOnly = memoryOnly
+        loaderReadAheadRate = rate
         traceBufferPolicy()
     }
 
     private func traceBufferPolicy() {
         #if DEBUG
         guard ProcessInfo.processInfo.arguments.contains("-playback-buffer-diagnostics") else { return }
-        NSLog("PlaybackBuffer rate=%.2f targetMediaSeconds=%.2f preview=%d aheadEnabled=%d",
+        NSLog("PlaybackBuffer rate=%.2f targetMediaSeconds=%.2f preview=%d aheadEnabled=%d memoryOnly=%d",
               Double(effectiveSpeed), bufferPolicy.targetMediaSeconds, isPreview ? 1 : 0,
-              loaderReadAheadEnabled ? 1 : 0)
+              loaderReadAheadEnabled ? 1 : 0, loaderReadAheadMemoryOnly ? 1 : 0)
         #endif
     }
 
@@ -412,6 +418,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private var prefetchNetworkAllowed = false
     private var bufferPolicy = PlaybackBufferPolicy()
     private var loaderReadAheadEnabled = false
+    private var loaderReadAheadMemoryOnly = false
+    private var loaderReadAheadRate: Float = 1
 
     init(series: Series, episodes: [Episode], initialEpisodeID: String, resumeSeconds: Double,
          service: any CatalogService, onProgress: @escaping (Episode, Double, Double) -> Void,

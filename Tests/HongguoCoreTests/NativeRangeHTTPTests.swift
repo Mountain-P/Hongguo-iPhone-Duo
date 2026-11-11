@@ -6,6 +6,7 @@ import Testing
 private struct RangeScenario: Sendable {
     var status = 206
     var excess = false
+    var shortBodies = 0
     var delay: Double = 0.03
     var responseOutsidePolicy = false
     var redirectHosts: [String] = []
@@ -32,6 +33,7 @@ private final class RangeScenarios: @unchecked Sendable {
     func begin(_ path: String) -> RangeScenario? {
         lock.withLock {
             guard let scenario = values[path] else { return nil }
+            if scenario.shortBodies > 0 { values[path]?.shortBodies -= 1 }
             active[path, default: 0] += 1; requests[path, default: 0] += 1
             peak[path] = max(peak[path, default: 0], active[path, default: 0]); return scenario
         }
@@ -54,6 +56,7 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
         let range = (request.value(forHTTPHeaderField: "Range") ?? "bytes=0-15").dropFirst(6).split(separator: "-")
         let first = Int(range[0])!, last = Int(range[1])!
         var headers = ["Content-Type": "video/mp4", "Content-Range": "bytes \(first)-\(last)/1000", "Content-Length": String(last - first + 1), "ETag": "fixture"]
+        if scenario.shortBodies > 0 { headers.removeValue(forKey: "Content-Length") }
         let redirectURL = scenario.nextRedirectHost(after: url.host).map { URL(string: "https://" + $0 + url.path)! }
         let status = redirectURL == nil && !scenario.redirectHosts.isEmpty ? 206 : scenario.status
         if status == 403 { headers["Content-Type"] = "application/json"; headers["Content-Length"] = "999999999" }
@@ -72,7 +75,8 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
             }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             guard !lock.withLock({ stopped }) else { return }
-            client?.urlProtocol(self, didLoad: Data(repeating: 0x55, count: last - first + 1 + (scenario.excess ? 1 : 0)))
+            let byteCount = last - first + 1 + (scenario.excess ? 1 : 0) - (scenario.shortBodies > 0 ? 1 : 0)
+            client?.urlProtocol(self, didLoad: Data(repeating: 0x55, count: byteCount))
             end()
             client?.urlProtocolDidFinishLoading(self)
         }
@@ -124,6 +128,21 @@ struct NativeRangeHTTPTests {
         await #expect(throws: NativeProgressiveError.invalidRange) { try await excess.fetch(range: 0..<16) }
         let (ignored, _) = try client(.init(status: 200)); defer { ignored.close() }
         await #expect(throws: NativeProgressiveError.unsupportedRange) { try await ignored.fetch(range: 0..<16) }
+    }
+
+    @Test func validRangeWithAnEarlyEndIsRetriedOnce() async throws {
+        let (client, url) = try client(.init(shortBodies: 1)); defer { client.close() }
+        let range = 32..<48
+        let response = try await client.fetch(range: range)
+        #expect(response.range == range)
+        #expect(response.data == Data(repeating: 0x55, count: range.count))
+        #expect(RangeScenarios.shared.counts(url.path).requests == 2)
+    }
+
+    @Test func repeatedEarlyEndsReturnANetworkErrorAfterTwoAttempts() async throws {
+        let (client, url) = try client(.init(shortBodies: 3)); defer { client.close() }
+        await #expect(throws: NativeMediaError.network) { try await client.fetch(range: 32..<48) }
+        #expect(RangeScenarios.shared.counts(url.path).requests == 2)
     }
 
     @Test func authorizationDenialIsTerminalDespiteHugeBinaryBody() async throws {

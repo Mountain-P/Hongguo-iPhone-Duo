@@ -77,6 +77,8 @@ enum NativeRangeHeaders {
 /// Reuses a single ephemeral session per stream. All callbacks and mutable
 /// request state share one queue; at most two Range transactions are active.
 final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelegate, @unchecked Sendable {
+    private enum TransferError: Error { case incompleteBody }
+
     private final class Transfer: @unchecked Sendable {
         let id = UUID()
         let range: Range<Int>
@@ -123,6 +125,17 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
     func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound > range.lowerBound, range.count <= 8 * 1024 * 1024 else { throw NativeProgressiveError.invalidRange }
+        do {
+            return try await fetchOnce(range: range)
+        } catch TransferError.incompleteBody {
+            // A valid but incomplete response has not released any bytes to the caller.
+            do { return try await fetchOnce(range: range) }
+            catch TransferError.incompleteBody { throw NativeMediaError.network }
+        }
+    }
+
+    private func fetchOnce(range: Range<Int>) async throws -> NativeRangeResponse {
+        try Task.checkCancellation()
         let transfer = Transfer(range: range)
         let response = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -200,8 +213,13 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
         guard let transfer = transfer(task), !transfer.finished else { return }
         if transfer.cancelled { finish(transfer, error: CancellationError()) }
         else if error != nil { finish(transfer, error: NativeMediaError.network) }
-        else if let metadata = transfer.metadata, transfer.data.count == metadata.range.count {
-            finish(transfer, response: NativeRangeResponse(data: transfer.data, range: metadata.range, totalLength: metadata.totalLength, validators: metadata.validators))
+        else if let metadata = transfer.metadata {
+            if transfer.data.count < metadata.range.count {
+                // The range headers were valid, but the body ended before all bytes arrived.
+                finish(transfer, error: TransferError.incompleteBody)
+            } else {
+                finish(transfer, response: NativeRangeResponse(data: transfer.data, range: metadata.range, totalLength: metadata.totalLength, validators: metadata.validators))
+            }
         } else { finish(transfer, error: NativeProgressiveError.invalidRange) }
     }
 

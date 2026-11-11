@@ -10,14 +10,20 @@ import UniformTypeIdentifiers
 public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     struct ReadAheadWindow {
         static let chunkSize = 512 * 1024
-        private static let windowBytes = 16 * 1024 * 1024
+        private static let diskWindowBytes = 16 * 1024 * 1024
+
+        static func memoryWindowBytes(playbackRate: Float) -> Int {
+            playbackRate >= 1.5 ? 4 * 1024 * 1024 : 2 * 1024 * 1024
+        }
 
         private var next = 0
         private var end = 0
         var hasPendingRange: Bool { next < end }
 
-        mutating func extend(after cursor: Int, totalLength: Int) {
-            end = cursor + min(Self.windowBytes, totalLength - cursor)
+        mutating func extend(after cursor: Int, totalLength: Int, memoryOnly: Bool = false, playbackRate: Float = 1) {
+            let windowBytes = memoryOnly ? Self.memoryWindowBytes(playbackRate: playbackRate) : Self.diskWindowBytes
+            let limit = cursor + min(windowBytes, totalLength - cursor)
+            end = memoryOnly && limit < totalLength ? limit / Self.chunkSize * Self.chunkSize : limit
         }
 
         mutating func skipConsumedChunks(before cursor: Int) {
@@ -27,7 +33,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         mutating func nextRange(after prefetched: Range<Int>?, totalLength: Int) -> Range<Int>? {
             // A temporary failure must leave the attempted chunk eligible for the
             // next demand. Advance only when the worker confirms a successful fetch.
-            if let prefetched { next = prefetched.upperBound }
+            if let prefetched { next = max(next, prefetched.upperBound) }
             guard hasPendingRange else { return nil }
             return next..<(next + min(Self.chunkSize, totalLength - next))
         }
@@ -54,7 +60,10 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private var pending: [ObjectIdentifier: Pending] = [:]
     private var stopped = false
     private var readAheadEnabled = false
+    private var readAheadMemoryOnly = false
+    private var readAheadRate: Float = 1
     private var readAheadStorageFailed = false
+    private var usesMemoryReadAhead: Bool { readAheadMemoryOnly || readAheadStorageFailed }
     private var readAheadTask: Task<Void, Never>?
     private var readAheadGeneration = UUID()
     private var readAheadWindow = ReadAheadWindow()
@@ -80,12 +89,17 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
 
     /// Network/scene/power policy is owned by the active player. This can be called
     /// from any queue; speculation never starts merely because an asset was created.
-    public func setReadAheadEnabled(_ enabled: Bool) {
+    public func setReadAheadEnabled(_ enabled: Bool, memoryOnly: Bool = false, playbackRate: Float = 1) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
+            let wasMemoryOnly = self.usesMemoryReadAhead
+            let previousWindow = ReadAheadWindow.memoryWindowBytes(playbackRate: self.readAheadRate)
             self.readAheadEnabled = enabled
-            if !enabled { self.cancelReadAhead() }
-            else if let cursor = self.lastDemandEnd { self.extendReadAhead(after: cursor) }
+            self.readAheadMemoryOnly = memoryOnly
+            self.readAheadRate = playbackRate
+            let windowChanged = self.usesMemoryReadAhead && previousWindow != ReadAheadWindow.memoryWindowBytes(playbackRate: playbackRate)
+            if !enabled || wasMemoryOnly != self.usesMemoryReadAhead || windowChanged { self.cancelReadAhead() }
+            if enabled, let cursor = self.lastDemandEnd { self.extendReadAhead(after: cursor) }
         }
     }
 
@@ -234,10 +248,11 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     }
 
     private func extendReadAhead(after cursor: Int) {
-        guard readAheadEnabled, !readAheadStorageFailed, !stopped, cursor < stream.totalLength else { return }
-        readAheadWindow.extend(after: cursor, totalLength: stream.totalLength)
+        guard readAheadEnabled, !stopped, cursor < stream.totalLength else { return }
+        let memoryOnly = usesMemoryReadAhead
+        readAheadWindow.extend(after: cursor, totalLength: stream.totalLength, memoryOnly: memoryOnly, playbackRate: readAheadRate)
+        readAheadWindow.skipConsumedChunks(before: cursor)
         if readAheadTask == nil {
-            readAheadWindow.skipConsumedChunks(before: cursor)
             guard readAheadWindow.hasPendingRange else { return }
             let generation = UUID(); readAheadGeneration = generation
             let stream = stream
@@ -247,14 +262,34 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                 do {
                     var prefetched: Range<Int>?
                     while let range = await self?.nextReadAheadRange(after: prefetched, generation: generation) {
-                        try Task.checkCancellation()
-                        try await stream.prefetch(range: range)
+                        if memoryOnly {
+                            _ = try await stream.read(range: range)
+                        } else {
+                            try await Self.prefetchWithBackoff(range) { try await stream.prefetch(range: $0) }
+                        }
                         prefetched = range
                     }
                     completed = true
-                } catch PlaybackPrefetchError.unsupported { storageFailed = true }
+                } catch PlaybackPrefetchError.unsupported where !memoryOnly { storageFailed = true }
                 catch { /* Read-ahead failures never replace foreground errors. */ }
                 self?.finishReadAhead(generation: generation, continueIfExtended: completed, storageFailed: storageFailed)
+            }
+        }
+    }
+
+    static func prefetchWithBackoff(_ range: Range<Int>,
+                                    prefetch: (Range<Int>) async throws -> Void) async throws {
+        var delay = Duration.milliseconds(50)
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await prefetch(range)
+                return
+            } catch NativeMediaError.busy where delay <= .milliseconds(400) {
+                // A busy disk cache can finish opening or committing a chunk
+                // while AVFoundation has no further successful reads to wake us.
+                try await Task.sleep(for: delay)
+                delay *= 2
             }
         }
     }
@@ -276,8 +311,12 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         queue.async { [weak self] in
             guard let self, self.readAheadGeneration == generation else { return }
             self.readAheadTask = nil
-            if storageFailed { self.readAheadStorageFailed = true }
-            if continueIfExtended, self.readAheadWindow.hasPendingRange, let cursor = self.lastDemandEnd {
+            if storageFailed {
+                self.readAheadStorageFailed = true
+                self.readAheadWindow = ReadAheadWindow()
+            }
+            if storageFailed || (continueIfExtended && self.readAheadWindow.hasPendingRange),
+               let cursor = self.lastDemandEnd {
                 self.extendReadAhead(after: cursor)
             }
         }
