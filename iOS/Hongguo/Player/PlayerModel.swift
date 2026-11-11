@@ -272,9 +272,21 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
                 guard let self, self.generation == requestGeneration else { return }
                 self.updateBufferedRanges()
+                if await self.recoverTerminalStreamFailure(generation: requestGeneration) { return }
                 self.updatePlaybackHealth()
             }
         }
+    }
+
+    private func recoverTerminalStreamFailure(generation requestGeneration: UUID) async -> Bool {
+        guard isBuffering, !isSeeking, bufferedSeconds(at: resumePosition) <= 0.5 * Double(effectiveSpeed),
+              let error = await progressiveLoader?.recoverableTerminalError(),
+              generation == requestGeneration, !Task.isCancelled, sceneActive, playbackSpeed.wantsPlayback,
+              PlaybackNetworkAvailability.shared.isAvailable, errorMessage == nil,
+              isBuffering, !isSeeking, bufferedSeconds(at: resumePosition) <= 0.5 * Double(effectiveSpeed) else { return false }
+        traceHealth("terminal source")
+        handleFailure(generation: requestGeneration, error: error)
+        return true
     }
 
     private func traceHealth(_ action: String) {
@@ -839,6 +851,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             Task { @MainActor [weak self] in
                 guard let self, self.generation == requestGeneration, self.hasStarted else { return }
                 if !self.isSeeking { self.elapsed = time.seconds.isFinite ? max(0, time.seconds) : 0 }
+                if !self.isSeeking, self.sceneActive, self.playbackSpeed.wantsPlayback, !self.isLoading,
+                   self.player.timeControlStatus == .playing, self.player.currentItem?.status == .readyToPlay,
+                   self.errorMessage == nil {
+                    self.stallRecovery.recordPlaybackProgress(at: time.seconds)
+                }
                 self.updateDuration()
                 self.updateBufferedRanges()
                 self.updateNextEpisodePrefetch()
@@ -878,7 +895,12 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
         if error is CancellationError { return }
         cancelStartupWatchdog()
-        let willRetry = PlaybackRecovery.shouldRetry(error, attempt: retryCount)
+        let willRetry: Bool
+        if hasStarted && !isLoading {
+            willRetry = PlaybackRecovery.shouldRetry(error, attempt: 0) && stallRecovery.requestReload()
+        } else {
+            willRetry = PlaybackRecovery.shouldRetry(error, attempt: retryCount)
+        }
         if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: willRetry) }
         if willRetry {
             let resumeAfterRecovery = playbackSpeed.wantsPlayback

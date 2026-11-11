@@ -74,6 +74,58 @@ struct PlaybackHealthTests {
         }
     }
 
+    @Test func sustainedPlaybackRearmsSeparateStallsUpToTheEpisodeLimit() {
+        var state = PlaybackStallRecoveryState()
+        for incident in 0..<3 {
+            let time = Double(incident * 30)
+            let position = Double(40 + incident * 10)
+            #expect(state.update(sample(time, position: position)) == .none)
+            #expect(state.update(sample(time + 12, position: position)) == .reload)
+            #expect(state.update(sample(time + 13, position: position, waiting: false)) == .none)
+            for offset in 0...10 { state.recordPlaybackProgress(at: position + Double(offset)) }
+        }
+        #expect(state.update(sample(90, position: 70)) == .none)
+        #expect(state.update(sample(102, position: 70)) == .stopWaiting)
+        #expect(state.isExhausted)
+    }
+
+    @Test func readyItemFailuresAndSustainedWaitingShareTheSameRecoverySlot() {
+        var state = PlaybackStallRecoveryState()
+        #expect(state.requestReload() == true)
+        #expect(state.requestReload() == false)
+        #expect(!state.isExhausted)
+        #expect(state.update(sample(0)) == .none)
+        #expect(state.update(sample(12)) == .stopWaiting)
+        #expect(state.requestReload() == false)
+
+        state.reset()
+        _ = state.update(sample(0))
+        #expect(state.update(sample(12)) == .reload)
+        #expect(state.requestReload() == false)
+        for position in 40...50 { state.recordPlaybackProgress(at: Double(position)) }
+        #expect(state.requestReload() == true)
+    }
+
+    @Test func seekItemReplacementAndClockJumpsCannotRearmRecovery() {
+        for interruption in [sample(0, isReady: false), sample(0, isSeeking: true)] {
+            var state = PlaybackStallRecoveryState()
+            #expect(state.requestReload() == true)
+            for position in 40...48 { state.recordPlaybackProgress(at: Double(position)) }
+            #expect(state.update(interruption) == .none)
+            for position in 48...50 { state.recordPlaybackProgress(at: Double(position)) }
+            #expect(state.requestReload() == false)
+        }
+
+        for jump in [20, 80] {
+            var state = PlaybackStallRecoveryState()
+            #expect(state.requestReload() == true)
+            for position in 40...48 { state.recordPlaybackProgress(at: Double(position)) }
+            state.recordPlaybackProgress(at: Double(jump))
+            state.recordPlaybackProgress(at: Double(jump + 2))
+            #expect(state.requestReload() == false)
+        }
+    }
+
     @Test func explicitResetAllowsANewEpisodeOrManualRetryToRecoverAgain() {
         var state = PlaybackStallRecoveryState()
         _ = state.update(sample(0)); _ = state.update(sample(12))

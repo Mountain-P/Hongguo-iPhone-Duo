@@ -91,6 +91,10 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         stream.noteBufferStarvation()
     }
 
+    public func recoverableTerminalError() async -> NSError? {
+        await stream.recoverableTerminalError.map(Self.sanitized)
+    }
+
     /// Network/scene/power policy is owned by the active player. This can be called
     /// from any queue; speculation never starts merely because an asset was created.
     public func setReadAheadEnabled(_ enabled: Bool, memoryOnly: Bool = false, playbackRate: Float = 1) {

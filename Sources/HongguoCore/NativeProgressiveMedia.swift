@@ -328,6 +328,11 @@ public actor NativeMediaStream: Hashable {
         onRouteFailure?()
     }
 
+    public var recoverableTerminalError: (any Error)? {
+        guard let permanentFailure, PlaybackRecovery.shouldRetryAssetRead(permanentFailure) else { return nil }
+        return permanentFailure
+    }
+
     public func read(range: Range<Int>) async throws -> Data {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound <= totalLength else { throw NativeProgressiveError.invalidRange }

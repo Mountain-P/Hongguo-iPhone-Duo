@@ -97,6 +97,8 @@ struct NativeProgressiveTests {
         case .starvation:
             original.noteBufferStarvation()
         }
+        let recoverableError = await original.recoverableTerminalError
+        #expect((recoverableError != nil) == (failure != .starvation))
         let primaryRequests = failure == .starvation ? 1 : 2
         #expect(await primaryBytes.ranges.count == primaryRequests)
         #expect(await backupBytes.ranges.isEmpty)

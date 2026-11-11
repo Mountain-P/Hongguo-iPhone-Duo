@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-/// A bounded recovery budget belongs to an episode, not to a particular player item.
-/// The caller resets it only for an explicit retry or a newly selected episode.
+/// An episode can recover from separate stalls after sustained playback resumes.
+/// Replacing the player item preserves the episode's recovery limit.
 public struct PlaybackStallRecoveryState: Sendable, Equatable {
     public enum Action: Sendable, Equatable { case none, reload, stopWaiting }
 
@@ -23,8 +23,15 @@ public struct PlaybackStallRecoveryState: Sendable, Equatable {
         }
     }
 
-    public private(set) var hasAttemptedRecovery = false
+    private static let maximumRecoveries = 3
+    private static let minimumRecoveryProgress = 10.0
+
+    public var hasAttemptedRecovery: Bool { recoveryCount > 0 }
     public private(set) var isExhausted = false
+    private var recoveryCount = 0
+    private var canReload = true
+    private var playbackProgressStart: Double?
+    private var lastPlaybackPosition: Double?
     private var waitingSince: Double?
     private var anchorPosition: Double?
     private var lastTime: Double?
@@ -36,15 +43,19 @@ public struct PlaybackStallRecoveryState: Sendable, Equatable {
         guard context.time.isFinite, context.time >= 0,
               lastTime.map({ context.time >= $0 }) ?? true else {
             clearWindow()
+            clearPlaybackProgress()
             return .none
         }
         lastTime = context.time
         guard !isExhausted, context.position.isFinite, context.position >= 0,
-              context.waiting, context.wantsPlayback, context.sceneActive,
+              context.wantsPlayback, context.sceneActive,
               context.isReady, !context.isSeeking, context.networkAvailable else {
             clearWindow()
+            clearPlaybackProgress()
             return .none
         }
+        guard context.waiting else { clearWindow(); return .none }
+        clearPlaybackProgress()
         if let anchorPosition, abs(context.position - anchorPosition) > 0.05 {
             clearWindow()
         }
@@ -53,13 +64,36 @@ public struct PlaybackStallRecoveryState: Sendable, Equatable {
             anchorPosition = context.position
         }
         guard let waitingSince, context.time - waitingSince >= 12 else { return .none }
+        if requestReload() { return .reload }
         clearWindow()
-        if !hasAttemptedRecovery {
-            hasAttemptedRecovery = true
-            return .reload
-        }
         isExhausted = true
         return .stopWaiting
+    }
+
+    /// A failed ready item and the stall watchdog consume the same recovery slot.
+    public mutating func requestReload() -> Bool {
+        guard !isExhausted, canReload, recoveryCount < Self.maximumRecoveries else { return false }
+        recoveryCount += 1
+        canReload = false
+        clearWindow()
+        clearPlaybackProgress()
+        return true
+    }
+
+    /// Call from the periodic media clock while playback is active and not seeking.
+    public mutating func recordPlaybackProgress(at position: Double) {
+        guard !isExhausted, !canReload, recoveryCount < Self.maximumRecoveries else { return }
+        guard position.isFinite, position >= 0 else { clearPlaybackProgress(); return }
+        // The observer samples once per media second. Start over after a clock jump.
+        if let lastPlaybackPosition, !(0...4).contains(position - lastPlaybackPosition) {
+            playbackProgressStart = nil
+        }
+        lastPlaybackPosition = position
+        if playbackProgressStart == nil { playbackProgressStart = position }
+        if let playbackProgressStart, position - playbackProgressStart >= Self.minimumRecoveryProgress {
+            canReload = true
+            clearPlaybackProgress()
+        }
     }
 
     public mutating func reset() { self = Self() }
@@ -67,6 +101,11 @@ public struct PlaybackStallRecoveryState: Sendable, Equatable {
     private mutating func clearWindow() {
         waitingSince = nil
         anchorPosition = nil
+    }
+
+    private mutating func clearPlaybackProgress() {
+        playbackProgressStart = nil
+        lastPlaybackPosition = nil
     }
 }
 
