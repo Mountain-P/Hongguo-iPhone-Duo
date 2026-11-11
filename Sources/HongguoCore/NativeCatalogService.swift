@@ -106,9 +106,10 @@ public struct NativeCatalogService: CatalogService {
         let source: PlaybackSource
         do {
             source = try await prepare(episodeID, entry.contentType, fresh, playbackQuality)
-        } catch NativeMediaError.unsafeURL where !fresh && NativePrefetchContext.maximumBytes == nil {
-            // The rejected address stays blocked. Ask for a fresh source for the
-            // same verified episode once, using the existing URL policy again.
+        } catch let error where !fresh && NativePrefetchContext.maximumBytes == nil &&
+            ((error as? NativeMediaError) == .unsafeURL || (error as? NativeProgressiveError) == .changedSource) {
+            // Discard the rejected address or inconsistent ranges. A fresh
+            // preparation starts over for the same episode and checks every response.
             try Task.checkCancellation()
             source = try await prepare(episodeID, entry.contentType, true, playbackQuality)
         }

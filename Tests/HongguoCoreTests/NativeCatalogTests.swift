@@ -142,13 +142,16 @@ struct NativeCatalogTests {
         #expect(await recorder.calls == [.init(episodeID: "203", contentType: "1004", fresh: false)])
     }
 
-    @Test
-    func unsafeInitialPreparationRequeriesTheSameEpisodeAndQualityOnce() async throws {
+    @Test(arguments: [false, true])
+    func rejectedInitialPreparationRequeriesTheSameEpisodeAndQualityOnce(changedSource: Bool) async throws {
         let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(contentType: "1005"))
         let recorder = NativeQualityPreparationRecorder()
         let service = NativeCatalogService(transport: transport, quality: .dataSaver, prepareSource: { episode, type, fresh, quality in
             let source = await recorder.prepare(episode, type, fresh, quality)
-            guard fresh else { throw NativeMediaError.unsafeURL }
+            if !fresh {
+                if changedSource { throw NativeProgressiveError.changedSource }
+                throw NativeMediaError.unsafeURL
+            }
             return source
         })
         let source = try await service.playback(seriesID: "100", episodeID: "203", fresh: false)
