@@ -19,7 +19,7 @@ public struct NativeCatalogService: CatalogService {
         self.playbackQuality = quality
         self.prepare = { episodeID, contentType, fresh, quality in
             let source = try await NativeSourceResolver.shared.resolve(episodeID: episodeID, contentType: contentType, fresh: fresh, quality: quality)
-            let stream = try await NativeProgressiveMedia.shared.prepare(source: source, episodeID: episodeID, fresh: fresh)
+            let stream = try await NativeProgressiveMedia.shared.preparePlayback(source: source, episodeID: episodeID, fresh: fresh)
             return PlaybackSource(url: stream.assetURL, nativeStream: stream)
         }
     }

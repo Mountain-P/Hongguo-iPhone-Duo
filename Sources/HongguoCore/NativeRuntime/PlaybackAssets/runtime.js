@@ -135,7 +135,8 @@
         global.require('app-source').fetchAppPlayUrl(episodeID, { contentType, quality: 'auto', playbackQuality: preference, offlineDirect, signal: controller.signal }).then(source => {
             global._nativeComplete(JSON.stringify({ url: source.url, contentKey: source.contentKey, userAgent: source.userAgent,
                 codec: source.codec, quality: source.quality, preference, qualityFallback: source.qualityFallback === true,
-                width: source.width, height: source.height }));
+                width: source.width, height: source.height,
+                alternateURLs: !offlineDirect && Array.isArray(source.alternateURLs) ? source.alternateURLs.slice(0, 2) : undefined }));
         }, error => {
             const status = Number(error.status);
             const registrationFailure = error.registrationFailure;

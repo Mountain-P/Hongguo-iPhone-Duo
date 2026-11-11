@@ -153,6 +153,14 @@ enum NativeMediaPolicy {
     enum Stage: String { case source, rangeRedirect, rangeResponse }
 
     private static let domains = ["qznovelvod.com", "fqnovelvod.com", "douyinvod.com"]
+    private static let scheduledPlaybackOrigins: Set<String> = [
+        "v5-reading-video-a.qznovelvod.com", "v5-reading-video-b.qznovelvod.com",
+        "v5-ex-reading-video-a.qznovelvod.com"
+    ]
+    private enum ScheduledCDN: String, CaseIterable {
+        case vegslb = ".vegslb.com"
+        case bdcgslb = ".bdcgslb.com"
+    }
     private static let logger = Logger(subsystem: "tw.mountainp.hongguo", category: "media-policy")
 
     static func allows(_ url: URL) -> Bool {
@@ -175,6 +183,31 @@ enum NativeMediaPolicy {
     static func redirectRejection(of url: URL?, hops: Int) -> Rejection? {
         guard hops <= 3 else { return .redirectLimit }
         return rejection(of: url)
+    }
+
+    static func isScheduledPlaybackOrigin(_ url: URL) -> Bool {
+        guard allows(url), let host = url.host(percentEncoded: true) else { return false }
+        return scheduledPlaybackOrigins.contains(host.lowercased())
+    }
+
+    static func allowsScheduledCDNRedirect(from origin: URL, to target: URL?) -> Bool {
+        isScheduledPlaybackOrigin(origin) && scheduledCDN(for: target) != nil
+    }
+
+    static func allowsScheduledCDNRelay(from approvedURL: URL?, to target: URL?) -> Bool {
+        scheduledCDN(for: approvedURL) == .vegslb && scheduledCDN(for: target) == .bdcgslb
+    }
+
+    private static func scheduledCDN(for target: URL?) -> ScheduledCDN? {
+        guard rejection(of: target) == .host,
+              let host = target?.host(percentEncoded: true),
+              let family = ScheduledCDN.allCases.first(where: { host.hasSuffix($0.rawValue) }) else { return nil }
+        let label = host.dropLast(family.rawValue.count).utf8
+        let hyphen = UInt8(ascii: "-")
+        guard (1...63).contains(label.count), label.first != hyphen, label.last != hyphen else { return nil }
+        let lowercase = UInt8(ascii: "a")...UInt8(ascii: "z")
+        let digits = UInt8(ascii: "0")...UInt8(ascii: "9")
+        return label.allSatisfy { lowercase.contains($0) || digits.contains($0) || $0 == hyphen } ? family : nil
     }
 
     static func sourceRejection(_ source: NativeMediaSource) -> Rejection? {

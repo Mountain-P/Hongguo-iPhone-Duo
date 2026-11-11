@@ -625,6 +625,7 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     let incompleteEncryptionMetadata = false;
     const variants = [];
     const seen = new Set();
+    let primaryRowVariantCount = 0;
     // Auto means "best available". Keep every compatible encoding at the same
     // resolution tier, but never silently fall through to a lower rendition.
     const bestPixels = rows[0].pixels;
@@ -666,8 +667,13 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
                 } catch (error) { lastError = error; }
             }
         } catch (error) { lastError = error; }
+        if (primaryRowVariantCount === 0) primaryRowVariantCount = variants.length;
     }
-    if (variants.length) return { ...variants[0], variants };
+    if (variants.length) {
+        // Only URLs from the selected row can reuse its rendition metadata.
+        const alternateURLs = variants.slice(1, Math.min(primaryRowVariantCount, 3)).map(variant => variant.url);
+        return { ...variants[0], variants, ...(offlineDirect ? {} : { alternateURLs }) };
+    }
     throw lastError?.code === 'SECURITY_BLOCKED' ? lastError
         : Object.assign(new Error('本集片源地址或密钥无法解析'), {
             code: 'INVALID_RESPONSE',

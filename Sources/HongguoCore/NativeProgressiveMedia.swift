@@ -6,6 +6,10 @@ public actor NativeProgressiveMedia {
     public static let reusableTimeToLive: TimeInterval = 30
     public static let maximumReusableEntries = 2
     public static let maximumReusablePreparationBytes = 2 * 1024 * 1024
+    private static let directPlaybackHosts: Set<String> = [
+        "v11-reading-videocdn302.qznovelvod.com",
+        "v26-reading-videocdn302.qznovelvod.com"
+    ]
     private struct Key: Hashable {
         let episodeID: String
         let url: URL
@@ -20,8 +24,36 @@ public actor NativeProgressiveMedia {
         let expires: Date
         var access: UInt64
     }
+    private struct PlaybackRoute: Hashable {
+        let episodeID: String
+        let preference: NativePlaybackQuality
+    }
+    private final class FailedPlaybackRoutes: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [PlaybackRoute: (host: String, expires: Date)] = [:]
+
+        func host(for route: PlaybackRoute, now: Date) -> String? {
+            lock.withLock {
+                entries = entries.filter { $0.value.expires > now }
+                return entries[route]?.host
+            }
+        }
+
+        func record(_ host: String, for route: PlaybackRoute, now: Date) {
+            lock.withLock {
+                entries = entries.filter { $0.value.expires > now }
+                entries[route] = (host, now.addingTimeInterval(60))
+                if entries.count > 16, let oldest = entries.min(by: { $0.value.expires < $1.value.expires }) {
+                    entries.removeValue(forKey: oldest.key)
+                }
+            }
+        }
+
+        func clear() { lock.withLock { entries.removeAll() } }
+    }
     private var reusable: [Key: Cached] = [:]
     private var requests: [Key: UUID] = [:]
+    private let failedRoutes = FailedPlaybackRoutes()
     private var access: UInt64 = 0
     private let now: @Sendable () -> Date
     private let makeFetcher: @Sendable (NativeMediaSource) throws -> any NativeRangeFetching
@@ -37,9 +69,49 @@ public actor NativeProgressiveMedia {
     }
 
     public func prepare(source: NativeMediaSource, episodeID: String, fresh: Bool = false) async throws -> NativeMediaStream {
+        try await prepare(source: source, episodeID: episodeID, fresh: fresh, deadline: .now + .seconds(30))
+    }
+
+    func preparePlayback(source: NativeMediaSource, episodeID: String, fresh: Bool) async throws -> NativeMediaStream {
+        var candidates = [source] + source.alternateSources.prefix(2)
+        // These direct mirrors served the same rendition with shorter range waits
+        // when paired with origins that schedule a redirect on each request.
+        if NativeMediaPolicy.isScheduledPlaybackOrigin(source.url),
+           let preferred = candidates.dropFirst().firstIndex(where: { Self.directPlaybackHosts.contains($0.url.host?.lowercased() ?? "") }) {
+            let direct = candidates.remove(at: preferred)
+            candidates.insert(direct, at: 0)
+        }
+        let deadline = ContinuousClock.now + .seconds(30)
+        if NativePrefetchContext.maximumBytes != nil {
+            return try await prepare(source: candidates[0], episodeID: episodeID, fresh: fresh, deadline: deadline)
+        }
+        let route = PlaybackRoute(episodeID: episodeID, preference: source.preference)
+        if fresh, let failedHost = failedRoutes.host(for: route, now: now()),
+           candidates[0].url.host?.lowercased() == failedHost,
+           let alternate = candidates.dropFirst().firstIndex(where: {
+               NativeMediaPolicy.allows($0.url) && $0.url.host?.lowercased() != failedHost
+           }) {
+            let preferred = candidates.remove(at: alternate)
+            let failed = candidates.removeFirst()
+            candidates.insert(preferred, at: 0)
+            candidates.append(failed)
+        }
+        for candidate in candidates.dropLast() {
+            do { return try await prepare(source: candidate, episodeID: episodeID, fresh: fresh, deadline: deadline) }
+            catch {
+                try Task.checkCancellation()
+                guard ContinuousClock.now < deadline, PlaybackRecovery.shouldRetryAssetRead(error) else { throw error }
+            }
+        }
+        return try await prepare(source: candidates[candidates.count - 1], episodeID: episodeID, fresh: fresh, deadline: deadline)
+    }
+
+    private func prepare(source: NativeMediaSource, episodeID: String, fresh: Bool,
+                         deadline: ContinuousClock.Instant) async throws -> NativeMediaStream {
         try validateID(episodeID)
         try NativeMediaPolicy.validate(source)
         try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else { throw NativeSourceError(code: "ETIMEDOUT") }
         let key = Key(episodeID: episodeID, url: source.url, key: source.contentKey,
                       codec: source.codec, userAgent: source.userAgent, quality: source.quality, preference: source.preference)
         reusable = reusable.filter { $0.value.expires > now() }
@@ -50,14 +122,20 @@ public actor NativeProgressiveMedia {
             return cached.stream
         }
         reusable.removeValue(forKey: key)
-        let request = UUID(); requests[key] = request
         let fetcher = try makeFetcher(source)
+        let request = UUID(); requests[key] = request
         let byteLimit = NativePrefetchContext.maximumBytes
+        let route = PlaybackRoute(episodeID: episodeID, preference: source.preference)
+        let host = source.url.host?.lowercased(), routes = failedRoutes, now = now
         do {
             let stream = try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
-                group.addTask { try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit, diskCache: .shared) }
                 group.addTask {
-                    try await Task.sleep(for: .seconds(30))
+                    try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit, diskCache: .shared) {
+                        if let host { routes.record(host, for: route, now: now()) }
+                    }
+                }
+                group.addTask {
+                    try await Task.sleep(until: deadline, clock: .continuous)
                     throw NativeSourceError(code: "ETIMEDOUT")
                 }
                 defer { group.cancelAll() }
@@ -89,6 +167,7 @@ public actor NativeProgressiveMedia {
         let streams = reusable.values.map(\.stream)
         reusable.removeAll()
         requests.removeAll()
+        failedRoutes.clear()
         for stream in streams { await stream.trimCachedChunks() }
     }
 
@@ -99,7 +178,7 @@ public actor NativeProgressiveMedia {
 
     // Injectable byte source allows deterministic header, aux, LRU and cancellation tests.
     func prepare(source: NativeMediaSource, fetcher: any NativeRangeFetching, byteLimit: Int? = nil,
-                 diskCache: NativeChunkDiskCache? = nil) async throws -> NativeMediaStream {
+                 diskCache: NativeChunkDiskCache? = nil, onRouteFailure: (@Sendable () -> Void)? = nil) async throws -> NativeMediaStream {
         let reader = PreparationReader(fetcher: fetcher, byteLimit: byteLimit)
         let first = try await reader.fetch(range: 0..<(256 * 1024))
         try Self.validate(first, requested: 0..<(256 * 1024), total: nil, validators: nil)
@@ -122,7 +201,7 @@ public actor NativeProgressiveMedia {
                 let clearPrefix = try plan.decrypt(data: prefix, offset: 0)
                 return NativeMediaStream(totalLength: first.totalLength, fetcher: fetcher, plan: plan,
                     validators: first.validators, prefix: clearPrefix, preparationByteCount: clearPrefix.count + auxiliaryBytes,
-                    variant: NativeMediaVariant(source: source), diskCache: diskCache)
+                    variant: NativeMediaVariant(source: source), diskCache: diskCache, onRouteFailure: onRouteFailure)
             } catch let requirements as NativeMP4StreamRequirements {
                 guard round < 3, !requirements.ranges.isEmpty, requirements.ranges.count <= 512 else { throw NativeProgressiveError.auxiliaryLimit }
                 for range in requirements.ranges {
@@ -188,6 +267,7 @@ public actor NativeMediaStream: Hashable {
     private let plan: NativeMP4StreamPlan
     private let prefix: Data
     private let diskCache: NativeChunkDiskCache?
+    private let onRouteFailure: (@Sendable () -> Void)?
     private var validators: NativeRangeValidators
     private struct Chunk { let data: Data; var access: UInt64 }
     private var cache: [Int: Chunk] = [:]
@@ -226,11 +306,12 @@ public actor NativeMediaStream: Hashable {
     private let cacheLimit = 8 * 1024 * 1024
 
     init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil,
-         variant: NativeMediaVariant, diskCache: NativeChunkDiskCache? = nil) {
+         variant: NativeMediaVariant, diskCache: NativeChunkDiskCache? = nil, onRouteFailure: (@Sendable () -> Void)? = nil) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
         self.preparationByteCount = preparationByteCount ?? prefix.count
         self.variant = variant
         self.diskCache = diskCache
+        self.onRouteFailure = onRouteFailure
     }
 
     deinit {
@@ -445,6 +526,9 @@ public actor NativeMediaStream: Hashable {
         } catch {
             guard flights[index]?.id == id else { return }
             if Self.terminal(error) {
+                if (error as? NativeProgressiveError) == .changedSource || (error as? NativeMediaError) == .unsafeURL {
+                    onRouteFailure?()
+                }
                 permanentFailure = error; trimCachedChunks()
                 committedDiskIndices = []; recentDiskIndices = []
                 let abandoned = flights.values; flights.removeAll()

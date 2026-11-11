@@ -128,6 +128,47 @@ struct NativePlaybackQualityTests {
         #expect(calls == [["policy": "automatic", "quality": "auto"], ["policy": "dataSaver", "quality": "auto"]])
     }
 
+    @Test func bundledResolveKeepsOnlyTwoValidatedMirrorsFromTheSelectedRow() async throws {
+        let raw = try await NativeJSRuntime().evaluateForTesting(#"""
+        (() => {
+          const app = require('app-source');
+          const main = 'https://primary.fqnovelvod.com/video.mp4';
+          const first = 'https://mirror.qznovelvod.com/video.mp4';
+          const row = { main_url:main, backup_url:first, codec_type:'h264',
+            vwidth:1080, vheight:1920, quality_desc:'1080p', encrypt:false,
+            backup_url_list:[main,first,'https://blocked.invalid/video.mp4',
+              'https://mirror.douyinvod.com/video.mp4','https://extra.fqnovelvod.com/video.mp4'] };
+          const other = { ...row, main_url:'https://other.fqnovelvod.com/video.mp4',
+            backup_url_list:[], backup_url:undefined, codec_type:'hevc' };
+          app.fetchAppPlayUrl = async (id, options) => {
+            const oneMirror = { ...row, backup_url_list:[] };
+            const sparse = app.audit.parseAppPlayModel({video_list:{oneMirror,other}}, id, options, true);
+            if (sparse.alternateURLs.length !== 1 || sparse.alternateURLs[0] !== first || sparse.variants.length !== 3) {
+              throw Object.assign(new Error('fixture'), {code:'WRONG_RENDITION'});
+            }
+            return app.audit.parseAppPlayModel({video_list:{row,other}}, id, options, true);
+          };
+          __startResolve('100', '1004');
+          return new Promise(() => {});
+        })()
+        """#)
+        let source = try NativeJSRuntime.parseSource(raw, preference: .automatic, offlineDirect: false)
+        #expect(source.url.host == "primary.fqnovelvod.com")
+        #expect(source.alternateSources.compactMap { $0.url.host } == ["mirror.qznovelvod.com", "mirror.douyinvod.com"])
+        for alternate in source.alternateSources {
+            #expect(alternate.codec == source.codec)
+            #expect(alternate.width == source.width)
+            #expect(alternate.height == source.height)
+            #expect(alternate.alternateSources.isEmpty)
+        }
+        #expect(try NativeJSRuntime.parseSource(raw, preference: .automatic, offlineDirect: true).alternateSources.isEmpty)
+
+        var invalid = try qualityDictionary(raw)
+        invalid["alternateURLs"] = [source.url.absoluteString, "https://unknown.invalid/video.mp4"]
+        let invalidRaw = String(decoding: try JSONSerialization.data(withJSONObject: invalid), as: UTF8.self)
+        #expect(try NativeJSRuntime.parseSource(invalidRaw, preference: .automatic, offlineDirect: false).alternateSources.isEmpty)
+    }
+
     @Test func singleTierUnknownSizeAndInvalidLowerSourceFallBackWithoutInventingResolution() async throws {
         let result = try await NativeJSRuntime().evaluateForTesting(#"""
         (() => {

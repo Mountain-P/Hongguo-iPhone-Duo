@@ -40,11 +40,13 @@ enum NativeRangeHeaders {
         let totalLength: Int
         let validators: NativeRangeValidators
     }
-    static func parse(_ response: HTTPURLResponse, requested: Range<Int>, knownTotal: Int?, validators: NativeRangeValidators?) throws -> Parsed {
+    static func parse(_ response: HTTPURLResponse, requested: Range<Int>, knownTotal: Int?, validators: NativeRangeValidators?,
+                      approvedRedirectURL: URL? = nil) throws -> Parsed {
         guard requested.lowerBound >= 0, requested.upperBound > requested.lowerBound else { throw NativeProgressiveError.invalidRange }
         if response.statusCode == 401 { throw CatalogError.unauthorized }
         if response.statusCode == 403 { throw CatalogError.httpStatus(403) }
-        if let reason = NativeMediaPolicy.rejection(of: response.url) {
+        if let reason = NativeMediaPolicy.rejection(of: response.url),
+           reason != .host || response.url != approvedRedirectURL {
             NativeMediaPolicy.report(reason, stage: .rangeResponse, status: response.statusCode)
             throw NativeMediaError.unsafeURL
         }
@@ -85,6 +87,7 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
         var cancelled = false
         var finished = false
         var redirects = 0
+        var approvedRedirectURL: URL?
         init(range: Range<Int>) { self.range = range }
     }
     private let source: NativeMediaSource
@@ -169,7 +172,8 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
                     completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void) {
         guard let transfer = transfer(dataTask), !transfer.finished, let http = response as? HTTPURLResponse else { completionHandler(.cancel); return }
         do {
-            let metadata = try NativeRangeHeaders.parse(http, requested: transfer.range, knownTotal: knownTotal, validators: validators)
+            let metadata = try NativeRangeHeaders.parse(http, requested: transfer.range, knownTotal: knownTotal,
+                                                        validators: validators, approvedRedirectURL: transfer.approvedRedirectURL)
             knownTotal = metadata.totalLength
             if validators == nil { validators = metadata.validators }
             else {
@@ -205,11 +209,21 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         guard let transfer = transfer(task), !transfer.finished else { completionHandler(nil); return }
         transfer.redirects += 1
+        let priorApprovedURL = transfer.approvedRedirectURL
+        transfer.approvedRedirectURL = nil
         if let reason = NativeMediaPolicy.redirectRejection(of: request.url, hops: transfer.redirects) {
-            completionHandler(nil)
-            NativeMediaPolicy.report(reason, stage: .rangeRedirect, status: response.statusCode, hops: transfer.redirects)
-            retire(session, with: NativeMediaError.unsafeURL)
-            return
+            let fromSource = transfer.redirects == 1 && response.url == source.url
+                && NativeMediaPolicy.allowsScheduledCDNRedirect(from: source.url, to: request.url)
+            let fromRelay = transfer.redirects == 2 && response.url == priorApprovedURL
+                && NativeMediaPolicy.allowsScheduledCDNRelay(from: priorApprovedURL, to: request.url)
+            guard reason == .host, response.statusCode == 302, fromSource || fromRelay else {
+                completionHandler(nil)
+                NativeMediaPolicy.report(reason, stage: .rangeRedirect, status: response.statusCode, hops: transfer.redirects)
+                retire(session, with: NativeMediaError.unsafeURL)
+                return
+            }
+            // The extra destination is valid only for this individual Range request.
+            transfer.approvedRedirectURL = request.url
         }
         var safe = request
         safe.httpMethod = "GET"; safe.httpBody = nil

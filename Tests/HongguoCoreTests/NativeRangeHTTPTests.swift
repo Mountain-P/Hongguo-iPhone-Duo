@@ -8,7 +8,13 @@ private struct RangeScenario: Sendable {
     var excess = false
     var delay: Double = 0.03
     var responseOutsidePolicy = false
-    var redirectOutsidePolicy = false
+    var redirectHosts: [String] = []
+    var redirectedResponseHost: String?
+
+    func nextRedirectHost(after host: String?) -> String? {
+        guard let index = redirectHosts.firstIndex(where: { $0 == host }) else { return redirectHosts.first }
+        return redirectHosts.dropFirst(index + 1).first
+    }
 }
 private final class RangeScenarios: @unchecked Sendable {
     static let shared = RangeScenarios()
@@ -17,10 +23,10 @@ private final class RangeScenarios: @unchecked Sendable {
     private var active: [String: Int] = [:]
     private var peak: [String: Int] = [:]
     private var requests: [String: Int] = [:]
-    func register(_ scenario: RangeScenario) -> URL {
+    func register(_ scenario: RangeScenario, host: String) -> URL {
         lock.withLock {
             let key = UUID().uuidString; values["/" + key] = scenario
-            return URL(string: "https://unit.fqnovelvod.com/" + key)!
+            return URL(string: "https://\(host)/" + key)!
         }
     }
     func begin(_ path: String) -> RangeScenario? {
@@ -48,16 +54,19 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
         let range = (request.value(forHTTPHeaderField: "Range") ?? "bytes=0-15").dropFirst(6).split(separator: "-")
         let first = Int(range[0])!, last = Int(range[1])!
         var headers = ["Content-Type": "video/mp4", "Content-Range": "bytes \(first)-\(last)/1000", "Content-Length": String(last - first + 1), "ETag": "fixture"]
-        if scenario.status == 403 { headers["Content-Type"] = "application/json"; headers["Content-Length"] = "999999999" }
+        let redirectURL = scenario.nextRedirectHost(after: url.host).map { URL(string: "https://" + $0 + url.path)! }
+        let status = redirectURL == nil && !scenario.redirectHosts.isEmpty ? 206 : scenario.status
+        if status == 403 { headers["Content-Type"] = "application/json"; headers["Content-Length"] = "999999999" }
         let blockedURL = URL(string: "https://blocked.invalid" + url.path)!
-        if scenario.redirectOutsidePolicy { headers["Location"] = blockedURL.absoluteString }
-        let responseURL = scenario.responseOutsidePolicy ? blockedURL : url
-        let response = HTTPURLResponse(url: responseURL, statusCode: scenario.status, httpVersion: "HTTP/1.1", headerFields: headers)!
+        if let redirectURL { headers["Location"] = redirectURL.absoluteString }
+        var responseURL = scenario.responseOutsidePolicy ? blockedURL : url
+        if redirectURL == nil, let host = scenario.redirectedResponseHost { responseURL = URL(string: "https://" + host + url.path)! }
+        let response = HTTPURLResponse(url: responseURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         DispatchQueue.global().asyncAfter(deadline: .now() + scenario.delay) { [self] in
             guard !lock.withLock({ stopped }) else { return }
-            if scenario.redirectOutsidePolicy {
+            if let redirectURL {
                 var redirected = request
-                redirected.url = blockedURL
+                redirected.url = redirectURL
                 client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
                 return
             }
@@ -79,8 +88,10 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
 }
 
 struct NativeRangeHTTPTests {
-    private func client(_ scenario: RangeScenario) throws -> (NativeRangeHTTP, URL) {
-        let url = RangeScenarios.shared.register(scenario)
+    private let scheduledOrigin = "v5-reading-video-a.qznovelvod.com"
+
+    private func client(_ scenario: RangeScenario, host: String = "unit.fqnovelvod.com") throws -> (NativeRangeHTTP, URL) {
+        let url = RangeScenarios.shared.register(scenario, host: host)
         let source = NativeMediaSource(url: url, contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [RangeURLProtocol.self]
@@ -141,10 +152,65 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func rejectedRedirectDoesNotFollowTargetOrStartMoreReads() async throws {
-        let (client, url) = try client(.init(status: 302, redirectOutsidePolicy: true)); defer { client.close() }
+        let (client, url) = try client(.init(status: 302, redirectHosts: ["blocked.invalid"])); defer { client.close() }
         await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
         await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 32..<48) }
         #expect(RangeScenarios.shared.counts(url.path).requests == 1)
+    }
+
+    @Test func approvedSchedulerRedirectFollowsForEachRange() async throws {
+        for (origin, targets) in [(scheduledOrigin, ["relay-a9.vegslb.com"]),
+                                  ("v5-reading-video-b.qznovelvod.com", ["relay-b7.bdcgslb.com"]),
+                                  ("v5-ex-reading-video-a.qznovelvod.com", ["relay-b7.bdcgslb.com"]),
+                                  (scheduledOrigin, ["relay-a9.vegslb.com", "relay-b7.bdcgslb.com"])] {
+            let (client, url) = try client(.init(status: 302, redirectHosts: targets), host: origin)
+            defer { client.close() }
+            for range in [0..<16, 32..<48] {
+                #expect(try await client.fetch(range: range).range == range)
+            }
+            #expect(RangeScenarios.shared.counts(url.path).requests == 2 * (targets.count + 1))
+        }
+    }
+
+    @Test func schedulerExceptionRejectsOtherOriginsRedirectCodesAndDestinations() async throws {
+        for (origin, status, targets, requests) in [
+            ("unit.qznovelvod.com", 302, ["relay-a.vegslb.com"], 1),
+            (scheduledOrigin, 307, ["relay-a.vegslb.com"], 1),
+            (scheduledOrigin, 302, ["relay-a.vegslb.com.blocked.invalid"], 1),
+            (scheduledOrigin, 302, ["one.two.vegslb.com"], 1),
+            (scheduledOrigin, 302, ["another.fqnovelvod.com", "relay-a.vegslb.com"], 2),
+            (scheduledOrigin, 302, ["relay-a.vegslb.com", "relay-b.vegslb.com"], 2),
+            (scheduledOrigin, 302, ["relay-a.bdcgslb.com", "relay-b.vegslb.com"], 2),
+            (scheduledOrigin, 302, ["relay-a.vegslb.com", "relay-b.bdcgslb.com", "relay-c.bdcgslb.com"], 3),
+        ] {
+            let (client, url) = try client(.init(status: status, redirectHosts: targets), host: origin)
+            defer { client.close() }
+            await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
+            #expect(RangeScenarios.shared.counts(url.path).requests == requests)
+        }
+    }
+
+    @Test func schedulerDestinationCannotBeUsedAsADirectSourceOrSubstituteResponse() async throws {
+        #expect(throws: NativeMediaError.unsafeURL) { try client(.init(), host: "relay-a.vegslb.com") }
+        let scenario = RangeScenario(status: 302, redirectHosts: ["relay-a.vegslb.com"], redirectedResponseHost: "relay-b.vegslb.com")
+        let (client, url) = try client(scenario, host: scheduledOrigin)
+        defer { client.close() }
+        await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
+        #expect(RangeScenarios.shared.counts(url.path).requests == 2)
+    }
+
+    @Test func scheduledDestinationRequiresOneLowercaseASCIIDNSLabelAndAnOrdinaryHTTPSURL() {
+        let origin = URL(string: "https://\(scheduledOrigin)/v")!
+        #expect(NativeMediaPolicy.allowsScheduledCDNRedirect(from: origin, to: URL(string: "https://a-9.vegslb.com:443/v")))
+        for address in [
+            "https://vegslb.com/v", "https://a.b.vegslb.com/v", "https://a.vegslb.com.invalid/v",
+            "https://A.vegslb.com/v", "https://%61.vegslb.com/v", "https://-a.vegslb.com/v",
+            "https://a-.vegslb.com/v", "https://a_.vegslb.com/v", "https://127.0.0.1/v",
+            "https://a.vegslb.com:444/v", "https://user@a.vegslb.com/v", "https://a.vegslb.com/v#section",
+            "http://a.vegslb.com/v", "https://" + String(repeating: "a", count: 64) + ".vegslb.com/v",
+        ] {
+            #expect(!NativeMediaPolicy.allowsScheduledCDNRedirect(from: origin, to: URL(string: address)))
+        }
     }
 
     @Test func rejectionReasonsPreserveTheExistingURLAndRedirectLimits() {

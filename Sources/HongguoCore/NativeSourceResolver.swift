@@ -11,14 +11,16 @@ public struct NativeMediaSource: Sendable {
     public let qualityFallback: Bool
     public let width: Int?
     public let height: Int?
+    public let alternateSources: [NativeMediaSource]
 
     public init(url: URL, contentKey: Data?, userAgent: String, codec: String, quality: String,
                 preference: NativePlaybackQuality = .automatic, qualityFallback: Bool = false,
-                width: Int? = nil, height: Int? = nil) {
+                width: Int? = nil, height: Int? = nil, alternateSources: [NativeMediaSource] = []) {
         self.url = url; self.contentKey = contentKey; self.userAgent = userAgent
         self.codec = codec; self.quality = quality
         self.preference = preference; self.qualityFallback = qualityFallback
         self.width = width; self.height = height
+        self.alternateSources = alternateSources
     }
 }
 

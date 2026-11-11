@@ -13,7 +13,7 @@ private actor ProgressiveBytes: NativeRangeFetching {
     init(_ bytes: Data) { self.bytes = bytes }
     func setChanged() { changeAfter = ranges.count }
     func setDelay() { delay = true }
-    func setFailure(_ error: any Error) { failure = error }
+    func setFailure(_ error: (any Error)?) { failure = error }
     func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
         ranges.append(range)
         if delay {
@@ -31,6 +31,81 @@ private actor ProgressiveBytes: NativeRangeFetching {
 struct NativeProgressiveTests {
     private func source(key: Data? = nil) -> NativeMediaSource {
         .init(url: URL(string: "https://unit.fqnovelvod.com/video.mp4")!, contentKey: key, userAgent: "Fixture", codec: "h264", quality: "1080p")
+    }
+
+    @Test(arguments: [false, true])
+    func testedDirectMirrorIsTriedFirstAndCanFailBack(_ directFails: Bool) async throws {
+        let fixture = streamFixture(payload: Data([1, 2, 3]), samples: 1)
+        let directBytes = ProgressiveBytes(fixture.data), routedBytes = ProgressiveBytes(fixture.data)
+        let direct = NativeMediaSource(url: URL(string: "https://v11-reading-videocdn302.qznovelvod.com/file.mp4")!,
+                                       contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
+        let routed = NativeMediaSource(url: URL(string: "https://v5-reading-video-b.qznovelvod.com/file.mp4")!,
+                                       contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [direct])
+        if directFails { await directBytes.setFailure(NativeProgressiveError.changedSource) }
+        let media = NativeProgressiveMedia(makeFetcher: { $0.url == direct.url ? directBytes : routedBytes })
+        let stream = try await media.preparePlayback(source: routed, episodeID: "123", fresh: false)
+        #expect(try await stream.read(range: 0..<fixture.data.count) == fixture.data)
+        #expect(await directBytes.ranges.count == 1)
+        #expect(await routedBytes.ranges.count == (directFails ? 1 : 0))
+    }
+
+    @Test func aRejectedRouteCanUseItsMirrorButDenialAndPrefetchStop() async throws {
+        let fixture = streamFixture(payload: Data([1, 2, 3]), samples: 1)
+        let primaryBytes = ProgressiveBytes(fixture.data), backupBytes = ProgressiveBytes(fixture.data)
+        let backup = source()
+        let primary = NativeMediaSource(url: URL(string: "https://primary.qznovelvod.com/file.mp4")!,
+                                        contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
+        let media = NativeProgressiveMedia(makeFetcher: { $0.url == primary.url ? primaryBytes : backupBytes })
+        await primaryBytes.setFailure(CatalogError.httpStatus(403))
+        await #expect(throws: CatalogError.httpStatus(403)) {
+            try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+        }
+        await primaryBytes.setFailure(NativeMediaError.unsafeURL)
+        await #expect(throws: NativeMediaError.unsafeURL) {
+            try await NativePrefetchContext.$maximumBytes.withValue(1_048_576) {
+                try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+            }
+        }
+        #expect(await backupBytes.ranges.isEmpty)
+        let stream = try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+        #expect(try await stream.read(range: 0..<fixture.data.count) == fixture.data)
+        #expect(await backupBytes.ranges.count == 1)
+    }
+
+    @Test(arguments: [true, false])
+    func freshPreparationAvoidsTheHostThatFailedMidstream(_ validatorChanged: Bool) async throws {
+        let primaryFixture = streamFixture(payload: Data(repeating: 0x11, count: 900_000), samples: 1)
+        let backupFixture = streamFixture(payload: Data(repeating: 0x22, count: 900_000), samples: 1)
+        let primaryBytes = ProgressiveBytes(primaryFixture.data), backupBytes = ProgressiveBytes(backupFixture.data)
+        let backup = source()
+        let primary = NativeMediaSource(url: URL(string: "https://primary.qznovelvod.com/file.mp4")!,
+                                        contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
+        let clock = ProgressiveClock()
+        let media = NativeProgressiveMedia(now: { clock.now }, makeFetcher: { $0.url == primary.url ? primaryBytes : backupBytes })
+        let original = try await media.preparePlayback(source: primary, episodeID: "123", fresh: false)
+        let range = 600_000..<600_020
+        if validatorChanged {
+            await primaryBytes.setChanged()
+            await #expect(throws: NativeProgressiveError.changedSource) { try await original.read(range: range) }
+        } else {
+            await primaryBytes.setFailure(NativeMediaError.unsafeURL)
+            await #expect(throws: NativeMediaError.unsafeURL) { try await original.read(range: range) }
+            await primaryBytes.setFailure(nil)
+        }
+        #expect(await primaryBytes.ranges.count == 2)
+        #expect(await backupBytes.ranges.isEmpty)
+
+        let recovered = try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+        #expect(recovered != original)
+        #expect(try await recovered.read(range: range) == backupFixture.data.subdata(in: range))
+        #expect(await primaryBytes.ranges.count == 2)
+        #expect(await backupBytes.ranges.count == 2)
+
+        _ = try await media.preparePlayback(source: primary, episodeID: "124", fresh: true)
+        #expect(await primaryBytes.ranges.count == 3)
+        clock.advance(61)
+        _ = try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+        #expect(await primaryBytes.ranges.count == 4)
     }
 
     @Test func preparationFetchesOnlyPrefixAndFirstReadsUseThatPrefix() async throws {

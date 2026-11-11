@@ -49,6 +49,10 @@ final class NativeJSRuntime: @unchecked Sendable {
         let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.rawValue, offlineDirect])
         let raw = try await run(script: "__startResolve(..." + String(decoding: arguments, as: UTF8.self) + ")")
         try Task.checkCancellation()
+        return try Self.parseSource(raw, preference: preference, offlineDirect: offlineDirect)
+    }
+
+    static func parseSource(_ raw: String, preference: NativePlaybackQuality, offlineDirect: Bool) throws -> NativeMediaSource {
         guard let data = raw.data(using: .utf8), let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NativeSourceError(code: "INVALID_RESPONSE") }
         if let code = object["error"] as? String { throw NativeSourceError(code: code) }
         guard let address = object["url"] as? String, let url = URL(string: address), Self.allowedMediaURL(url),
@@ -69,9 +73,21 @@ final class NativeJSRuntime: @unchecked Sendable {
             guard let number = object[key] as? NSNumber, (1...16_384).contains(number.intValue) else { return nil }
             return number.intValue
         }
-        return NativeMediaSource(url: url, contentKey: key, userAgent: userAgent, codec: codec, quality: quality,
-            preference: preference, qualityFallback: object["qualityFallback"] as? Bool ?? false,
-            width: dimension("width"), height: dimension("height"))
+        let qualityFallback = object["qualityFallback"] as? Bool ?? false
+        let width = dimension("width"), height = dimension("height")
+        func source(at address: URL, alternates: [NativeMediaSource] = []) -> NativeMediaSource {
+            NativeMediaSource(url: address, contentKey: key, userAgent: userAgent, codec: codec, quality: quality,
+                              preference: preference, qualityFallback: qualityFallback,
+                              width: width, height: height, alternateSources: alternates)
+        }
+        guard !offlineDirect, let alternateURLs = object["alternateURLs"] as? [String] else { return source(at: url) }
+        var seen = Set([url])
+        let alternates = alternateURLs.prefix(2).compactMap { address -> NativeMediaSource? in
+            guard let alternate = URL(string: address), NativeMediaPolicy.allows(alternate),
+                  seen.insert(alternate).inserted else { return nil }
+            return source(at: alternate)
+        }
+        return source(at: url, alternates: alternates)
     }
 
     static func allowedMediaURL(_ url: URL) -> Bool {
