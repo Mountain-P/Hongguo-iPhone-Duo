@@ -263,7 +263,7 @@ struct OfflineEpisodeSelectionView: View {
                         .accessibilityIdentifier("offline.selectAll")
                     }
                 } footer: {
-                    Text("部分分集只提供線上播放。下載結果會顯示在「我的 → 離線下載」。")
+                    Text("下載完成後可到「我的 → 離線下載」斷網觀看。")
                 }
             }
             .onChange(of: selectableIDs) { _, eligibleIDs in selected.formIntersection(eligibleIDs) }
@@ -461,7 +461,7 @@ private struct OfflineDownloadStatus: View {
                 if item.isImportedVideo {
                     Text("匯入的影片無法播放，可重新從「檔案」匯入。")
                 } else if item.isOfflineUnsupported {
-                    Text("來源未提供離線版本，可回劇集詳情線上觀看。")
+                    Text("這個片源目前無法儲存，可回劇集詳情線上觀看。")
                 } else {
                     Text(item.failure ?? "下載失敗")
                 }

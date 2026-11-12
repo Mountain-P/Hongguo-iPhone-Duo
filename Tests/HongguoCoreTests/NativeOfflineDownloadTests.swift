@@ -29,6 +29,7 @@ private final class OfflineHTTPSFixtures: @unchecked Sendable {
         var status = 200
         var headers: [String: String]
         var body: Data
+        var servesRanges = false
     }
     static let shared = OfflineHTTPSFixtures()
     private let lock = NSLock()
@@ -41,7 +42,21 @@ private final class OfflineHTTPSFixtures: @unchecked Sendable {
         return url
     }
     func start(_ request: URLRequest, url: URL) -> Response? {
-        lock.withLock { requests[url, default: []].append(request); return responses[url] }
+        lock.withLock {
+            requests[url, default: []].append(request)
+            guard var response = responses[url] else { return nil }
+            if response.servesRanges {
+                guard let header = request.value(forHTTPHeaderField: "Range"), header.hasPrefix("bytes=") else { return nil }
+                let bounds = header.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2, bounds[0] >= 0, bounds[0] < response.body.count, bounds[1] >= bounds[0] else { return nil }
+                let upper = min(response.body.count - 1, bounds[1])
+                response.status = 206
+                response.headers["Content-Range"] = "bytes \(bounds[0])-\(upper)/\(response.body.count)"
+                response.body = response.body.subdata(in: bounds[0]..<(upper + 1))
+                response.headers["Content-Length"] = String(response.body.count)
+            }
+            return response
+        }
     }
     func requests(to url: URL) -> [URLRequest] { lock.withLock { requests[url] ?? [] } }
     func remove(_ url: URL) {
@@ -80,6 +95,30 @@ private actor OfflineHeldTransfer: NativeOfflineMediaDownloading {
     }
     func waitForPartialFile() async {
         if !started { await withCheckedContinuation { waiters.append($0) } }
+    }
+}
+
+private actor OfflineHeldRange: NativeRangeFetching {
+    let media: Data
+    private var held = false
+
+    init(_ media: Data) { self.media = media }
+
+    func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
+        if range.lowerBound >= 512 * 1024 {
+            held = true
+            try await Task.sleep(for: .seconds(30))
+        }
+        let actual = range.lowerBound..<min(range.upperBound, media.count)
+        return .init(data: media.subdata(in: actual), range: actual, totalLength: media.count, validators: .init())
+    }
+
+    func waitForHeldRange() async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !held {
+            guard ContinuousClock.now < deadline else { throw NativeMediaError.invalidResponse }
+            try await Task.sleep(for: .milliseconds(10))
+        }
     }
 }
 
@@ -178,16 +217,65 @@ struct NativeOfflineDownloadTests {
         #expect(try Data(contentsOf: destination) == existing)
     }
 
-    @Test func protectedSourceFailsBeforeOpeningTheMediaConnection() async throws {
+    @Test func encryptedSourceUsesRangesAndPublishesACompleteClearMP4() async throws {
         let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
-        let url = OfflineHTTPSFixtures.shared.register(.init(headers: [:], body: Data()))
+        let media = encryptedMP4()
+        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media, servesRanges: true))
         defer { OfflineHTTPSFixtures.shared.remove(url) }
-        let file = try NativeOfflineFile(destination: directory.appendingPathComponent("episode.stage"), maximumBytes: 2048)
-        do {
-            try await file.write(source: source(url, key: Data(repeating: 0x11, count: 16)), downloader: httpDownloader(), progress: { _, _ in })
-            Issue.record("A keyed source reached offline staging")
-        } catch let error as NativeSourceError { #expect(error.code == "OFFLINE_CLEAR_UNAVAILABLE") }
-        #expect(OfflineHTTPSFixtures.shared.requests(to: url).isEmpty)
+        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
+        let file = try rangedFile(destination, maximumBytes: Int64(media.count))
+        try await file.write(source: source(url, key: encryptionKey), downloader: httpDownloader()) { await events.advanced($0, $1) }
+        let result = try Data(contentsOf: destination)
+        #expect(result == (try NativeMP4.decrypt(data: media, contentKey: encryptionKey, codec: "h264")))
+        #expect(result != media)
+        try NativeMP4.validateOfflineClear(data: result, codec: "h264")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["episode.stage"])
+        #expect(try (FileManager.default.attributesOfItem(atPath: destination.path)[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let requests = OfflineHTTPSFixtures.shared.requests(to: url)
+        #expect(requests.count >= 3)
+        #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Range") != nil })
+        #expect(requests.allSatisfy { $0.value(forHTTPHeaderField: "Authorization") == nil && $0.value(forHTTPHeaderField: "Cookie") == nil })
+        let progress = await events.progress
+        #expect(progress.first?.0 == 0)
+        #expect(progress.last?.0 == Int64(result.count))
+        #expect(progress.allSatisfy { $0.1 == Int64(result.count) })
+        #expect(progress.map(\.0) == progress.map(\.0).sorted())
+    }
+
+    @Test func encryptedSourceHonorsSizeLimitsAndDenialsBeforePublication() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let media = encryptedMP4()
+        let large = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media, servesRanges: true))
+        let denied = OfflineHTTPSFixtures.shared.register(.init(status: 403, headers: [:], body: Data()))
+        defer { OfflineHTTPSFixtures.shared.remove(large); OfflineHTTPSFixtures.shared.remove(denied) }
+        let file = try rangedFile(directory.appendingPathComponent("episode.stage"), maximumBytes: 2048)
+        await #expect(throws: NativeMediaError.tooLarge) {
+            try await file.write(source: source(large, key: encryptionKey), downloader: httpDownloader(), progress: { _, _ in })
+        }
+        await #expect(throws: CatalogError.httpStatus(403)) {
+            try await file.write(source: source(denied, key: encryptionKey), downloader: httpDownloader(), progress: { _, _ in })
+        }
+        #expect(OfflineHTTPSFixtures.shared.requests(to: large).count == 1)
+        #expect(OfflineHTTPSFixtures.shared.requests(to: denied).count == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test func cancellingAnEncryptedTransferDiscardsAlreadyDecryptedBytes() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let media = encryptedMP4(), held = OfflineHeldRange(media)
+        let url = URL(string: "https://offline-fixture.fqnovelvod.com/cancel-encrypted.mp4")!
+        let destination = directory.appendingPathComponent("episode.stage")
+        let file = try NativeOfflineFile(destination: destination, maximumBytes: Int64(media.count)) { _ in held }
+        let events = OfflineEvents()
+        let task = Task {
+            try await file.write(source: source(url, key: encryptionKey), downloader: httpDownloader()) { await events.advanced($0, $1) }
+        }
+        defer { task.cancel() }
+        try await held.waitForHeldRange()
+        #expect(await events.progress.last?.0 == 512 * 1024)
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
@@ -290,7 +378,25 @@ struct NativeOfflineDownloadTests {
         return NativeMediaHTTPDownload(configuration: configuration)
     }
 
-    private func clearMP4(sampleEntry: String = "avc1", selfContained: Bool = true, truncatedToEOF: Bool = false) -> Data {
+    private func rangedFile(_ destination: URL, maximumBytes: Int64) throws -> NativeOfflineFile {
+        try NativeOfflineFile(destination: destination, maximumBytes: maximumBytes) { source in
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [OfflineHTTPSProtocol.self]
+            return try NativeRangeHTTP(source: source, configuration: configuration)
+        }
+    }
+
+    private var encryptionKey: Data {
+        Data([0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c])
+    }
+
+    private func encryptedMP4() -> Data {
+        let cipher = Data([0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d, 0xb6, 0xce])
+        return clearMP4(sampleEntry: "encv", payload: cipher + Data(repeating: 0x42, count: 512 * 1024), iv: Data(0xf0...0xff))
+    }
+
+    private func clearMP4(sampleEntry: String = "avc1", selfContained: Bool = true, truncatedToEOF: Bool = false,
+                          payload: Data = Data([1, 2, 3, 4]), iv: Data? = nil) -> Data {
         func words(_ values: UInt32...) -> Data {
             var data = Data()
             for value in values { var big = value.bigEndian; withUnsafeBytes(of: &big) { data.append(contentsOf: $0) } }
@@ -299,18 +405,24 @@ struct NativeOfflineDownloadTests {
         func box(_ name: String, _ body: Data) -> Data { words(UInt32(body.count + 8)) + Data(name.utf8) + body }
         let ftyp = box("ftyp", Data("isom".utf8) + words(0))
         var video = Data(repeating: 0, count: 78); video[7] = 1
+        if let iv {
+            let tenc = box("tenc", words(0) + Data([0, 0, 1, UInt8(iv.count)]) + Data(count: 16))
+            video += box("sinf", box("frma", Data("avc1".utf8))
+                + box("schm", words(0) + Data("cenc".utf8) + words(0x10000)) + box("schi", tenc))
+        }
         let descriptions = box("stsd", words(0, 1) + box(sampleEntry, video))
         let references = box("dinf", box("dref", words(0, 1) + box("url ", words(selfContained ? 1 : 0))))
         let timing = box("stts", words(0, 1, 1, 1000))
         let mapping = box("stsc", words(0, 1, 1, 1, 1))
-        let sizes = box("stsz", words(0, 4, 1))
+        let sizes = box("stsz", words(0, UInt32(payload.count), 1))
+        let encryption = iv.map { box("senc", words(0, 1) + $0) } ?? Data()
         func movie(_ offset: UInt32) -> Data {
             let index = box("stco", words(0, 1, offset))
-            let table = box("stbl", descriptions + timing + mapping + sizes + index)
+            let table = box("stbl", descriptions + timing + mapping + sizes + index + encryption)
             return box("moov", box("trak", box("mdia", box("minf", references + table))))
         }
         let mediaStart = UInt32(ftyp.count + movie(0).count + 8)
-        let media = truncatedToEOF ? words(0) + Data("mdat".utf8) + Data([1, 2]) : box("mdat", Data([1, 2, 3, 4]))
+        let media = truncatedToEOF ? words(0) + Data("mdat".utf8) + Data([1, 2]) : box("mdat", payload)
         return ftyp + movie(mediaStart) + media
     }
 }

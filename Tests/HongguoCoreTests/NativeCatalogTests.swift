@@ -74,7 +74,49 @@ private actor CancellingNativePreparation {
     }
 }
 
+private actor OfflineSourceProbe: NativeOfflineMediaDownloading {
+    private(set) var calls: [NativeQualityPreparationRecorder.Call] = []
+    private(set) var transfers = 0
+
+    func resolvePlayable(_ episodeID: String, _ contentType: String, _ quality: NativePlaybackQuality) -> NativeMediaSource {
+        calls.append(.init(episodeID: episodeID, contentType: contentType, fresh: true, quality: quality))
+        return NativeMediaSource(url: URL(string: "https://fixture.qznovelvod.com/episode.mp4")!,
+                                 contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "720p")
+    }
+
+    func downloadOffline(source: NativeMediaSource, destination: URL, maximumBytes: Int64,
+                         progress: @escaping @Sendable (Int64, Int64?) -> Void) async throws {
+        transfers += 1
+        throw NativeMediaError.network
+    }
+}
+
 struct NativeCatalogTests {
+    @Test(arguments: ["OFFLINE_CLEAR_UNAVAILABLE", "HTTP_401", "HTTP_403", "HTTP_429", "BUSINESS_REJECTED", "SECURITY_BLOCKED", "ERR_NETWORK"])
+    func offlineUsesTheExactPlayableEpisodeOnlyWhenNoClearSourceExists(_ code: String) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(episodes: ["200"], accessible: 1))
+        let service = NativeCatalogService(transport: transport, quality: .dataSaver)
+        let probe = OfflineSourceProbe()
+        do {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: directory.appendingPathComponent("episode.mp4"),
+                maximumBytes: 2048, resolve: { _, _, _ in throw NativeSourceError(code: code) },
+                resolvePlayable: { await probe.resolvePlayable($0, $1, $2) }, downloader: probe, progress: { _, _ in })
+            Issue.record("The fixture always stops before publishing")
+        } catch {
+            if code == "OFFLINE_CLEAR_UNAVAILABLE" {
+                #expect(error as? NativeMediaError == .network)
+            } else {
+                #expect((error as? NativeSourceError)?.code == code)
+            }
+        }
+        let expected = code == "OFFLINE_CLEAR_UNAVAILABLE"
+        #expect(await probe.calls == (expected ? [.init(episodeID: "200", contentType: "1004", fresh: true, quality: .dataSaver)] : []))
+        #expect(await probe.transfers == (expected ? 1 : 0))
+    }
+
     @Test
     func completeNativeListDoesNotUseWebsitePreviewCount() throws {
         let html = try nativeCatalogueHTML(episodes: ["200", "201", "202", "203"], accessible: 1)

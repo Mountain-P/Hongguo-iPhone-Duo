@@ -32,7 +32,8 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
     public fileprivate(set) var duration: Double = 0
     public var id: OfflineDownloadKey { key }
     public var isOfflineUnsupported: Bool {
-        state == .failed && (offlineUnsupported == true || failure == "來源未提供可離線儲存的未加密 MP4。")
+        // Older builds saved clear-only failures as unsupported. The episode can now be retried.
+        state == .failed && offlineUnsupported == true && failure != "來源未提供可離線儲存的未加密 MP4。"
     }
 
     public init(key: OfflineDownloadKey, seriesTitle: String, episodeNumber: Int, episodeTitle: String = "",

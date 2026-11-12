@@ -28,14 +28,16 @@ struct NativeMediaHTTPDownload: NativeMediaDownloading, NativeOfflineMediaDownlo
     }
 }
 
-/// Stages only an authorized clear rendition. The caller owns the completed staging URL.
+/// Stages a verified clear MP4. The caller owns the completed staging URL.
 struct NativeOfflineFile: Sendable {
     private let destination: URL
     private let workspace: URL
     private let staging: URL
     private let maximumBytes: Int64
+    private let makeRangeFetcher: @Sendable (NativeMediaSource) throws -> any NativeRangeFetching
 
-    init(destination: URL, maximumBytes: Int64) throws {
+    init(destination: URL, maximumBytes: Int64,
+         makeRangeFetcher: @escaping @Sendable (NativeMediaSource) throws -> any NativeRangeFetching = { try NativeRangeHTTP(source: $0) }) throws {
         guard maximumBytes > 0 else { throw NativeMediaError.tooLarge }
         guard destination.isFileURL, destination.user == nil, destination.password == nil,
               destination.host == nil || destination.host == "localhost",
@@ -50,19 +52,38 @@ struct NativeOfflineFile: Sendable {
         self.workspace = directory.appendingPathComponent(UUID().uuidString + ".offline-part", isDirectory: true)
         self.staging = workspace.appendingPathComponent("media")
         self.maximumBytes = min(maximumBytes, Int64(NativeMediaStore.maximumBytes))
+        self.makeRangeFetcher = makeRangeFetcher
     }
 
     func write(source: NativeMediaSource, downloader: any NativeOfflineMediaDownloading,
                progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         try Task.checkCancellation()
         try NativeMediaPolicy.validate(source)
-        guard source.contentKey == nil else { throw NativeSourceError(code: "OFFLINE_CLEAR_UNAVAILABLE") }
 
         guard mkdir(workspace.path, S_IRWXU) == 0 else { throw NativeMediaError.storage }
         defer {
             _ = Darwin.unlink(staging.path)
             _ = Darwin.rmdir(workspace.path)
         }
+        if source.contentKey == nil {
+            try await writeDirect(source: source, downloader: downloader, progress: progress)
+        } else {
+            try await writeDecrypted(source: source, progress: progress)
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: staging.path)
+        guard attributes?[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes?[.size] as? NSNumber, size.int64Value > 0 else { throw NativeMediaError.invalidResponse }
+        guard size.int64Value <= maximumBytes else { throw NativeMediaError.tooLarge }
+        guard let data = try? Data(contentsOf: staging, options: .mappedIfSafe), Int64(data.count) == size.int64Value else {
+            throw NativeMediaError.storage
+        }
+        try NativeMP4.validateOfflineClear(data: data, codec: source.codec)
+        try Task.checkCancellation()
+        guard renamex_np(staging.path, destination.path, UInt32(RENAME_EXCL)) == 0 else { throw NativeMediaError.storage }
+    }
+
+    private func writeDirect(source: NativeMediaSource, downloader: any NativeOfflineMediaDownloading,
+                             progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         let updates = AsyncStream<(Int64, Int64?)>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let observer = Task {
             for await (received, expected) in updates.stream {
@@ -89,16 +110,45 @@ struct NativeOfflineFile: Sendable {
             if error is CancellationError { throw CancellationError() }
             throw NativeMediaError.storage
         }
-        let attributes = try? FileManager.default.attributesOfItem(atPath: staging.path)
-        guard attributes?[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes?[.size] as? NSNumber, size.int64Value > 0 else { throw NativeMediaError.invalidResponse }
-        guard size.int64Value <= maximumBytes else { throw NativeMediaError.tooLarge }
-        guard let data = try? Data(contentsOf: staging, options: .mappedIfSafe), Int64(data.count) == size.int64Value else {
-            throw NativeMediaError.storage
+    }
+
+    private func writeDecrypted(source: NativeMediaSource,
+                                progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+        let fetcher = try makeRangeFetcher(source)
+        defer { (fetcher as? NativeRangeHTTP)?.close() }
+        // Offline work owns an independent stream and never populates the playback disk cache.
+        let stream = try await NativeProgressiveMedia.shared.prepare(source: source,
+            fetcher: LimitedRangeFetcher(fetcher: fetcher, maximumBytes: maximumBytes))
+        let total = stream.totalLength
+        let descriptor = open(staging.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw NativeMediaError.storage }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        await progress(0, Int64(total))
+        let chunkSize = 512 * 1024
+        for start in stride(from: 0, to: total, by: chunkSize) {
+            let end = min(start + chunkSize, total)
+            let bytes = try await stream.read(range: start..<end)
+            guard bytes.count == end - start else { throw NativeMediaError.invalidResponse }
+            try Task.checkCancellation()
+            do { try handle.write(contentsOf: bytes) }
+            catch { throw NativeMediaError.storage }
+            await progress(Int64(end), Int64(total))
         }
-        try NativeMP4.validateOfflineClear(data: data, codec: source.codec)
         try Task.checkCancellation()
-        guard renamex_np(staging.path, destination.path, UInt32(RENAME_EXCL)) == 0 else { throw NativeMediaError.storage }
+        do { try handle.synchronize(); try handle.close() }
+        catch { throw NativeMediaError.storage }
+    }
+
+    private struct LimitedRangeFetcher: NativeRangeFetching {
+        let fetcher: any NativeRangeFetching
+        let maximumBytes: Int64
+
+        func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
+            let response = try await fetcher.fetch(range: range)
+            guard Int64(response.totalLength) <= maximumBytes else { throw NativeMediaError.tooLarge }
+            return response
+        }
     }
 }
 

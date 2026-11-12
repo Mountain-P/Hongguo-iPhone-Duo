@@ -11,7 +11,7 @@ struct OfflineDownloadsTests {
         let unsupported = episode(1)
         let available = episode(2)
         let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
-            if item.key == unsupported.key { throw NativeSourceError(code: "OFFLINE_CLEAR_UNAVAILABLE") }
+            if item.key == unsupported.key { throw NativeMediaError.unsupportedEncryption }
             try await writeFixture(item, destination, maximum, progress)
         }
         try await queue.enqueue([unsupported, available])
@@ -22,6 +22,38 @@ struct OfflineDownloadsTests {
         #expect(await queue.snapshot().map(\.key) == [unsupported.key, available.key])
         let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
         #expect(await reopened.snapshot().first?.isOfflineUnsupported == true)
+    }
+
+    @Test(arguments: [true, false])
+    func persistedClearOnlyFailureAllowsManualRetry(_ hasUnsupportedFlag: Bool) async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let item = episode(1)
+        let previous = try OfflineDownloads(directory: directory) { _, _, _, _ in
+            throw NativeSourceError(code: "OFFLINE_CLEAR_UNAVAILABLE")
+        }
+        try await previous.enqueue(item)
+        try await wait { await previous.snapshot().first?.state == .failed }
+
+        let manifest = directory.appendingPathComponent("index.json")
+        var index = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any])
+        var records = try #require(index["records"] as? [[String: Any]])
+        var persisted = try #require(records.first?["item"] as? [String: Any])
+        persisted["failure"] = "來源未提供可離線儲存的未加密 MP4。"
+        persisted["offlineUnsupported"] = hasUnsupportedFlag ? true : nil
+        records[0]["item"] = persisted
+        index["records"] = records
+        let previousManifest = try JSONSerialization.data(withJSONObject: index)
+        try previousManifest.write(to: manifest)
+
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        await reopened.start()
+        #expect(await reopened.snapshot().first?.state == .failed)
+        #expect(await reopened.snapshot().first?.isOfflineUnsupported == false)
+        #expect(try Data(contentsOf: manifest) == previousManifest)
+        try await reopened.retry(item.key)
+        try await wait { await reopened.snapshot().first?.state == .completed }
+        #expect(try await reopened.localURL(for: item.key) != nil)
     }
 
     @Test func serialQueueRejectsCancelledWorkAndRetriesAtTheTail() async throws {

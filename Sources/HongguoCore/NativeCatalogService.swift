@@ -65,18 +65,21 @@ public struct NativeCatalogService: CatalogService {
         try await loadDetail(id: id).detail
     }
 
-    /// Downloads a fresh, explicitly clear MP4 for this exact episode to a new staging file.
+    /// Stages a playable MP4 from an available rendition of this exact episode.
     public func downloadOffline(seriesID: String, episodeID: String, to destination: URL, maximumBytes: Int64,
                                 progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         try await downloadOffline(seriesID: seriesID, episodeID: episodeID, to: destination, maximumBytes: maximumBytes,
                                   resolve: { episodeID, contentType, quality in
             try await NativeJSRuntime().resolve(episodeID: episodeID, contentType: contentType,
                                                 quality: quality, offlineDirect: true)
+        }, resolvePlayable: { episodeID, contentType, quality in
+            try await NativeJSRuntime().resolve(episodeID: episodeID, contentType: contentType, quality: quality)
         }, downloader: NativeMediaHTTPDownload(), progress: progress)
     }
 
     func downloadOffline(seriesID: String, episodeID: String, to destination: URL, maximumBytes: Int64,
                          resolve: @Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource,
+                         resolvePlayable: (@Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource)? = nil,
                          downloader: any NativeOfflineMediaDownloading,
                          progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         try validateID(seriesID)
@@ -88,7 +91,14 @@ public struct NativeCatalogService: CatalogService {
               let episode = entry.detail.episodes.first(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
         guard episode.isAvailable else { throw CatalogError.protectedPlayback }
         try Task.checkCancellation()
-        let source = try await resolve(episodeID, entry.contentType, playbackQuality)
+        let source: NativeMediaSource
+        do {
+            source = try await resolve(episodeID, entry.contentType, playbackQuality)
+        } catch let error as NativeSourceError where error.code == "OFFLINE_CLEAR_UNAVAILABLE" {
+            guard let resolvePlayable else { throw error }
+            try Task.checkCancellation()
+            source = try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+        }
         try await file.write(source: source, downloader: downloader, progress: progress)
     }
 
