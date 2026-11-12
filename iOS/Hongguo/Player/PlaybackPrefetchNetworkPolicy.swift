@@ -32,7 +32,8 @@ final class PlaybackPrefetchNetworkPolicy: ObservableObject {
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
-            let allowed = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            // Formal playback can prefetch over mobile data as well as Wi-Fi.
+            let allowed = path.status == .satisfied
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.pathAllowed = allowed

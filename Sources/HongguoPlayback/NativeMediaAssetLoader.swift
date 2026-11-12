@@ -287,7 +287,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     static func prefetchWithBackoff(_ range: Range<Int>,
                                     prefetch: (Range<Int>) async throws -> Void) async throws {
         var delay = Duration.milliseconds(50)
-        var retriedTransport = false
+        var transportRetries = 0
         while true {
             try Task.checkCancellation()
             do {
@@ -298,8 +298,13 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                 // while AVFoundation has no further successful reads to wake us.
                 try await Task.sleep(for: delay)
                 delay *= 2
-            } catch where !retriedTransport && PlaybackRecovery.shouldRetry(error, attempt: 0) {
-                retriedTransport = true
+            } catch where transportRetries < 2 && PlaybackRecovery.shouldRetry(error, attempt: 0) {
+                transportRetries += 1
+                if transportRetries == 2 {
+                    // Give a briefly interrupted connection time to return, even
+                    // when no new AVFoundation demand has arrived to restart the worker.
+                    try await Task.sleep(for: .seconds(1))
+                }
             }
         }
     }

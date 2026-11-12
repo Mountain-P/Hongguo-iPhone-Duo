@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 import HongguoCore
 @testable import HongguoPlayback
 
@@ -37,13 +38,55 @@ private actor BusyReadAheadProbe {
         #expect(await probe.requests == Array(repeating: range, count: 5))
     }
 
-    @Test func temporaryNetworkFailureRetriesTheSameRangeOnlyOnce() async {
+    @Test func aBriefNetworkDropRecoversTheSameRangeWithoutNewDemand() async throws {
         let probe = BusyReadAheadProbe(failures: 2, failure: .network)
+        let range = chunk..<(2 * chunk)
+        let clock = ContinuousClock()
+        let start = clock.now
+        try await NativeMediaAssetLoader.prefetchWithBackoff(range) { try await probe.prefetch($0) }
+        #expect(await probe.requests == [range, range, range])
+        #expect(start.duration(to: clock.now) >= .seconds(1))
+    }
+
+    @Test func persistentNetworkFailureStopsAfterTheDelayedRetry() async {
+        let probe = BusyReadAheadProbe(failures: 3, failure: .network)
         let range = chunk..<(2 * chunk)
         await #expect(throws: NativeMediaError.network) {
             try await NativeMediaAssetLoader.prefetchWithBackoff(range) { try await probe.prefetch($0) }
         }
+        #expect(await probe.requests == [range, range, range])
+    }
+
+    @Test func cancellingReadAheadDuringTheDelayDoesNotFetchAgain() async {
+        let probe = BusyReadAheadProbe(failures: 2, failure: .network)
+        let range = chunk..<(2 * chunk)
+        let secondAttempt = AsyncStream<Void>.makeStream()
+        let task = Task {
+            defer { secondAttempt.continuation.finish() }
+            try await NativeMediaAssetLoader.prefetchWithBackoff(range) { range in
+                do { try await probe.prefetch(range) }
+                catch {
+                    if await probe.requests.count == 2 { secondAttempt.continuation.yield(()) }
+                    throw error
+                }
+            }
+        }
+        var attempts = secondAttempt.stream.makeAsyncIterator()
+        _ = await attempts.next()
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
         #expect(await probe.requests == [range, range])
+    }
+
+    @Test(arguments: [403, 429])
+    func deniedReadAheadDoesNotRetry(status: Int) async {
+        let error = NativeMediaError.httpStatus(status)
+        let probe = BusyReadAheadProbe(failures: 3, failure: error)
+        let range = chunk..<(2 * chunk)
+        await #expect(throws: error) {
+            try await NativeMediaAssetLoader.prefetchWithBackoff(range) { try await probe.prefetch($0) }
+        }
+        #expect(await probe.requests == [range])
     }
 
     @Test(arguments: [(rate: Float(1), count: 4), (rate: Float(2), count: 8)])
