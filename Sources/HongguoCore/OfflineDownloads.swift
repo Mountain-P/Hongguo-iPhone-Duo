@@ -236,6 +236,13 @@ public actor OfflineDownloads {
         try delete([key])
     }
 
+    /// Removes a drama's saved episodes and its outstanding downloads.
+    public func deleteSeries(scope: String, seriesID: String) throws {
+        guard scope != Self.importedScope else { return }
+        let keys = records.lazy.map(\.item.key).filter { $0.scope == scope && $0.seriesID == seriesID }
+        try delete(Array(keys))
+    }
+
     /// Removes the selected downloads. A storage error can leave only the refused items in the library.
     public func delete(_ keys: [OfflineDownloadKey]) throws {
         let requested = Set(keys)

@@ -342,6 +342,49 @@ struct OfflineDownloadsTests {
         #expect(try await reopened.localURL(for: otherSeries.key) != nil)
     }
 
+    @Test func deleteSeriesRemovesSavedAndOutstandingDownloadsAndContinuesTheQueue() async throws {
+        let directory = temporaryLibrary()
+        let transfer = ControlledOfflineTransfer()
+        defer {
+            Task { await transfer.releaseAll() }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let saved = episode(1)
+        let active = episode(2)
+        let waiting = episode(3)
+        let otherSeries = OfflineDownloadItem(key: .init(scope: saved.key.scope, seriesID: "41", episodeID: "1"),
+                                              seriesTitle: "另一部劇", episodeNumber: 1)
+        let otherScope = OfflineDownloadItem(key: .init(scope: "private", seriesID: saved.key.seriesID, episodeID: "1"),
+                                             seriesTitle: "另一個來源", episodeNumber: 1)
+        let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            try await transfer.download(item, destination, maximum, progress)
+        }
+        try await queue.enqueue([saved, active, waiting, otherSeries, otherScope])
+        try await wait { await transfer.count == 1 }
+        await transfer.release(0)
+        try await wait { await transfer.count == 2 }
+        let movie = try #require(try await queue.localURL(for: saved.key))
+        #expect(await queue.snapshot().map(\.state) == [.completed, .downloading, .queued, .queued, .queued])
+
+        try await queue.deleteSeries(scope: saved.key.scope, seriesID: saved.key.seriesID)
+
+        #expect(await queue.snapshot().map(\.key) == [otherSeries.key, otherScope.key])
+        #expect(!FileManager.default.fileExists(atPath: movie.path))
+        await transfer.release(1)
+        try await wait { await transfer.count == 3 }
+        #expect(await transfer.key(at: 2) == otherSeries.key)
+        await transfer.release(2)
+        try await wait { await transfer.count == 4 }
+        #expect(await transfer.key(at: 3) == otherScope.key)
+        await transfer.release(3)
+        try await wait { await queue.snapshot().map(\.state) == [.completed, .completed] }
+
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await reopened.snapshot().map(\.key) == [otherSeries.key, otherScope.key])
+        #expect(try await reopened.localURL(for: otherSeries.key) != nil)
+        #expect(try await reopened.localURL(for: otherScope.key) != nil)
+    }
+
     @Test(.enabled(if: geteuid() != 0))
     func batchDeletePreservesOnlyRefusedRowsWhenSomeDeletionsFail() async throws {
         let directory = temporaryLibrary()

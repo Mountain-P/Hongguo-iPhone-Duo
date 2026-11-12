@@ -121,6 +121,17 @@ final class OfflineDownloadModel: ObservableObject {
         catch { report(error) }
     }
 
+    func deleteSeries(scope: String, id: String) async -> Bool {
+        guard let storage else { return false }
+        do {
+            try await storage.deleteSeries(scope: scope, seriesID: id)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     func playback(_ item: OfflineDownloadItem) async -> OfflinePlaybackRoute? {
         guard let storage else { return nil }
         // Wait for the last progress write when reopening immediately after close.
@@ -137,7 +148,7 @@ final class OfflineDownloadModel: ObservableObject {
             ($0.episodeNumber, $0.key.episodeID) < ($1.episodeNumber, $1.key.episodeID)
         }.map { Episode(id: $0.key.episodeID, number: $0.episodeNumber, title: $0.episodeTitle) }
         let detail = SeriesDetail(series: .init(id: item.key.seriesID, title: item.seriesTitle), episodes: episodes)
-        let resume = selected.duration > 0 && selected.position >= selected.duration - 0.25 ? 0 : selected.position
+        let resume = selected.isFinishedOffline ? 0 : selected.position
         return OfflinePlaybackRoute(detail: detail, episodeID: item.key.episodeID, resume: resume,
             service: OfflinePlaybackService(detail: detail, scope: item.key.scope, storage: storage)) {
                 [weak self] episode, position, duration in
@@ -318,26 +329,33 @@ struct OfflineDownloadsView: View {
                     .accessibilityIdentifier("offline.import.progress")
             }
             ForEach(groups) { group in
-                NavigationLink {
-                    OfflineDownloadGroupView(groupID: group.id, title: group.title)
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(group.title).font(.headline)
-                        Text(group.summary).font(.caption).foregroundStyle(.secondary)
+                if case let .series(_, seriesID) = group.id {
+                    HStack {
+                        groupLink(group)
+                        Menu {
+                            Button("刪除整部劇", systemImage: "trash", role: .destructive) {
+                                pendingSeriesDeletion = group
+                            }
+                            .accessibilityIdentifier("offline.deleteSeries.\(seriesID)")
+                        } label: {
+                            Label("\(group.title)下載選項", systemImage: "ellipsis.circle")
+                                .labelStyle(.iconOnly)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("offline.seriesActions.\(seriesID)")
                     }
-                    .padding(.vertical, 4)
-                }
-                .accessibilityIdentifier(group.accessibilityID)
-                .swipeActions(allowsFullSwipe: false) {
-                    if case let .series(_, seriesID) = group.id, group.items.allSatisfy(\.canDeleteOffline) {
+                    .swipeActions(allowsFullSwipe: false) {
                         Button {
                             pendingSeriesDeletion = group
                         } label: {
                             Label("刪除整部劇", systemImage: "trash")
                         }
                         .tint(.red)
-                        .accessibilityIdentifier("offline.deleteSeries.\(seriesID)")
                     }
+                } else {
+                    groupLink(group)
                 }
             }
         }
@@ -362,19 +380,23 @@ struct OfflineDownloadsView: View {
                 downloads.error = "無法開啟選取的影片，請回到「檔案」確認後再試。"
             }
         }
-        .confirmationDialog("刪除這部劇的離線下載？",
-            isPresented: Binding(get: { pendingSeriesDeletion != nil }, set: { if !$0 { pendingSeriesDeletion = nil } }),
-            titleVisibility: .visible, presenting: pendingSeriesDeletion) { group in
-            Button("刪除 \(group.items.count) 集", role: .destructive) {
-                Task { await downloads.delete(group.items.map(\.key)) }
-            }
-            .accessibilityIdentifier("offline.confirmDeleteSeries")
-        } message: { group in
-            Text(group.title)
-        }
+        .modifier(OfflineSeriesDeletionDialog(group: $pendingSeriesDeletion))
         .alert("離線下載", isPresented: Binding(get: { downloads.isReady && downloads.error != nil },
             set: { if !$0 { downloads.error = nil } })) { Button("好") { downloads.error = nil } }
             message: { Text(downloads.error ?? "") }
+    }
+
+    private func groupLink(_ group: OfflineDownloadGroup) -> some View {
+        NavigationLink {
+            OfflineDownloadGroupView(groupID: group.id, title: group.title)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(group.title).font(.headline)
+                Text(group.summary).font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+        }
+        .accessibilityIdentifier(group.accessibilityID)
     }
 
     private var groups: [OfflineDownloadGroup] {
@@ -429,16 +451,40 @@ private struct OfflineDownloadGroup: Identifiable {
     }
 }
 
+private struct OfflineSeriesDeletionDialog: ViewModifier {
+    @EnvironmentObject private var downloads: OfflineDownloadModel
+    @Binding var group: OfflineDownloadGroup?
+    var onDeleted: () -> Void = {}
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog("刪除這部劇的離線下載？",
+            isPresented: Binding(get: { group != nil }, set: { if !$0 { group = nil } }),
+            titleVisibility: .visible, presenting: group) { group in
+            Button("刪除整部劇", role: .destructive) {
+                guard case let .series(scope, id) = group.id else { return }
+                Task {
+                    if await downloads.deleteSeries(scope: scope, id: id) { onDeleted() }
+                }
+            }
+            .accessibilityIdentifier("offline.confirmDeleteSeries")
+        } message: { group in
+            Text("「\(group.title)」的離線影片將被刪除，下載中的集數也會取消。")
+        }
+    }
+}
+
 private struct OfflineDownloadGroupView: View {
     let groupID: OfflineDownloadGroup.ID
     let title: String
 
     @EnvironmentObject private var downloads: OfflineDownloadModel
+    @Environment(\.dismiss) private var dismiss
     @State private var route: OfflinePlaybackRoute?
     @State private var opening: OfflineDownloadKey?
     @State private var isEditing = false
     @State private var selection = Set<OfflineDownloadKey>()
     @State private var pendingDeletion: [OfflineDownloadItem]?
+    @State private var pendingSeriesDeletion: OfflineDownloadGroup?
     @State private var isDeleting = false
 
     private var items: [OfflineDownloadItem] {
@@ -459,6 +505,9 @@ private struct OfflineDownloadGroupView: View {
                 ContentUnavailableView(groupID == .imported ? "尚無匯入影片" : "尚無離線劇集",
                     systemImage: "arrow.down.circle")
             } else {
+                if !isEditing, case .series = groupID {
+                    seriesActions(items)
+                }
                 if isEditing {
                     Section {
                         HStack {
@@ -500,6 +549,7 @@ private struct OfflineDownloadGroupView: View {
             }
         }
         .onChange(of: removableKeys) { _, keys in selection.formIntersection(keys) }
+        .modifier(OfflineSeriesDeletionDialog(group: $pendingSeriesDeletion) { dismiss() })
         .fullScreenCover(item: Binding(get: { route }, set: { if $0 == nil { closePlayback() } })) { item in
             if let retained = item.session.resolve(make: {
                 PlayerModel(series: item.detail.series, episodes: item.detail.episodes, initialEpisodeID: item.episodeID,
@@ -532,6 +582,29 @@ private struct OfflineDownloadGroupView: View {
         .alert("離線下載", isPresented: Binding(get: { downloads.isReady && downloads.error != nil },
             set: { if !$0 { downloads.error = nil } })) { Button("好") { downloads.error = nil } }
             message: { Text(downloads.error ?? "") }
+    }
+
+    private func seriesActions(_ items: [OfflineDownloadItem]) -> some View {
+        let saved = items.filter { $0.state == .completed }
+        let start = saved.first(where: \.canResumeOffline)
+            ?? saved.first(where: { !$0.isFinishedOffline }) ?? saved.first
+        return Section {
+            if let start {
+                Button {
+                    openPlayback(start)
+                } label: {
+                    Label(start.canResumeOffline ? "繼續第 \(start.episodeNumber) 集" : "播放第 \(start.episodeNumber) 集",
+                          systemImage: "play.fill")
+                }
+                .disabled(opening != nil)
+                .accessibilityIdentifier("offline.playSeries")
+            }
+            Button("刪除整部劇", systemImage: "trash", role: .destructive) {
+                pendingSeriesDeletion = .init(id: groupID, items: items)
+            }
+            .disabled(opening != nil)
+            .accessibilityIdentifier("offline.deleteSeriesFromDetail")
+        }
     }
 
     private func deleteLabel(_ count: Int) -> String {
@@ -581,13 +654,9 @@ private struct OfflineDownloadGroupView: View {
                 switch item.state {
                 case .completed:
                     Button {
-                        opening = item.key
-                        Task {
-                            route = await downloads.playback(item)
-                            opening = nil
-                        }
+                        openPlayback(item)
                     } label: {
-                        Label(item.position > 0 && item.position < item.duration - 0.25 ? "繼續觀看" : "播放",
+                        Label(item.canResumeOffline ? "繼續觀看" : "播放",
                               systemImage: "play.fill")
                     }
                     .disabled(opening != nil)
@@ -612,6 +681,14 @@ private struct OfflineDownloadGroupView: View {
             .buttonStyle(.bordered)
         }
         .padding(.vertical, 4)
+    }
+
+    private func openPlayback(_ item: OfflineDownloadItem) {
+        opening = item.key
+        Task {
+            route = await downloads.playback(item)
+            opening = nil
+        }
     }
 
     private func closePlayback() {
@@ -661,6 +738,8 @@ private struct OfflineDownloadStatus: View {
 private extension OfflineDownloadItem {
     var isImportedVideo: Bool { key.scope == OfflineDownloads.importedScope }
     var canDeleteOffline: Bool { state != .queued && state != .downloading }
+    var isFinishedOffline: Bool { duration > 0 && position >= duration - 0.25 }
+    var canResumeOffline: Bool { position > 0 && duration > 0 && !isFinishedOffline }
 }
 
 private func episodeLabel(_ number: Int, _ title: String) -> String {
