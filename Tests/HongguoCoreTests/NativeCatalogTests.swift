@@ -8,10 +8,14 @@ import FoundationNetworking
 private actor NativeCatalogueTransport: HTTPTransport {
     let body: Data
     let status: Int
+    let firstStatus: Int?
     private(set) var requests: [URLRequest] = []
-    init(body: String, status: Int = 200) { self.body = Data(body.utf8); self.status = status }
+    init(body: String, status: Int = 200, firstStatus: Int? = nil) {
+        self.body = Data(body.utf8); self.status = status; self.firstStatus = firstStatus
+    }
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         requests.append(request)
+        let status = requests.count == 1 ? (firstStatus ?? status) : status
         return (body, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!)
     }
 }
@@ -75,19 +79,32 @@ private actor CancellingNativePreparation {
 }
 
 private actor OfflineSourceProbe: NativeOfflineMediaDownloading {
-    private(set) var calls: [NativeQualityPreparationRecorder.Call] = []
-    private(set) var transfers = 0
+    struct Resolution: Equatable, Sendable {
+        let episodeID: String
+        let contentType: String
+        let quality: NativePlaybackQuality
+        let playable: Bool
+    }
 
-    func resolvePlayable(_ episodeID: String, _ contentType: String, _ quality: NativePlaybackQuality) -> NativeMediaSource {
-        calls.append(.init(episodeID: episodeID, contentType: contentType, fresh: true, quality: quality))
-        return NativeMediaSource(url: URL(string: "https://fixture.qznovelvod.com/episode.mp4")!,
-                                 contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "720p")
+    private let transferError: NativeMediaError
+    private(set) var calls: [Resolution] = []
+    private(set) var transfers: [URL] = []
+
+    init(transferError: NativeMediaError = .network) { self.transferError = transferError }
+
+    func resolve(_ episodeID: String, _ contentType: String, _ quality: NativePlaybackQuality,
+                 playable: Bool, errorCode: String? = nil) throws -> NativeMediaSource {
+        calls.append(.init(episodeID: episodeID, contentType: contentType, quality: quality, playable: playable))
+        if let errorCode { throw NativeSourceError(code: errorCode) }
+        return NativeMediaSource(url: URL(string: "https://fixture.qznovelvod.com/episode-\(calls.count).mp4")!,
+                                 contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "720p", preference: quality)
     }
 
     func downloadOffline(source: NativeMediaSource, destination: URL, maximumBytes: Int64,
                          progress: @escaping @Sendable (Int64, Int64?) -> Void) async throws {
-        transfers += 1
-        throw NativeMediaError.network
+        transfers.append(source.url)
+        try Data([0]).write(to: destination, options: .withoutOverwriting)
+        throw transferError
     }
 }
 
@@ -102,8 +119,8 @@ struct NativeCatalogTests {
         let probe = OfflineSourceProbe()
         do {
             try await service.downloadOffline(seriesID: "100", episodeID: "200", to: directory.appendingPathComponent("episode.mp4"),
-                maximumBytes: 2048, resolve: { _, _, _ in throw NativeSourceError(code: code) },
-                resolvePlayable: { await probe.resolvePlayable($0, $1, $2) }, downloader: probe, progress: { _, _ in })
+                maximumBytes: 2048, resolve: { try await probe.resolve($0, $1, $2, playable: false, errorCode: code) },
+                resolvePlayable: { try await probe.resolve($0, $1, $2, playable: true) }, downloader: probe, progress: { _, _ in })
             Issue.record("The fixture always stops before publishing")
         } catch {
             if code == "OFFLINE_CLEAR_UNAVAILABLE" {
@@ -112,9 +129,63 @@ struct NativeCatalogTests {
                 #expect((error as? NativeSourceError)?.code == code)
             }
         }
-        let expected = code == "OFFLINE_CLEAR_UNAVAILABLE"
-        #expect(await probe.calls == (expected ? [.init(episodeID: "200", contentType: "1004", fresh: true, quality: .dataSaver)] : []))
-        #expect(await probe.transfers == (expected ? 1 : 0))
+        let clear = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1004", quality: .dataSaver, playable: false)
+        let playable = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1004", quality: .dataSaver, playable: true)
+        let usesPlayable = code == "OFFLINE_CLEAR_UNAVAILABLE"
+        #expect(await probe.calls == (usesPlayable ? [clear, playable, clear, playable] : [clear]))
+        #expect(await probe.transfers.count == (usesPlayable ? 2 : 0))
+    }
+
+    @Test(arguments: [NativeMediaError.network, .unsafeURL, .httpStatus(503), .httpStatus(429), .storage])
+    func offlineRefreshesTheExactSourceOnceForRetryableTransferFailures(_ error: NativeMediaError) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(episodes: ["199", "200"], accessible: 2,
+                                                                               contentType: "1005"))
+        let service = NativeCatalogService(transport: transport, quality: .dataSaver)
+        let probe = OfflineSourceProbe(transferError: error)
+        await #expect(throws: error) {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: directory.appendingPathComponent("episode.mp4"),
+                maximumBytes: 2048, resolve: { try await probe.resolve($0, $1, $2, playable: false) },
+                resolvePlayable: { try await probe.resolve($0, $1, $2, playable: true) }, downloader: probe, progress: { _, _ in })
+        }
+        let count = [.network, .unsafeURL, .httpStatus(503)].contains(error) ? 2 : 1
+        let clear = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1005", quality: .dataSaver, playable: false)
+        #expect(await probe.calls == Array(repeating: clear, count: count))
+        #expect(await probe.transfers.map(\.lastPathComponent) == (1...count).map { "episode-\($0).mp4" })
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test(arguments: [[502, 200], [502, 502], [401, 200], [403, 200], [429, 200]])
+    func offlineRetriesOnlyTransientCatalogueResponses(_ statuses: [Int]) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(episodes: ["199", "200"], accessible: 2,
+                                                                               contentType: "1005"),
+                                                 status: statuses[1], firstStatus: statuses[0])
+        let service = NativeCatalogService(transport: transport, quality: .dataSaver)
+        let probe = OfflineSourceProbe(transferError: .storage)
+        let retries = statuses[0] == 502
+        let reachedTransfer = retries && statuses[1] == 200
+        do {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: directory.appendingPathComponent("episode.mp4"),
+                maximumBytes: 2048, resolve: { try await probe.resolve($0, $1, $2, playable: false) }, downloader: probe, progress: { _, _ in })
+            Issue.record("The fixture stops at the catalogue or first transfer")
+        } catch {
+            if reachedTransfer {
+                #expect(error as? NativeMediaError == .storage)
+            } else {
+                #expect(error as? CatalogError == (statuses[0] == 401 ? .unauthorized : .httpStatus(statuses[0])))
+            }
+        }
+        let requests = await transport.requests
+        #expect(requests.count == (retries ? 2 : 1))
+        #expect(requests.allSatisfy { $0.url?.query == "series_id=100" })
+        let clear = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1005", quality: .dataSaver, playable: false)
+        #expect(await probe.calls == (reachedTransfer ? [clear] : []))
+        #expect(await probe.transfers.count == (reachedTransfer ? 1 : 0))
     }
 
     @Test

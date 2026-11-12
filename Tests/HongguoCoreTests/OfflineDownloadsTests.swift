@@ -317,6 +317,58 @@ struct OfflineDownloadsTests {
         #expect(!FileManager.default.fileExists(atPath: movie.path))
     }
 
+    @Test func batchDeleteRemovesOnlySelectedEpisodesFromDiskAndIndex() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = episode(1)
+        let second = episode(2)
+        let third = episode(3)
+        let otherSeries = OfflineDownloadItem(key: .init(scope: "public", seriesID: "41", episodeID: "1"),
+                                              seriesTitle: "另一部劇", episodeNumber: 1)
+        let queue = try OfflineDownloads(directory: directory, provider: writeFixture)
+        try await queue.enqueue([first, second, third, otherSeries])
+        try await wait { await queue.snapshot().map(\.state) == Array(repeating: .completed, count: 4) }
+        let firstMovie = try #require(try await queue.localURL(for: first.key))
+        let thirdMovie = try #require(try await queue.localURL(for: third.key))
+
+        try await queue.delete([third.key, episode(5).key, first.key, third.key])
+
+        #expect(await queue.snapshot().map(\.key) == [second.key, otherSeries.key])
+        #expect(!FileManager.default.fileExists(atPath: firstMovie.path))
+        #expect(!FileManager.default.fileExists(atPath: thirdMovie.path))
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await reopened.snapshot().map(\.key) == [second.key, otherSeries.key])
+        #expect(try await reopened.localURL(for: second.key) != nil)
+        #expect(try await reopened.localURL(for: otherSeries.key) != nil)
+    }
+
+    @Test(.enabled(if: geteuid() != 0))
+    func batchDeletePreservesOnlyRefusedRowsWhenSomeDeletionsFail() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let available = episode(1)
+        let unavailable = episode(2)
+        let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            if item.key == unavailable.key { throw NativeMediaError.unsupportedEncryption }
+            try await writeFixture(item, destination, maximum, progress)
+        }
+        try await queue.enqueue([available, unavailable])
+        try await wait { await queue.snapshot().map(\.state) == [.completed, .failed] }
+        let movie = try #require(try await queue.localURL(for: available.key))
+        let movies = movie.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: movies.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: movies.path) }
+
+        await #expect(throws: OfflineDownloadError.storageUnavailable) {
+            try await queue.delete([available.key, unavailable.key])
+        }
+
+        #expect(await queue.snapshot().map(\.key) == [available.key])
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await reopened.snapshot().map(\.key) == [available.key])
+        #expect(try await reopened.localURL(for: available.key) == movie)
+    }
+
     @Test(.enabled(if: geteuid() != 0))
     func retryReplacesTheStaleCorruptFileOnceStorageAllowsRemoval() async throws {
         let directory = temporaryLibrary()

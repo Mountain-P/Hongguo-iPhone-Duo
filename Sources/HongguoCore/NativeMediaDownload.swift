@@ -60,15 +60,51 @@ struct NativeOfflineFile: Sendable {
         try Task.checkCancellation()
         try NativeMediaPolicy.validate(source)
 
+        var seen = Set([source.url])
+        let mirrors = source.alternateSources.prefix(2).filter {
+            $0.contentKey == source.contentKey && $0.codec == source.codec && $0.quality == source.quality
+                && $0.preference == source.preference && $0.userAgent == source.userAgent
+                && $0.width == source.width && $0.height == source.height
+                && NativeMediaPolicy.allows($0.url) && seen.insert($0.url).inserted
+        }
+        let candidates = [source] + mirrors
+        for (index, candidate) in candidates.enumerated() {
+            do {
+                try await writeCandidate(source: candidate, downloader: downloader, progress: progress)
+                return
+            } catch {
+                try Task.checkCancellation()
+                guard index < candidates.count - 1, PlaybackRecovery.shouldRetryAssetRead(error) else { throw error }
+            }
+        }
+    }
+
+    private func writeCandidate(source: NativeMediaSource, downloader: any NativeOfflineMediaDownloading,
+                                progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+        if source.contentKey == nil {
+            do {
+                try await writeAttempt(source: source, directDownloader: downloader, progress: progress)
+                return
+            } catch NativeMediaError.unsafeURL {
+                // Only Range can validate the existing scheduled playback redirects.
+                guard NativeMediaPolicy.isScheduledPlaybackOrigin(source.url) else { throw NativeMediaError.unsafeURL }
+            }
+        }
+        try await writeAttempt(source: source, directDownloader: nil, progress: progress)
+    }
+
+    private func writeAttempt(source: NativeMediaSource, directDownloader: (any NativeOfflineMediaDownloading)?,
+                              progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+        try Task.checkCancellation()
         guard mkdir(workspace.path, S_IRWXU) == 0 else { throw NativeMediaError.storage }
         defer {
             _ = Darwin.unlink(staging.path)
             _ = Darwin.rmdir(workspace.path)
         }
-        if source.contentKey == nil {
+        if let downloader = directDownloader {
             try await writeDirect(source: source, downloader: downloader, progress: progress)
         } else {
-            try await writeDecrypted(source: source, progress: progress)
+            try await writeRanges(source: source, progress: progress)
         }
         let attributes = try? FileManager.default.attributesOfItem(atPath: staging.path)
         guard attributes?[.type] as? FileAttributeType == .typeRegular,
@@ -112,8 +148,8 @@ struct NativeOfflineFile: Sendable {
         }
     }
 
-    private func writeDecrypted(source: NativeMediaSource,
-                                progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
+    private func writeRanges(source: NativeMediaSource,
+                             progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         let fetcher = try makeRangeFetcher(source)
         defer { (fetcher as? NativeRangeHTTP)?.close() }
         // Offline work owns an independent stream and never populates the playback disk cache.
@@ -145,7 +181,14 @@ struct NativeOfflineFile: Sendable {
         let maximumBytes: Int64
 
         func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
-            let response = try await fetcher.fetch(range: range)
+            let response: NativeRangeResponse
+            do {
+                response = try await fetcher.fetch(range: range)
+            } catch where PlaybackRecovery.shouldRetry(error, attempt: 0) {
+                // Keep the same fetcher and If-Range validator for the retry.
+                try Task.checkCancellation()
+                response = try await fetcher.fetch(range: range)
+            }
             guard Int64(response.totalLength) <= maximumBytes else { throw NativeMediaError.tooLarge }
             return response
         }

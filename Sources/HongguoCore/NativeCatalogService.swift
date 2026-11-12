@@ -86,20 +86,36 @@ public struct NativeCatalogService: CatalogService {
         try validateID(episodeID)
         try Task.checkCancellation()
         let file = try NativeOfflineFile(destination: destination, maximumBytes: maximumBytes)
-        let entry = try await loadDetail(id: seriesID)
+        let entry: NativeCatalogEntry
+        do {
+            entry = try await loadDetail(id: seriesID)
+        } catch where PlaybackRecovery.shouldRetry(error, attempt: 0) {
+            entry = try await loadDetail(id: seriesID)
+        }
         guard entry.detail.series.id == seriesID,
               let episode = entry.detail.episodes.first(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
         guard episode.isAvailable else { throw CatalogError.protectedPlayback }
-        try Task.checkCancellation()
-        let source: NativeMediaSource
-        do {
-            source = try await resolve(episodeID, entry.contentType, playbackQuality)
-        } catch let error as NativeSourceError where error.code == "OFFLINE_CLEAR_UNAVAILABLE" {
-            guard let resolvePlayable else { throw error }
+
+        func resolveSource() async throws -> NativeMediaSource {
             try Task.checkCancellation()
-            source = try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+            do {
+                return try await resolve(episodeID, entry.contentType, playbackQuality)
+            } catch let error as NativeSourceError where error.code == "OFFLINE_CLEAR_UNAVAILABLE" {
+                guard let resolvePlayable else { throw error }
+                try Task.checkCancellation()
+                return try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+            }
         }
-        try await file.write(source: source, downloader: downloader, progress: progress)
+
+        let source = try await resolveSource()
+        do {
+            try await file.write(source: source, downloader: downloader, progress: progress)
+        } catch where PlaybackRecovery.shouldRetryAssetRead(error) {
+            // The writer removed the partial file. Resolve this episode again
+            // before opening a fresh file so bytes from two versions cannot mix.
+            let refreshed = try await resolveSource()
+            try await file.write(source: refreshed, downloader: downloader, progress: progress)
+        }
     }
 
     public func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {

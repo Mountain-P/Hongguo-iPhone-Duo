@@ -30,14 +30,18 @@ private final class OfflineHTTPSFixtures: @unchecked Sendable {
         var headers: [String: String]
         var body: Data
         var servesRanges = false
+        var changesETagAt: Int?
+        var failsFirstRangeAt: Int?
+        var rangeFailureStatus: Int?
+        var transportError: URLError?
     }
     static let shared = OfflineHTTPSFixtures()
     private let lock = NSLock()
     private var responses: [URL: Response] = [:]
     private var requests: [URL: [URLRequest]] = [:]
 
-    func register(_ response: Response) -> URL {
-        let url = URL(string: "https://offline-fixture.fqnovelvod.com/\(UUID()).mp4")!
+    func register(_ response: Response, host: String = "offline-fixture.fqnovelvod.com") -> URL {
+        let url = URL(string: "https://\(host)/\(UUID()).mp4")!
         lock.withLock { responses[url] = response }
         return url
     }
@@ -49,11 +53,21 @@ private final class OfflineHTTPSFixtures: @unchecked Sendable {
                 guard let header = request.value(forHTTPHeaderField: "Range"), header.hasPrefix("bytes=") else { return nil }
                 let bounds = header.dropFirst(6).split(separator: "-").compactMap { Int($0) }
                 guard bounds.count == 2, bounds[0] >= 0, bounds[0] < response.body.count, bounds[1] >= bounds[0] else { return nil }
+                if response.failsFirstRangeAt == bounds[0],
+                   requests[url]?.filter({ $0.value(forHTTPHeaderField: "Range") == header }).count == 1 {
+                    if let status = response.rangeFailureStatus {
+                        return .init(status: status, headers: [:], body: Data())
+                    }
+                    return .init(headers: [:], body: Data(), transportError: URLError(.networkConnectionLost))
+                }
                 let upper = min(response.body.count - 1, bounds[1])
                 response.status = 206
                 response.headers["Content-Range"] = "bytes \(bounds[0])-\(upper)/\(response.body.count)"
                 response.body = response.body.subdata(in: bounds[0]..<(upper + 1))
                 response.headers["Content-Length"] = String(response.body.count)
+                if let start = response.changesETagAt {
+                    response.headers["ETag"] = bounds[0] >= start ? "\"changed\"" : "\"initial\""
+                }
             }
             return response
         }
@@ -68,9 +82,14 @@ private final class OfflineHTTPSProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        guard let url = request.url, let fixture = OfflineHTTPSFixtures.shared.start(request, url: url),
-              let response = HTTPURLResponse(url: url, statusCode: fixture.status, httpVersion: "HTTP/1.1", headerFields: fixture.headers) else {
+        guard let url = request.url, let fixture = OfflineHTTPSFixtures.shared.start(request, url: url) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL)); return
+        }
+        if let error = fixture.transportError {
+            client?.urlProtocol(self, didFailWithError: error); return
+        }
+        guard let response = HTTPURLResponse(url: url, statusCode: fixture.status, httpVersion: "HTTP/1.1", headerFields: fixture.headers) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse)); return
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let middle = fixture.body.count / 2
@@ -79,6 +98,13 @@ private final class OfflineHTTPSProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private struct OfflineRejectedRedirect: NativeOfflineMediaDownloading {
+    func downloadOffline(source: NativeMediaSource, destination: URL, maximumBytes: Int64,
+                         progress: @escaping @Sendable (Int64, Int64?) -> Void) async throws {
+        throw NativeMediaError.unsafeURL
+    }
 }
 
 private actor OfflineHeldTransfer: NativeOfflineMediaDownloading {
@@ -260,6 +286,65 @@ struct NativeOfflineDownloadTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
+    @Test func encryptedMirrorRestartsAfterALateValidatorChange() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let original = encryptedMP4()
+        var changed = original
+        changed[1024] ^= 1
+        let primary = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: changed,
+                                                                servesRanges: true, changesETagAt: 512 * 1024))
+        let mirror = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: original,
+                                                               servesRanges: true))
+        defer { OfflineHTTPSFixtures.shared.remove(primary); OfflineHTTPSFixtures.shared.remove(mirror) }
+        let destination = directory.appendingPathComponent("episode.stage")
+        let file = try rangedFile(destination, maximumBytes: Int64(original.count))
+        try await file.write(source: source(primary, key: encryptionKey, alternates: [source(mirror, key: encryptionKey)]),
+                             downloader: httpDownloader(), progress: { _, _ in })
+        #expect(try Data(contentsOf: destination) == NativeMP4.decrypt(data: original, contentKey: encryptionKey, codec: "h264"))
+        #expect(OfflineHTTPSFixtures.shared.requests(to: primary).contains { $0.value(forHTTPHeaderField: "If-Range") == "\"initial\"" })
+        #expect(OfflineHTTPSFixtures.shared.requests(to: mirror).first?.value(forHTTPHeaderField: "Range") == "bytes=0-262143")
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["episode.stage"])
+    }
+
+    @Test(arguments: [nil, 503] as [Int?])
+    func lateTransportFailureRetriesExactlyTheSameRange(status: Int?) async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let media = encryptedMP4()
+        let chunkOffset = 512 * 1024
+        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4", "ETag": "\"stable\""],
+                                                            body: media, servesRanges: true,
+                                                            failsFirstRangeAt: chunkOffset, rangeFailureStatus: status))
+        defer { OfflineHTTPSFixtures.shared.remove(url) }
+        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
+        let file = try rangedFile(destination, maximumBytes: Int64(media.count))
+        try await file.write(source: source(url, key: encryptionKey), downloader: httpDownloader()) { await events.advanced($0, $1) }
+        #expect(try Data(contentsOf: destination) == NativeMP4.decrypt(data: media, contentKey: encryptionKey, codec: "h264"))
+        let requests = OfflineHTTPSFixtures.shared.requests(to: url)
+        let retries = requests.filter { $0.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=\(chunkOffset)-") == true }
+        #expect(retries.count == 2)
+        #expect(retries.first?.value(forHTTPHeaderField: "Range") == retries.last?.value(forHTTPHeaderField: "Range"))
+        #expect(retries.allSatisfy { $0.value(forHTTPHeaderField: "If-Range") == "\"stable\"" })
+        #expect(await events.progress.map(\.0) == [0, Int64(chunkOffset), Int64(media.count)])
+    }
+
+    @Test func clearTransferUsesRangeFallbackOnlyForScheduledOrigins() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let media = clearMP4()
+        let fixture = OfflineHTTPSFixtures.Response(headers: ["Content-Type": "video/mp4"], body: media, servesRanges: true)
+        let scheduled = OfflineHTTPSFixtures.shared.register(fixture, host: "v5-reading-video-a.qznovelvod.com")
+        let ordinary = OfflineHTTPSFixtures.shared.register(fixture)
+        defer { OfflineHTTPSFixtures.shared.remove(scheduled); OfflineHTTPSFixtures.shared.remove(ordinary) }
+        let destination = directory.appendingPathComponent("episode.stage")
+        let file = try rangedFile(destination, maximumBytes: Int64(media.count))
+        await #expect(throws: NativeMediaError.unsafeURL) {
+            try await file.write(source: source(ordinary), downloader: OfflineRejectedRedirect(), progress: { _, _ in })
+        }
+        try await file.write(source: source(scheduled), downloader: OfflineRejectedRedirect(), progress: { _, _ in })
+        #expect(OfflineHTTPSFixtures.shared.requests(to: ordinary).isEmpty)
+        #expect(OfflineHTTPSFixtures.shared.requests(to: scheduled).first?.value(forHTTPHeaderField: "Range") != nil)
+        #expect(try Data(contentsOf: destination) == media)
+    }
+
     @Test func cancellingAnEncryptedTransferDiscardsAlreadyDecryptedBytes() async throws {
         let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let media = encryptedMP4(), held = OfflineHeldRange(media)
@@ -282,12 +367,14 @@ struct NativeOfflineDownloadTests {
     @Test func deniedAndOversizeBodiesNeverPublishOrRetry() async throws {
         let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let payload = Data(repeating: 0xff, count: 1024)
+        let mirror = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: clearMP4()))
+        defer { OfflineHTTPSFixtures.shared.remove(mirror) }
         for status in [401, 403, 429, 200] {
             let url = OfflineHTTPSFixtures.shared.register(.init(status: status, headers: ["Content-Type": "video/mp4", "Content-Length": "1024"], body: payload))
             defer { OfflineHTTPSFixtures.shared.remove(url) }
             let file = try NativeOfflineFile(destination: directory.appendingPathComponent("episode.stage"), maximumBytes: 64)
             do {
-                try await file.write(source: source(url), downloader: httpDownloader(), progress: { _, _ in })
+                try await file.write(source: source(url, alternates: [source(mirror)]), downloader: httpDownloader(), progress: { _, _ in })
                 Issue.record("Denied or oversized media was published")
             } catch {
                 switch status {
@@ -300,6 +387,7 @@ struct NativeOfflineDownloadTests {
             #expect(OfflineHTTPSFixtures.shared.requests(to: url).count == 1)
             #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
         }
+        #expect(OfflineHTTPSFixtures.shared.requests(to: mirror).isEmpty)
     }
 
     @Test func cancellingAStartedTransferDiscardsItsPartialFile() async throws {
@@ -362,8 +450,8 @@ struct NativeOfflineDownloadTests {
         #expect(value["fallback"] as? Int == 0)
     }
 
-    private func source(_ url: URL, key: Data? = nil) -> NativeMediaSource {
-        .init(url: url, contentKey: key, userAgent: "OfflineFixture", codec: "h264", quality: "720p")
+    private func source(_ url: URL, key: Data? = nil, alternates: [NativeMediaSource] = []) -> NativeMediaSource {
+        .init(url: url, contentKey: key, userAgent: "OfflineFixture", codec: "h264", quality: "720p", alternateSources: alternates)
     }
 
     private func makeDirectory() throws -> URL {

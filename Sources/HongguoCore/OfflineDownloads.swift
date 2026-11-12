@@ -233,23 +233,38 @@ public actor OfflineDownloads {
     }
 
     public func delete(_ key: OfflineDownloadKey) throws {
-        guard let index = index(for: key) else { return }
-        var updated = records
-        let removed = updated.remove(at: index)
+        try delete([key])
+    }
+
+    /// Removes the selected downloads. A storage error can leave only the refused items in the library.
+    public func delete(_ keys: [OfflineDownloadKey]) throws {
+        let requested = Set(keys)
+        let removed = records.filter { requested.contains($0.item.key) }
+        guard !removed.isEmpty else { return }
+        var updated = records.filter { !requested.contains($0.item.key) }
         try disk.save(updated)
-        do {
-            try disk.deleteFile(disk.movie(removed.fileID))
-        } catch {
-            // Restore the row if removal was refused. If the disk is now
-            // inaccessible, the last durable index still owns cleanup on reopen.
-            do { try disk.save(records) }
-            catch { records = updated; publish() }
-            throw error
+
+        var refused = Set<OfflineDownloadKey>()
+        var deletionError: (any Error)?
+        for record in removed {
+            do { try disk.deleteFile(disk.movie(record.fileID)) }
+            catch {
+                refused.insert(record.item.key)
+                deletionError = deletionError ?? error
+            }
         }
+        if !refused.isEmpty {
+            // Restore rows whose files could not be removed. If the second save
+            // fails, reopen will clean up files absent from the last durable index.
+            let restored = records.filter { !requested.contains($0.item.key) || refused.contains($0.item.key) }
+            if (try? disk.save(restored)) != nil { updated = restored }
+        }
+
         records = updated
         publish()
-        if job?.key == key { job?.task.cancel() }
+        if let key = job?.key, requested.contains(key), index(for: key) == nil { job?.task.cancel() }
         startNext()
+        if let deletionError { throw deletionError }
     }
 
     public func recordProgress(for key: OfflineDownloadKey, position: Double, duration: Double) throws {
@@ -389,6 +404,7 @@ public actor OfflineDownloads {
         let unsupported = source?.code == "OFFLINE_CLEAR_UNAVAILABLE" || media == .unsupportedEncryption
         let description = (error as? OfflineDownloadError)?.errorDescription ?? media?.errorDescription
             ?? (error as? CatalogError)?.errorDescription ?? source?.errorDescription
+            ?? (error as? NativeProgressiveError)?.errorDescription
             ?? "下載中斷，請稍後再試。"
         var updated = records
         updated[index].item.resetTransfer(to: .failed, failure: description, offlineUnsupported: unsupported ? true : nil)
