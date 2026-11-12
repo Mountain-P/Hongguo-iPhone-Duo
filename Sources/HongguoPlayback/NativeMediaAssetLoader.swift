@@ -20,8 +20,9 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         private var end = 0
         var hasPendingRange: Bool { next < end }
 
-        mutating func extend(after cursor: Int, totalLength: Int, memoryOnly: Bool = false, playbackRate: Float = 1) {
-            let windowBytes = memoryOnly ? Self.memoryWindowBytes(playbackRate: playbackRate) : Self.diskWindowBytes
+        mutating func extend(after cursor: Int, totalLength: Int, memoryOnly: Bool = false, playbackRate: Float = 1, duration: Double? = nil) {
+            let windowBytes = memoryOnly ? Self.memoryWindowBytes(playbackRate: playbackRate) : PlaybackReadAheadBudget.bytes(totalLength: totalLength, duration: duration, rate: playbackRate,
+                wallSeconds: 45, minimum: Self.diskWindowBytes, maximum: 64 * 1024 * 1024)
             let limit = cursor + min(windowBytes, totalLength - cursor)
             end = memoryOnly && limit < totalLength ? limit / Self.chunkSize * Self.chunkSize : limit
         }
@@ -62,6 +63,8 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     private var readAheadEnabled = false
     private var readAheadMemoryOnly = false
     private var readAheadRate: Float = 1
+    private var bufferedWallSeconds: Double = 0
+    private var retryReadAheadAfter: Double = 0
     private var readAheadStorageFailed = false
     private var usesMemoryReadAhead: Bool { readAheadMemoryOnly || readAheadStorageFailed }
     private var readAheadTask: Task<Void, Never>?
@@ -87,8 +90,23 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         return asset
     }
 
+    public var totalLength: Int { stream.totalLength }
+    public var transferSnapshot: PlaybackTransferSnapshot { stream.transferSnapshot }
+
+    public func updatePlaybackBuffer(mediaSeconds: Double, rate: Float) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, rate.isFinite, rate > 0 else { return }
+            self.bufferedWallSeconds = max(0, mediaSeconds) / Double(rate)
+            if let cursor = self.lastDemandEnd { self.extendReadAhead(after: cursor) }
+        }
+    }
+
     public func noteBufferStarvation() {
         stream.noteBufferStarvation()
+    }
+
+    public func unrecoverableTerminalError() async -> NSError? {
+        await stream.unrecoverableTerminalError.map(Self.sanitized)
     }
 
     public func recoverableTerminalError() async -> NSError? {
@@ -256,15 +274,16 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     }
 
     private func extendReadAhead(after cursor: Int) {
-        guard readAheadEnabled, !stopped, cursor < stream.totalLength else { return }
+        guard readAheadEnabled, !stopped, cursor < stream.totalLength,
+              ProcessInfo.processInfo.systemUptime >= retryReadAheadAfter else { return }
         let memoryOnly = usesMemoryReadAhead
-        readAheadWindow.extend(after: cursor, totalLength: stream.totalLength, memoryOnly: memoryOnly, playbackRate: readAheadRate)
+        readAheadWindow.extend(after: cursor, totalLength: stream.totalLength, memoryOnly: memoryOnly, playbackRate: readAheadRate, duration: stream.mediaDuration)
         readAheadWindow.skipConsumedChunks(before: cursor)
         if readAheadTask == nil {
             guard readAheadWindow.hasPendingRange else { return }
             let generation = UUID(); readAheadGeneration = generation
             let stream = stream
-            readAheadTask = Task(priority: .utility) { [weak self] in
+            readAheadTask = Task(priority: bufferedWallSeconds < 12 ? .userInitiated : .utility) { [weak self] in
                 var completed = false
                 var storageFailed = false
                 do {
@@ -326,6 +345,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
         queue.async { [weak self] in
             guard let self, self.readAheadGeneration == generation else { return }
             self.readAheadTask = nil
+            if !continueIfExtended { self.retryReadAheadAfter = ProcessInfo.processInfo.systemUptime + 2 }
             if storageFailed {
                 self.readAheadStorageFailed = true
                 self.readAheadWindow = ReadAheadWindow()
@@ -338,6 +358,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
     }
 
     private func cancelReadAhead() {
+        retryReadAheadAfter = 0
         readAheadGeneration = UUID()
         readAheadTask?.cancel(); readAheadTask = nil
         readAheadWindow = ReadAheadWindow()

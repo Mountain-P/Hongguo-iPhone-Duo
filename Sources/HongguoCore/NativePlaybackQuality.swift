@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-only
 import Foundation
 
-/// A source-selection preference, not adaptive bitrate or an in-flight video switch.
+/// Best/low rendition selection, plus an opt-in conservative adaptive playback policy.
 public enum NativePlaybackQuality: String, Codable, CaseIterable, Sendable, Identifiable {
-    case automatic, dataSaver
+    case automatic, smooth, dataSaver
     public var id: String { rawValue }
-    public var title: String { self == .automatic ? "自動（最佳可用）" : "省流量" }
+    public var title: String {
+        switch self {
+        case .automatic: "自動（最佳可用）"
+        case .smooth: "自動流暢"
+        case .dataSaver: "省流量"
+        }
+    }
+    public var sourcePreference: Self { self == .smooth ? .automatic : self }
 }
 
 /// The selected rendition's displayable facts. Contains no media URL, key or identity.

@@ -195,7 +195,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
 
     private func updateLoaderReadAheadEligibility() {
         let canReadAhead = (prefetchNetworkAllowed || !isPreview) && sceneActive && hasStarted
-            && playbackSpeed.wantsPlayback && !isLoading && errorMessage == nil
+            && playbackSpeed.wantsPlayback && !isLoading && errorMessage == nil && recoveryPreparation == nil
         setLoaderReadAheadEnabled(canReadAhead, memoryOnly: !prefetchNetworkAllowed)
     }
 
@@ -235,6 +235,9 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         let eligible = didStart && hasStarted && sceneActive && playbackSpeed.wantsPlayback
             && !isLoading && !reachedEnd && errorMessage == nil
         let waiting = eligible && isBuffering
+        let inspectedGeneration = generation
+        inspectPlaybackContinuity()
+        guard generation == inspectedGeneration else { return }
         showsBufferingIndicator = bufferingIndicator.update(waiting: waiting, eligible: eligible, at: now)
         let action = stallRecovery.update(.init(time: now, position: resumePosition, waiting: waiting,
             wantsPlayback: playbackSpeed.wantsPlayback, sceneActive: sceneActive,
@@ -249,8 +252,9 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             }
             traceHealth("reload")
             if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: true) }
+            let prepared = takeRecoveryPreparation()
             beginLoad(episode, position: position, fresh: true, autoplay: playbackSpeed.wantsPlayback,
-                      continuingDiagnostics: true, preservingPosition: true)
+                      continuingDiagnostics: true, preservingPosition: true, preparedTask: prepared)
             return
         case .stopWaiting:
             traceHealth("exhausted")
@@ -289,6 +293,121 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         return true
     }
 
+    /// Inspect while playback still has data, rather than discovering a retired
+    /// range session only after AVPlayer has drained its buffer.
+    private func inspectPlaybackContinuity() {
+        let eligible = !isPreview && sceneActive && hasStarted && !isLoading && !isSeeking && !reachedEnd
+            && playbackSpeed.wantsPlayback && errorMessage == nil && !isSwitchingQuality
+            && PlaybackNetworkAvailability.shared.isAvailable
+        updateLoaderReadAheadEligibility()
+        let buffer = bufferedSeconds(at: resumePosition)
+        let wall = buffer / Double(effectiveSpeed)
+        PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner,
+            constrained: eligible && wall < min(12, max(0, duration - resumePosition) / Double(effectiveSpeed)))
+        progressiveLoader?.updatePlaybackBuffer(mediaSeconds: buffer, rate: effectiveSpeed)
+        guard eligible, let loader = progressiveLoader, let episode = currentEpisode else { return }
+        // A temporary slowdown may clear while the replacement is preparing.
+        // Do not replace a now-healthy item later just because it approaches EOF.
+        let remaining = max(0, duration - resumePosition)
+        if recoveryPreparation != nil, !isBuffering,
+           (duration > 0 && buffer >= remaining || (!recoveryIsTerminal && wall >= 15)) {
+            cancelRecoveryPreparation()
+            updateLoaderReadAheadEligibility()
+            return
+        }
+        if recoveryPrepared, wall <= 2 || isBuffering {
+            adoptRecoveryPreparation()
+            return
+        }
+        guard recoveryPreparation == nil, continuityInspection == nil, stallRecovery.canPrepareRecovery else { return }
+        let requestGeneration = generation
+        continuityInspection = Task { @MainActor [weak self] in
+            let blocked = await loader.unrecoverableTerminalError()
+            let terminal = await loader.recoverableTerminalError() != nil
+            guard let self, !Task.isCancelled, self.generation == requestGeneration else { return }
+            self.continuityInspection = nil
+            if let blocked {
+                self.handleFailure(generation: requestGeneration, error: blocked)
+                return
+            }
+            let needed = self.duration > 0 ? Double(loader.totalLength) / self.duration * Double(self.effectiveSpeed) : 0
+            guard let reason = self.continuityPolicy.update(now: ProcessInfo.processInfo.systemUptime,
+                eligible: self.sceneActive && self.playbackSpeed.wantsPlayback && !self.isSeeking && !self.isLoading,
+                terminal: terminal, waiting: self.isBuffering, bufferedWallSeconds: wall,
+                requiredBytesPerSecond: needed, transfer: loader.transferSnapshot) else { return }
+            self.prepareRecovery(episode: episode, reason: reason)
+        }
+    }
+
+    private func prepareRecovery(episode: Episode, reason: PlaybackContinuityPolicy.Reason) {
+        guard recoveryPreparation == nil else { return }
+        let native = service as? NativeCatalogService
+        cancelNextEpisodePrefetch()
+        progressiveLoader?.noteBufferStarvation()
+        let downgrade = playbackQuality == .smooth && triedAlternateForEpisode && reason != .terminal
+            && native != nil && native?.playbackQuality != .dataSaver
+        let candidate: any CatalogService = downgrade ? native!.selectingPlaybackQuality(.dataSaver) : service
+        let requestGeneration = generation, token = UUID(), seriesID = series.id
+        recoveryToken = token; recoveryService = candidate; recoveryPrepared = false
+        recoveryIsTerminal = reason == .terminal
+        let priorVariant = nativeVariant
+        recoveryPreparation = Task { @MainActor [weak self] in
+            do {
+                let source = try await PlaybackTransferContext.$raceAlternates.withValue(true) {
+                    try await candidate.playback(seriesID: seriesID, episodeID: episode.id, fresh: true)
+                }
+                try Task.checkCancellation()
+                guard let self else { throw CancellationError() }
+                guard self.generation == requestGeneration, self.recoveryToken == token else { return source }
+                guard self.sceneActive, self.playbackSpeed.wantsPlayback else { throw CancellationError() }
+                self.recoveryPrepared = true
+                if downgrade, let variant = source.nativeStream?.variant, !variant.qualityFallback,
+                   variant.width != priorVariant?.width || variant.height != priorVariant?.height || variant.quality != priorVariant?.quality {
+                    self.traceHealth("lower quality prepared")
+                }
+                self.traceHealth("replacement prepared")
+                return source
+            } catch {
+                if let self, self.generation == requestGeneration, self.recoveryToken == token {
+                    self.recoveryPreparation = nil; self.recoveryService = nil; self.recoveryPrepared = false
+                    self.traceHealth("replacement preparation failed")
+                }
+                throw error
+            }
+        }
+        setLoaderReadAheadEnabled(false)
+        traceHealth("preparing replacement")
+    }
+
+    private func adoptRecoveryPreparation() {
+        guard let episode = currentEpisode, recoveryPrepared, recoveryPreparation != nil,
+              stallRecovery.requestReload() else { return }
+        let prepared = takeRecoveryPreparation()
+        if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: true) }
+        traceHealth("adopting replacement")
+        beginLoad(episode, position: resumePosition, fresh: true, autoplay: playbackSpeed.wantsPlayback,
+                  continuingDiagnostics: true, preservingPosition: true, preparedTask: prepared)
+    }
+
+    private func takeRecoveryPreparation() -> Task<PlaybackSource, any Error>? {
+        let task = recoveryPreparation
+        if task != nil {
+            if let recoveryService { service = recoveryService }
+            triedAlternateForEpisode = true
+        }
+        recoveryPreparation = nil; recoveryService = nil; recoveryPrepared = false
+        // The task is now owned by beginLoad; its generation check must allow adoption.
+        recoveryToken = UUID()
+        return task
+    }
+
+    private func cancelRecoveryPreparation() {
+        recoveryToken = UUID()
+        continuityInspection?.cancel(); continuityInspection = nil
+        recoveryPreparation?.cancel(); recoveryPreparation = nil
+        recoveryService = nil; recoveryPrepared = false
+    }
+
     private func traceHealth(_ action: String) {
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("-playback-health-diagnostics") {
@@ -302,6 +421,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
               hasStarted, sceneActive, !isLoading, !isSwitchingQuality,
               playbackQuality != preference else { return }
         clearQualityNotice()
+        cancelRecoveryPreparation()
         cancelNextEpisodePrefetch()
         let token = UUID(); qualityGeneration = token
         let requestGeneration = generation
@@ -330,6 +450,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 } ?? false
                 self.service = candidateService
                 self.playbackQuality = preference
+                self.triedAlternateForEpisode = false
                 if same {
                     self.showQualityNotice("目前已是所選模式的可用畫質。")
                     self.updateNextEpisodePrefetch()
@@ -341,7 +462,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 if self.stallRecovery.isExhausted { self.stallRecovery.reset() }
                 self.beginLoad(episode, position: position, fresh: false, autoplay: autoplay,
                                preparedSource: source, preservingPosition: true)
-                self.showQualityNotice(preference == .dataSaver ? "已切換為流暢優先" : "已切換為畫質優先")
+                self.showQualityNotice("已切換為" + preference.title)
                 self.traceHealth("qualityChanged")
             } catch {
                 guard let self, self.qualityGeneration == token, self.generation == requestGeneration else { return }
@@ -421,6 +542,15 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private var seekCoordinator = PlaybackSeekCoordinator()
     private var replaySeekToken: UUID?
     private var healthTask: Task<Void, Never>?
+    private var continuityInspection: Task<Void, Never>?
+    private var continuityPolicy = PlaybackContinuityPolicy()
+    private var recoveryPreparation: Task<PlaybackSource, any Error>?
+    private var recoveryPrepared = false
+    private var recoveryIsTerminal = false
+    private var recoveryService: (any CatalogService)?
+    private var recoveryToken = UUID()
+    private var triedAlternateForEpisode = false
+    private let networkPriorityOwner = UUID()
     private var stallRecovery = PlaybackStallRecoveryState()
     private var bufferingIndicator = BufferingIndicatorPolicy()
     private var qualityTask: Task<Void, Never>?
@@ -512,6 +642,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         guard episode.isAvailable else { return }
         retryCount = 0
         stallRecovery.reset()
+        triedAlternateForEpisode = false
         beginLoad(episode, position: position, fresh: false, autoplay: true)
     }
 
@@ -540,6 +671,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private func enqueueSeek(to seconds: Double, kind: PlaybackSeekCoordinator.Kind) {
         guard hasStarted, sceneActive, !isLoading, errorMessage == nil, seconds.isFinite else { return }
         let target = min(max(0, seconds), duration > 0 ? duration : .greatestFiniteMagnitude)
+        cancelRecoveryPreparation()
+        continuityPolicy = PlaybackContinuityPolicy()
         let request = seekCoordinator.submit(target: target, kind: kind)
         isSeeking = seekCoordinator.isSeeking
         pendingSeekTarget = seekCoordinator.pendingTarget
@@ -645,6 +778,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func pauseAndSave() {
+        cancelRecoveryPreparation()
+        PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner, constrained: false)
         clearAudioPlaybackNotice()
         if let id = diagnosticsID { PlaybackDiagnostics.shared.recordPause(id: id) }
         cancelNextEpisodePrefetch()
@@ -670,6 +805,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func stop() {
+        cancelRecoveryPreparation()
+        PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner, constrained: false)
         clearAudioPlaybackNotice()
         cancelQualitySwitch()
         clearQualityNotice()
@@ -696,7 +833,10 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
 
     private func beginLoad(_ episode: Episode, position: Double, fresh: Bool, autoplay: Bool,
                            continuingDiagnostics: Bool = false, preparedSource: PlaybackSource? = nil,
-                           preservingPosition: Bool = false) {
+                           preservingPosition: Bool = false,
+                           preparedTask: Task<PlaybackSource, any Error>? = nil) {
+        cancelRecoveryPreparation()
+        continuityPolicy = PlaybackContinuityPolicy()
         clearAudioPlaybackNotice()
         cancelQualitySwitch()
         cancelNextEpisodePrefetch()
@@ -733,11 +873,18 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         monitorStartup(requestGeneration)
         let service = self.service
         let seriesID = series.id
+        let nextPrefetcher = self.nextPrefetcher
         loadTask = Task { [weak self] in
             do {
                 let source: PlaybackSource
-                if let preparedSource { source = preparedSource }
-                else { source = try await service.playback(seriesID: seriesID, episodeID: episode.id, fresh: fresh) }
+                if let preparedTask {
+                    source = try await withTaskCancellationHandler { try await preparedTask.value } onCancel: { preparedTask.cancel() }
+                } else if let preparedSource { source = preparedSource }
+                else if !fresh, let opening = await nextPrefetcher.takePrepared(seriesID: seriesID, episodeID: episode.id,
+                    preference: (service as? NativeCatalogService)?.playbackQuality) {
+                    source = opening
+                    self?.traceHealth("prefetched opening adopted")
+                } else { source = try await service.playback(seriesID: seriesID, episodeID: episode.id, fresh: fresh) }
                 try Task.checkCancellation()
                 guard let self, self.generation == requestGeneration else { return }
                 self.configure(source: source, generation: requestGeneration)
@@ -858,6 +1005,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 }
                 self.updateDuration()
                 self.updateBufferedRanges()
+                self.inspectPlaybackContinuity()
                 self.updateNextEpisodePrefetch()
                 if Date().timeIntervalSince(self.lastSavedAt) >= 5 { self.saveProgress() }
             }
@@ -905,8 +1053,9 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         if willRetry {
             let resumeAfterRecovery = playbackSpeed.wantsPlayback
             retryCount = 1
+            let prepared = takeRecoveryPreparation()
             beginLoad(episode, position: resumePosition, fresh: true, autoplay: resumeAfterRecovery,
-                      continuingDiagnostics: true, preservingPosition: hasStarted || preservesResumePosition)
+                      continuingDiagnostics: true, preservingPosition: hasStarted || preservesResumePosition, preparedTask: prepared)
         } else {
             finishDiagnostics(outcome: .failed)
             if isLoading {
@@ -983,17 +1132,17 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             bufferedAhead: bufferedSeconds(at: elapsed),
             allowed: !isPreview && service is NativeCatalogService && autoNext && sceneActive && hasStarted
                 && playbackSpeed.wantsPlayback && isPlaying && !isLoading && !isBuffering
-                && errorMessage == nil && prefetchNetworkAllowed)
+                && errorMessage == nil && prefetchNetworkAllowed && recoveryPreparation == nil)
         switch nextPrefetchState.update(episodeID: currentEpisode.id, nextEpisodeID: nextEpisode?.id, context: context) {
         case .none: break
         case .cancel: cancelNextEpisodePrefetch()
         case .prepare(let episodeID):
             nextPrefetchTask?.cancel()
-            let service = service, seriesID = series.id, prefetcher = nextPrefetcher
+            let service = service, seriesID = series.id, prefetcher = nextPrefetcher, rate = effectiveSpeed
             nextPrefetchTask = Task(priority: .utility) {
                 do {
                     try Task.checkCancellation()
-                    _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service)
+                    _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service, warmOpening: true, playbackRate: rate)
                 } catch { /* Optional work cannot become a visible playback error. */ }
             }
         }
@@ -1046,6 +1195,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     private func clearItem(autoplay: Bool = false) {
+        PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner, constrained: false)
+        cancelRecoveryPreparation()
         cancelStartupWatchdog()
         healthTask?.cancel(); healthTask = nil
         bufferingIndicator.reset()

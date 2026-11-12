@@ -323,8 +323,11 @@ public actor OfflineDownloads {
                     let result: Result<Data, any Error>
                     do {
                         try Task.checkCancellation()
-                        try await provider(item, destination, maximumBytes) { [weak self] bytes, total in
-                            await self?.receiveProgress(token: token, bytes: bytes, total: total)
+                        try await PlaybackTransferContext.$isBackground.withValue(true) {
+                            try await PlaybackNetworkPriority.shared.waitForForeground()
+                            try await provider(item, destination, maximumBytes) { [weak self] bytes, total in
+                                await self?.receiveProgress(token: token, bytes: bytes, total: total)
+                            }
                         }
                         try Task.checkCancellation()
                         let size = try Disk.validatedSize(destination, maximumBytes: maximumBytes)

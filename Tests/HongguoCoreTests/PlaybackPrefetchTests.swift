@@ -146,4 +146,21 @@ struct PlaybackPrefetchTests {
         #expect(try await active.value == .prepared)
         #expect(await gate.calls == ["2"])
     }
+    @Test func formalOpeningIsFetchedAndHandedOffOnceWithoutAnotherSourceLookup() async throws {
+        let fixture = streamFixture(payload: Data(repeating: 0x31, count: 3 * 1024 * 1024), samples: 1)
+        let bytes = PrefetchFixtureBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: nativeSource(), fetcher: bytes)
+        let service = PrefetchFixtureService { _ in .init(url: stream.assetURL, nativeStream: stream) }
+        let prefetch = NativePlaybackPrefetch()
+        #expect(try await prefetch.prepare(seriesID: "1", episodeID: "2", service: service,
+            warmOpening: true, playbackRate: 2) == .prepared)
+        #expect(await prefetch.takePrepared(seriesID: "1", episodeID: "2", preference: .dataSaver) == nil)
+        let prepared = try #require(await prefetch.takePrepared(seriesID: "1", episodeID: "2", preference: .automatic))
+        #expect(prepared.nativeStream?.id == stream.id)
+        let before = await bytes.ranges.count
+        _ = try await stream.read(range: 300_000..<1_500_000)
+        #expect(await bytes.ranges.count == before)
+        #expect(await prefetch.takePrepared(seriesID: "1", episodeID: "2") == nil)
+    }
+
 }

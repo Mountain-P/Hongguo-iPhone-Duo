@@ -18,8 +18,19 @@ struct NativeRangeValidators: Sendable, Equatable {
     var etag: String?
     var lastModified: String?
     init(etag: String? = nil, lastModified: String? = nil) { self.etag = etag; self.lastModified = lastModified }
+    var strongETag: String? {
+        guard let etag else { return nil }
+        let bytes = Array(etag.utf8)
+        guard bytes.count >= 2, bytes.first == 0x22, bytes.last == 0x22,
+              bytes.dropFirst().dropLast().allSatisfy({ $0 == 0x21 || (0x23...0x7e).contains($0) || $0 >= 0x80 }) else { return nil }
+        return etag
+    }
+
     func accepts(_ next: Self) -> Bool {
-        (etag == nil || etag == next.etag) && (lastModified == nil || lastModified == next.lastModified)
+        // RFC 9110 8.8.1: within this bound resource, a matching strong tag
+        // identifies the bytes even when a CDN changes its modification date.
+        if let strongETag { return strongETag == next.strongETag }
+        return (etag == nil || etag == next.etag) && (lastModified == nil || lastModified == next.lastModified)
     }
 }
 
@@ -88,10 +99,12 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
         var data = Data()
         var cancelled = false
         var finished = false
+        var startedAt: TimeInterval?
         var redirects = 0
         var approvedRedirectURL: URL?
         init(range: Range<Int>) { self.range = range }
     }
+    let health = NativeTransferHealth()
     private let source: NativeMediaSource
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.range-http")
     private let configuration: URLSessionConfiguration
@@ -124,6 +137,7 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
 
     func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
         try Task.checkCancellation()
+        if PlaybackTransferContext.isBackground { try await PlaybackNetworkPriority.shared.waitForForeground() }
         guard range.lowerBound >= 0, range.upperBound > range.lowerBound, range.count <= 8 * 1024 * 1024 else { throw NativeProgressiveError.invalidRange }
         do {
             return try await fetchOnce(range: range)
@@ -170,9 +184,11 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
             request.setValue("https://novel.snssdk.com/", forHTTPHeaderField: "Referer")
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             // If-Range also prevents combining bytes from a changed CDN object.
-            if let value = validators?.etag ?? validators?.lastModified { request.setValue(value, forHTTPHeaderField: "If-Range") }
+            if let value = validators?.strongETag { request.setValue(value, forHTTPHeaderField: "If-Range") }
             let task = session.dataTask(with: request)
             transfer.task = task; taskIDs[task.taskIdentifier] = id
+            transfer.startedAt = ProcessInfo.processInfo.systemUptime
+            health.begin(id: transfer.id)
             active += 1; task.resume()
         }
     }
@@ -207,6 +223,7 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
         guard let transfer = transfer(dataTask), !transfer.finished else { return }
         guard let metadata = transfer.metadata, data.count <= metadata.range.count - transfer.data.count else { finish(transfer, error: NativeProgressiveError.invalidRange); return }
         transfer.data.append(data)
+        health.received(id: transfer.id)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
@@ -275,6 +292,14 @@ final class NativeRangeHTTP: NSObject, NativeRangeFetching, URLSessionDataDelega
 
     private func finish(_ transfer: Transfer, response: NativeRangeResponse? = nil, error: (any Error)? = nil, startNext: Bool = true) {
         guard !transfer.finished else { return }; transfer.finished = true
+        if let start = transfer.startedAt {
+            let cancelled = transfer.cancelled || error is CancellationError
+            health.finish(id: transfer.id, bytes: response?.data.count ?? 0, cancelled: cancelled)
+            if !cancelled, let host = source.url.host {
+                NativeCDNPerformance.shared.record(host: host, bytes: response?.data.count ?? 0,
+                    seconds: ProcessInfo.processInfo.systemUptime - start, failed: error != nil)
+            }
+        }
         if let task = transfer.task { taskIDs.removeValue(forKey: task.taskIdentifier); active -= 1; task.cancel() }
         transfers.removeValue(forKey: transfer.id)
         let continuation = transfer.continuation; transfer.continuation = nil

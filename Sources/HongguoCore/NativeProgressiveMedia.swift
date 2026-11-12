@@ -81,6 +81,7 @@ public actor NativeProgressiveMedia {
             let direct = candidates.remove(at: preferred)
             candidates.insert(direct, at: 0)
         }
+        candidates = NativeCDNPerformance.shared.ranked(candidates)
         let deadline = ContinuousClock.now + .seconds(30)
         if NativePrefetchContext.maximumBytes != nil {
             return try await prepare(source: candidates[0], episodeID: episodeID, fresh: fresh, deadline: deadline)
@@ -95,6 +96,38 @@ public actor NativeProgressiveMedia {
             let failed = candidates.removeFirst()
             candidates.insert(preferred, at: 0)
             candidates.append(failed)
+        }
+        if fresh, PlaybackTransferContext.raceAlternates, candidates.count > 1 {
+            // Race at most two independently validated streams. Their bytes and
+            // decryption plans are never shared. The losing preparation is cancelled.
+            let pair = Array(candidates.prefix(2))
+            do {
+                return try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
+                    for (index, candidate) in pair.enumerated() {
+                        group.addTask {
+                            if index > 0 { try await Task.sleep(for: .milliseconds(250)) }
+                            return try await self.prepare(source: candidate, episodeID: episodeID, fresh: true, deadline: deadline)
+                        }
+                    }
+                    defer { group.cancelAll() }
+                    var lastError: any Error = NativeMediaError.network
+                    while let result = await group.nextResult() {
+                        switch result {
+                        case .success(let stream): try Task.checkCancellation(); return stream
+                        case .failure(let error):
+                            try Task.checkCancellation()
+                            guard PlaybackRecovery.shouldRetryAssetRead(error) else { throw error }
+                            lastError = error
+                        }
+                    }
+                    throw lastError
+                }
+            } catch {
+                try Task.checkCancellation()
+                guard candidates.count > 2, ContinuousClock.now < deadline,
+                      PlaybackRecovery.shouldRetryAssetRead(error) else { throw error }
+                candidates.removeFirst(2)
+            }
         }
         for candidate in candidates.dropLast() {
             do { return try await prepare(source: candidate, episodeID: episodeID, fresh: fresh, deadline: deadline) }
@@ -261,6 +294,7 @@ public actor NativeMediaStream: Hashable {
     public nonisolated let id: UUID
     public nonisolated let totalLength: Int
     public nonisolated let preparationByteCount: Int
+    public nonisolated let mediaDuration: Double?
     public nonisolated let variant: NativeMediaVariant
     public nonisolated var assetURL: URL { URL(string: "hongguo-native://\(id.uuidString.lowercased())/video.mp4")! }
     private let fetcher: any NativeRangeFetching
@@ -309,6 +343,7 @@ public actor NativeMediaStream: Hashable {
          variant: NativeMediaVariant, diskCache: NativeChunkDiskCache? = nil, onRouteFailure: (@Sendable () -> Void)? = nil) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
         self.preparationByteCount = preparationByteCount ?? prefix.count
+        self.mediaDuration = NativeMovieDuration.seconds(in: prefix)
         self.variant = variant
         self.diskCache = diskCache
         self.onRouteFailure = onRouteFailure
@@ -324,8 +359,17 @@ public actor NativeMediaStream: Hashable {
     var pendingDiskWriteCount: Int { diskWriteCount }
     public func trimCachedChunks() { cache.removeAll(); cacheBytes = 0 }
 
+    public nonisolated var transferSnapshot: PlaybackTransferSnapshot {
+        (fetcher as? NativeRangeHTTP)?.health.snapshot ?? .init()
+    }
+
     public nonisolated func noteBufferStarvation() {
         onRouteFailure?()
+    }
+
+    public var unrecoverableTerminalError: (any Error)? {
+        guard let permanentFailure, !PlaybackRecovery.shouldRetryAssetRead(permanentFailure) else { return nil }
+        return permanentFailure
     }
 
     public var recoverableTerminalError: (any Error)? {

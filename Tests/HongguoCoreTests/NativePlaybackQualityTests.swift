@@ -24,6 +24,15 @@ struct NativePlaybackQualityTests {
         #expect(store.load() == .automatic)
     }
 
+    @Test func adaptivePolicyUsesSupportedBestSourceRequestAndRetainsItsSeparatePreference() throws {
+        let raw = #"{"url":"https://unit.fqnovelvod.com/video.mp4","userAgent":"Fixture","codec":"h264","quality":"1080p","preference":"automatic","width":1080,"height":1920}"#
+        #expect(NativePlaybackQuality.smooth.sourcePreference == .automatic)
+        let source = try NativeJSRuntime.parseSource(raw, preference: .smooth, offlineDirect: false)
+        #expect(source.preference == .smooth)
+        #expect(source.width == 1080)
+        #expect(throws: (any Error).self) { try NativeJSRuntime.parseSource(raw, preference: .dataSaver, offlineDirect: false) }
+    }
+
     @Test func sourceCacheSeparatesPoliciesEvenWhenProviderReturnsTheSameVariant() async throws {
         let calls = QualitySourceCalls()
         let resolver = NativeSourceResolver(resolveQuality: { _, _, quality in

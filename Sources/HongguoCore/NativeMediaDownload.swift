@@ -252,6 +252,7 @@ private final class NativeMediaTransfer: NSObject, URLSessionDataDelegate, @unch
                         request.setValue("https://novel.snssdk.com/", forHTTPHeaderField: "Referer")
                         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
                         task = session.dataTask(with: request)
+                        if offlineProgress != nil { task?.priority = URLSessionTask.lowPriority }
                         task?.resume()
                     } catch { finish(NativeMediaError.storage) }
                 }

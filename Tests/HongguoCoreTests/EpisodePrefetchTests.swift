@@ -59,4 +59,11 @@ struct EpisodePrefetchTests {
         #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(99, rate: 2, buffer: 0.99)) == .cancel)
         #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(99, rate: 2, buffer: 1)) == .prepare("2"))
     }
+    @Test func aFullyBufferedTailCanWarmTheNextOpeningThirtyWallSecondsEarly() {
+        var state = EpisodePrefetchState()
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(40, rate: 2, buffer: 59)) == .none)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(40, rate: 2, buffer: 60)) == .prepare("2"))
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(42, rate: 2, buffer: 30)) == .cancel)
+    }
+
 }

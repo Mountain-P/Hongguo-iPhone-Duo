@@ -46,7 +46,7 @@ final class NativeJSRuntime: @unchecked Sendable {
 
     func resolve(episodeID: String, contentType: String, quality preference: NativePlaybackQuality = .automatic,
                  offlineDirect: Bool = false) async throws -> NativeMediaSource {
-        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.rawValue, offlineDirect])
+        let arguments = try JSONSerialization.data(withJSONObject: [episodeID, contentType, preference.sourcePreference.rawValue, offlineDirect])
         let raw = try await run(script: "__startResolve(..." + String(decoding: arguments, as: UTF8.self) + ")")
         try Task.checkCancellation()
         return try Self.parseSource(raw, preference: preference, offlineDirect: offlineDirect)
@@ -59,7 +59,7 @@ final class NativeJSRuntime: @unchecked Sendable {
               let userAgent = object["userAgent"] as? String, userAgent.utf8.count < 1024, !userAgent.contains("\n"), !userAgent.contains("\r"),
               let codec = object["codec"] as? String, ["h264", "avc", "avc1", "hevc", "h265", "hvc1", "hev1"].contains(codec),
               let quality = object["quality"] as? String, quality.utf8.count <= 128,
-              object["preference"] as? String == preference.rawValue else { throw NativeSourceError(code: "NO_COMPATIBLE_SOURCE") }
+              object["preference"] as? String == preference.sourcePreference.rawValue else { throw NativeSourceError(code: "NO_COMPATIBLE_SOURCE") }
         let key: Data?
         if let hex = object["contentKey"] as? String, !hex.isEmpty {
             guard hex.range(of: #"^[0-9a-fA-F]{32}$"#, options: .regularExpression) != nil else { throw NativeSourceError(code: "INVALID_RESPONSE") }

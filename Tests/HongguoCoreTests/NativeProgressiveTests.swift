@@ -8,16 +8,17 @@ private actor ProgressiveBytes: NativeRangeFetching {
     var ranges: [Range<Int>] = []
     var changeAfter: Int?
     var delay = false
+    var delayDuration = Duration.milliseconds(50)
     var cancellations = 0
     var failure: (any Error)?
     init(_ bytes: Data) { self.bytes = bytes }
     func setChanged() { changeAfter = ranges.count }
-    func setDelay() { delay = true }
+    func setDelay(_ duration: Duration = .milliseconds(50)) { delay = true; delayDuration = duration }
     func setFailure(_ error: (any Error)?) { failure = error }
     func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
         ranges.append(range)
         if delay {
-            do { try await Task.sleep(for: .milliseconds(50)) }
+            do { try await Task.sleep(for: delayDuration) }
             catch { cancellations += 1; throw error }
         }
         try Task.checkCancellation()
@@ -397,4 +398,52 @@ private final class ProgressiveClock: @unchecked Sendable {
     private var value = Date(timeIntervalSince1970: 1_000)
     var now: Date { lock.withLock { value } }
     func advance(_ seconds: TimeInterval) { lock.withLock { value.addTimeInterval(seconds) } }
+
+}
+
+struct NativeRecoveryRaceTests {
+    private func source() -> NativeMediaSource {
+        .init(url: URL(string: "https://unit.fqnovelvod.com/video.mp4")!, contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
+    }
+    @Test func recoveryRacesBoundedIndependentStreamsAndCancelsTheSlowLoser() async throws {
+        let firstBytes = ProgressiveBytes(streamFixture(payload: Data(repeating: 0x11, count: 400_000), samples: 1).data)
+        let fastFixture = streamFixture(payload: Data(repeating: 0x22, count: 400_000), samples: 1)
+        let fastBytes = ProgressiveBytes(fastFixture.data)
+        await firstBytes.setDelay(.seconds(5))
+        let backup = source()
+        let primary = NativeMediaSource(url: URL(string: "https://slow.qznovelvod.com/file.mp4")!,
+            contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
+        let media = NativeProgressiveMedia(makeFetcher: { $0.url == primary.url ? firstBytes : fastBytes })
+        let stream = try await PlaybackTransferContext.$raceAlternates.withValue(true) {
+            try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+        }
+        #expect(try await stream.read(range: 0..<fastFixture.data.count) == fastFixture.data)
+        #expect(await firstBytes.cancellations == 1)
+        #expect(await firstBytes.ranges.count == 1)
+    }
+
+    @Test func streamDistinguishesPermanentDenialFromRecoverableRouteFailure() async throws {
+        let bytes = ProgressiveBytes(streamFixture(payload: Data(repeating: 1, count: 900_000), samples: 1).data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        await bytes.setFailure(CatalogError.httpStatus(403))
+        await #expect(throws: CatalogError.httpStatus(403)) { try await stream.read(range: 600_000..<600_020) }
+        #expect(await stream.recoverableTerminalError == nil)
+        #expect(await stream.unrecoverableTerminalError as? CatalogError == .httpStatus(403))
+    }
+
+    @Test func recoveryRaceDoesNotRetryAnExplicitProviderDenial() async throws {
+        let bytes = ProgressiveBytes(streamFixture(payload: Data([1,2,3]), samples: 1).data)
+        await bytes.setFailure(CatalogError.httpStatus(403))
+        let backup = source()
+        let primary = NativeMediaSource(url: URL(string: "https://denied.qznovelvod.com/file.mp4")!,
+            contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
+        let media = NativeProgressiveMedia(makeFetcher: { _ in bytes })
+        await #expect(throws: CatalogError.httpStatus(403)) {
+            try await PlaybackTransferContext.$raceAlternates.withValue(true) {
+                try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
+            }
+        }
+        #expect(await bytes.ranges.count == 1)
+    }
+
 }

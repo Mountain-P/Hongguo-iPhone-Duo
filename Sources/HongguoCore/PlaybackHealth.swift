@@ -26,6 +26,7 @@ public struct PlaybackStallRecoveryState: Sendable, Equatable {
     private static let maximumRecoveries = 3
     private static let minimumRecoveryProgress = 10.0
 
+    public var canPrepareRecovery: Bool { !isExhausted && canReload && recoveryCount < Self.maximumRecoveries }
     public var hasAttemptedRecovery: Bool { recoveryCount > 0 }
     public private(set) var isExhausted = false
     private var recoveryCount = 0

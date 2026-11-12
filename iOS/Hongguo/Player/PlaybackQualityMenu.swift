@@ -21,11 +21,12 @@ struct PlaybackQualityMenu: View {
         Menu {
             Section {
                 qualityButton("畫質優先", preference: .automatic)
-                qualityButton("流暢優先", preference: .dataSaver)
+                qualityButton("自動流暢", preference: .smooth)
+                qualityButton("省流量", preference: .dataSaver)
             } header: {
                 Text(currentQuality.map { "目前畫質：\($0)" } ?? "播放畫質")
             }
-            Text("切換會保留進度；可用畫質依來源而定。")
+            Text("自動流暢會在連續緩衝時降低畫質；切換保留進度。")
         } label: {
             Group {
                 if model.isSwitchingQuality {
@@ -41,7 +42,7 @@ struct PlaybackQualityMenu: View {
         .disabled(!model.supportsPlaybackQuality || model.isSwitchingQuality || model.isLoading || model.duration <= 0)
         .accessibilityLabel("播放畫質")
         .accessibilityValue(model.isSwitchingQuality ? "正在切換" :
-            (model.playbackQuality == .automatic ? "畫質優先" : "流暢優先") + (currentQuality.map { "，\($0)" } ?? ""))
+            model.playbackQuality.title + (currentQuality.map { "，\($0)" } ?? ""))
     }
 
     private func qualityButton(_ title: String, preference: NativePlaybackQuality) -> some View {
