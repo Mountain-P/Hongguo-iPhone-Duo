@@ -6,6 +6,7 @@
 // bounded HTTPS transport; exact episode matching; supported codec selection.
 // Crypto tables and SDK protocol constants below are not user credentials.
 const crypto = require('node:crypto');
+const { gzipSync } = require('node:zlib');
 const { registerPlaybackDevice } = require('./playback-device');
 const sm3 = require('./sm3');
 const { normalizeDownloadQuality, meetsDownloadQuality } = require('./download-quality');
@@ -17,7 +18,7 @@ const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/mult
 const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
-const PLAYBACK_UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
+const PLAYBACK_UA = VIDEO_UA.replace('71332', '74332');
 const SEARCH_UA = 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)';
 const DEVICE = {
     ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
@@ -30,7 +31,7 @@ const DEVICE = {
 const VIDEO_TAB_DEVICE = { ...DEVICE, version_code: '73932', version_name: '7.3.9.32',
     manifest_version_code: '73932', update_version_code: '73932', pv_player: '73932' };
 
-const PRIMARY_INLINE_UA = VIDEO_UA.replace(DEVICE.version_code, '74332');
+const PRIMARY_INLINE_UA = PLAYBACK_UA;
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
@@ -141,28 +142,25 @@ function helios(khronos) {
 
 function branchOf(url, body, khronos) { const bodyMd5 = body ? crypto.createHash('md5').update(body).digest() : Buffer.alloc(16); const q = sm3(url.split('?')[1]); const iv = getIv(getIv(getIv(0x20230928, q), bodyMd5), le32(khronos)); const low = iv & 15; return low - (((low * 171) >> 9) * 3); }
 function playbackRequest(payload, identity, host = new URL(VIDEO_API).hostname) {
-    const body = Buffer.from(payload);
-    const khronos = Math.floor(Date.now() / 1000), ticketBase = Date.now();
+    // Match the current upstream POST contract as well as the primary GET.
+    // The signature and stub must describe the compressed bytes actually sent.
+    const { signPlayer } = require('./playback-signature');
+    const body = gzipSync(Buffer.from(payload));
+    const requestTicket = Date.now(), khronos = Math.floor(requestTicket / 1000);
     // Registration Cookies and other account/profile fields never enter this signed query.
-    const device = { ...DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
-    let query, url, requestTicket;
-    for (let n = 0; n < 256; n += 1) {
-        requestTicket = ticketBase + n;
-        query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
-        url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
-        if (branchOf(url, body, khronos) === 2) break;
-        if (n === 255) throw new Error('无法生成播放请求签名');
-    }
+    const device = { ...DEVICE, version_code: '74332', version_name: '7.4.3.32',
+        manifest_version_code: '74332', update_version_code: '74332', pv_player: '74332',
+        device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
+    const query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
+    const url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
+    const signed = signPlayer({ query, body, ts: khronos });
     return { url, body, headers: {
-        'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
+        'User-Agent': VIDEO_UA.replace(DEVICE.version_code, device.version_code), Accept: 'application/json; charset=utf-8,application/x-protobuf',
         'Content-Type': 'application/json; charset=UTF-8',
-        'x-ss-stub': md5(body), 'passport-sdk-version': '50561',
-        'x-tt-request-tag': 't=0;n=0', 'x-vc-bdturing-sdk-version': '3.7.2.cn',
-        'x-ss-req-ticket': String(requestTicket), 'sdk-version': '2', 'x-xs-from-web': '0',
-        'x-khronos': String(khronos),
-        'x-gorgon': xGorgon(query, body, khronos, Math.floor(Math.random() * 65536)),
-        'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-        'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
+        'Content-Encoding': 'gzip', 'x-ss-stub': signed['x-ss-stub'], 'passport-sdk-version': '5051452',
+        'x-ss-req-ticket': signed['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
+        'x-ss-dp': String(device.aid), 'x-khronos': signed['x-khronos'],
+        'x-ladon': signed['x-ladon'], 'x-argus': signed['x-argus'], 'x-tt-dt': '',
         'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
     } };
 }

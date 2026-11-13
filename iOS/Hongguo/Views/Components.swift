@@ -118,10 +118,15 @@ struct SeriesCard: View {
 @MainActor
 struct SeriesGrid: View {
     let items: [Series]
+    var onSelect: ((Series) -> Void)? = nil
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 145), spacing: 10)], alignment: .leading, spacing: 12) {
             ForEach(items) { series in
-                NavigationLink(value: series) { SeriesCard(series: series) }.buttonStyle(.plain)
+                if let onSelect {
+                    Button { onSelect(series) } label: { SeriesCard(series: series) }.buttonStyle(.plain)
+                } else {
+                    NavigationLink(value: series) { SeriesCard(series: series) }.buttonStyle(.plain)
+                }
             }
         }
     }

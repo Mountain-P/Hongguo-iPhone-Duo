@@ -12,6 +12,7 @@ struct SearchView: View {
     @State private var loadTask: Task<Void, Never>?
     @State private var selectedFilter = SearchResultFilter.all
     @State private var validationError: String?
+    @State private var selectedSeries: Series?
 
     private struct SearchContext: Hashable {
         let revision: UUID
@@ -70,7 +71,7 @@ struct SearchView: View {
                             .font(.footnote).foregroundStyle(Theme.muted)
                     }
                     if !catalog.items.isEmpty { resultFilters }
-                    SeriesGrid(items: filteredItems)
+                    SeriesGrid(items: filteredItems, onSelect: { selectedSeries = $0 })
                     if catalog.isLoading { ProgressView().frame(maxWidth: .infinity).padding() }
                     else if let error = catalog.error {
                         StatusCard(icon: "exclamationmark.magnifyingglass", title: "搜尋暫時無法使用", message: error,
@@ -93,7 +94,15 @@ struct SearchView: View {
         .onSubmit(of: .search) { submit() }
         .onChange(of: text) { _, value in
             validationError = nil
-            if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { submitted = "" }
+            // Search dismissal during navigation can clear its text binding. Keep
+            // the result page alive until the selected detail has been dismissed.
+            if selectedSeries == nil, value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { submitted = "" }
+        }
+        .navigationDestination(item: $selectedSeries) { series in
+            DetailView(series: series).toolbar(.visible, for: .navigationBar)
+        }
+        .onAppear {
+            if text.isEmpty, !submitted.isEmpty { text = submitted }
         }
         .task(id: context) { await activate(context) }
         .onDisappear { cancelLoading() }

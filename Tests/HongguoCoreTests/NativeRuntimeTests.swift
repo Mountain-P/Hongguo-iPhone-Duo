@@ -41,21 +41,69 @@ struct NativeRuntimeTests {
         (() => {
           Date.now = () => 1800000000999;
           const a = require('app-source'), crypto = require('node:crypto');
+          crypto.randomBytes = count => Buffer.alloc(count, 0x12);
           const body = '{"biz_param":{"device_level":3},"mixed_video_id_map":{"1004":["7000000000000000001"]},"label":"測試 & bytes"}\n';
           const identity = {device_id:'7000000000000000001',iid:'7000000000000000002',cdid:'00000000-0000-4000-8000-000000000001',cookie:'sessionid=DO_NOT_USE',version_name:'9.9.9'};
           const p = a.audit.playbackRequest(body, identity), u = new URL(p.url);
-          const headers = ['x-argus','x-gorgon','x-medusa','x-khronos','x-ladon','x-helios'];
-          return { exact: p.body.equals(Buffer.from(body)), stub: p.headers['x-ss-stub'] === crypto.createHash('md5').update(Buffer.from(body)).digest('hex').toUpperCase(),
-            six: headers.every(h=>typeof p.headers[h]==='string' && p.headers[h]), branch: a.audit.branchOf(p.url,p.body,Number(p.headers['x-khronos'])),
+          const expected = require('playback-signature').signPlayer({query:u.search.slice(1),body:p.body,ts:1800000000});
+          const changed = require('playback-signature').signPlayer({query:u.search.slice(1),body:Buffer.from(body),ts:1800000000});
+          return { exact: p.body.equals(require('node:zlib').gzipSync(Buffer.from(body))),
+            stub: p.headers['x-ss-stub'] === crypto.createHash('md5').update(p.body).digest('hex'),
+            signed: ['x-argus','x-ladon','x-khronos','x-ss-req-ticket'].every(h=>p.headers[h]===expected[h]),
+            wireBound: changed['x-argus'] !== p.headers['x-argus'],
+            gzip:p.headers['Content-Encoding'] === 'gzip',
+            current:p.headers['passport-sdk-version'] === '5051452' && p.headers['User-Agent'].includes('/74332 '),
             profile:u.searchParams.get('version_name'), noCookie:!u.searchParams.has('cookie') && !p.headers.Cookie,
             search:new URL(a.signedSearchRequest({keyword:'fixture',identity}).url).searchParams.get('version_name') };
         })()
         """#)
         let value = try dictionary(Data(result.utf8))
-        for key in ["exact", "stub", "six", "noCookie"] { #expect(value[key] as? Bool == true) }
-        #expect(value["branch"] as? Int == 2)
-        #expect(value["profile"] as? String == "7.1.3.32")
+        for key in ["exact", "stub", "signed", "wireBound", "gzip", "current", "noCookie"] { #expect(value[key] as? Bool == true) }
+        #expect(value["profile"] as? String == "7.4.3.32")
         #expect(value["search"] as? String == "7.2.2.32")
+    }
+
+    @Test func emptyPrimaryRecoversThroughCompressedAlternatePost() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (async () => {
+          let registrations=0, gets=0, posts=0, bodies=[];
+          globalThis._nativeHTTP = (id, json) => {
+            const request=JSON.parse(json), url=new URL(request.url);
+            let data='';
+            if(url.pathname.includes('device_register')) {
+              registrations++;
+              data=JSON.stringify({device_id_str:'7000000000000000001',install_id_str:'7000000000000000002'});
+            } else if(request.method==='GET') { gets++; }
+            else {
+              posts++;
+              if(request.headers['Content-Encoding']!=='gzip') throw new Error('Uncompressed recovery request');
+              const wire=Buffer.from(request.body,'base64');
+              const unzipped=JSON.parse(_nativeInvoke('gunzip',JSON.stringify({data:request.body})));
+              bodies.push(JSON.parse(Buffer.from(unzipped.value,'base64').toString('utf8')));
+              if(request.headers['x-ss-stub']!==require('node:crypto').createHash('md5').update(wire).digest('hex')) throw new Error('Incorrect wire stub');
+              if(url.hostname==='api5-normal-hl.fqnovel.com') {
+                data=JSON.stringify({data:{'200':{video_model:{video_list:{main:{main_url:'https://unit.fqnovelvod.com/test.mp4',codec_type:'h264',width:1080,height:1920,encrypt:false}}}}}});
+              }
+            }
+            __httpDone(id,JSON.stringify({status:200,headers:{},data}));
+          };
+          const source=await require('app-source').fetchAppPlayUrl('200',{contentType:'1004'});
+          return {registrations,gets,posts,bodies,route:source.recovery.route,attempts:source.recovery.attempts,
+            correct:source.url==='https://unit.fqnovelvod.com/test.mp4',currentUA:source.userAgent.includes('/74332 ')};
+        })()
+        """#)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["registrations"] as? Int == 2)
+        #expect(value["gets"] as? Int == 1)
+        #expect(value["posts"] as? Int == 2)
+        #expect(value["attempts"] as? Int == 2)
+        #expect(value["route"] as? String == "registered_post")
+        #expect(value["correct"] as? Bool == true)
+        #expect(value["currentUA"] as? Bool == true)
+        for body in try #require(value["bodies"] as? [[String: Any]]) {
+            let ids = try #require(body["mixed_video_id_map"] as? [String: [String]])
+            #expect(ids == ["1004": ["200"]])
+        }
     }
 
     @Test func primaryPlaybackRequestUsesTheRegisteredProfileAndRequestedEpisode() async throws {
