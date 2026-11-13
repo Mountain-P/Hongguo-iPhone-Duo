@@ -142,7 +142,7 @@
             const registrationFailure = error.registrationFailure;
             let code = String(error.code || 'SOURCE_UNAVAILABLE');
             if (Number.isInteger(status) && status >= 400 && status <= 599) code = `HTTP_${status}`;
-            else if (['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(registrationFailure)) {
+            else if (['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'REGISTRATION_UNAVAILABLE'].includes(registrationFailure)) {
                 code = registrationFailure;
             }
             global._nativeComplete(JSON.stringify({ error: code }));

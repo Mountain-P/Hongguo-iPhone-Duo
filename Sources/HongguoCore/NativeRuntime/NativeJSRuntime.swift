@@ -3,6 +3,8 @@ import Foundation
 import JavaScriptCore
 
 final class NativeJSRuntime: @unchecked Sendable {
+    private let identityCache: NativePlaybackIdentityCache?
+    init(identityCache: NativePlaybackIdentityCache? = nil) { self.identityCache = identityCache }
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.native-signer")
     // JavaScriptCore objects are confined to queue, including all native callbacks.
     private var context: JSContext?
@@ -137,19 +139,27 @@ final class NativeJSRuntime: @unchecked Sendable {
         }
         let clear: @convention(block) (Int32) -> Void = { [weak self] id in self?.timers.removeValue(forKey: id)?.cancel() }
         let complete: @convention(block) (String) -> Void = { [weak self] value in self?.complete(.success(value)) }
+        let cache = identityCache ?? (testing ? NativePlaybackIdentityCache() : .shared)
+        let readIdentity: @convention(block) (String) -> String = { cache.read(scope: $0) }
+        let writeIdentity: @convention(block) (String, String) -> Bool = { [weak self] scope, json in
+            guard let self, !self.cancelled, !self.finished else { return false }
+            return cache.write(scope: scope, json: json)
+        }
         context.setObject(invoke, forKeyedSubscript: "_nativeInvoke" as NSString)
         context.setObject(http, forKeyedSubscript: "_nativeHTTP" as NSString)
         context.setObject(cancelHTTP, forKeyedSubscript: "_nativeCancelHTTP" as NSString)
         context.setObject(schedule, forKeyedSubscript: "_nativeSchedule" as NSString)
         context.setObject(clear, forKeyedSubscript: "_nativeClearTimer" as NSString)
         context.setObject(complete, forKeyedSubscript: "_nativeComplete" as NSString)
+        context.setObject(readIdentity, forKeyedSubscript: "_nativeReadPlaybackIdentity" as NSString)
+        context.setObject(writeIdentity, forKeyedSubscript: "_nativeWritePlaybackIdentity" as NSString)
         let modules = ["buffer": "buffer/index", "base64-js": "base64-js/index", "ieee754": "ieee754/index",
                        "app-source": "app-source", "playback-device": "playback-device", "playback-recovery": "playback-recovery",
                        "playback-signature": "playback-signature", "sm3": "sm3", "download-quality": "download-quality",
                        "new-releases": "new-releases", "account-library": "account-library", "native-phone-auth": "native-phone-auth"]
         var sources: [String: String] = [:]
         for (name, path) in modules { sources[name] = try resource(path) }
-        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest, primaryPlaybackRequest, consumeAppPlayResponse, parseAppPlayModel };" }
+        if testing { sources["app-source"]! += "\nmodule.exports.audit = { hashF13, sm3, helios, xGorgon, branchOf, playbackRequest, primaryPlaybackRequest, consumeAppPlayResponse, parseAppPlayModel, playbackDevice };" }
         context.setObject(sources, forKeyedSubscript: "__moduleSources" as NSString)
         context.evaluateScript(try resource("runtime"))
         guard context.exception == nil else { throw NativeSourceError(code: "RUNTIME_BOOTSTRAP") }

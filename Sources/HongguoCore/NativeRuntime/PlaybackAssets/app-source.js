@@ -499,10 +499,23 @@ function boundedSignal(signal, deadline, limit) {
     return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+async function playbackDevice({ scope, signal, deadline, fresh = false }) {
+    checkActive(signal, deadline);
+    const shared = ['tab', 'legacy'].includes(scope)
+        && typeof globalThis._nativeReadPlaybackIdentity === 'function'
+        && typeof globalThis._nativeWritePlaybackIdentity === 'function';
+    if (shared && !fresh) {
+        const cached = JSON.parse(globalThis._nativeReadPlaybackIdentity(scope));
+        if (cached) return Object.freeze(cached);
+    }
+    const identity = await registerPlaybackDevice(requestJson, { isolated: true, signal, deadline });
+    checkActive(signal, deadline);
+    if (shared) globalThis._nativeWritePlaybackIdentity(scope, JSON.stringify(identity));
+    return identity;
+}
+
 const playbackRecovery = createPlaybackRecovery({
-    register: ({ signal, deadline }) => registerPlaybackDevice(requestJson, {
-        isolated: true, signal, deadline,
-    }),
+    register: playbackDevice,
     getModel: (vid, identity, { signal, deadline }) => {
         const request = primaryPlaybackRequest(vid, identity);
         return requestJson(request.url, { method: request.method, headers: request.headers, forbidRedirects: true },

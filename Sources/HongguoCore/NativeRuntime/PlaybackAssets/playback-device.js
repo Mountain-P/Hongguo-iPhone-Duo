@@ -97,6 +97,10 @@ async function registerPlaybackDevice(requestJson, options = {}) {
             const device_id = responseId(response, 'device_id');
             const iid = responseId(response, 'install_id');
             if (Number(response?.code ?? response?.Code ?? 0) !== 0) throw Object.assign(new Error('Registration rejected'), { code: 'BUSINESS_REJECTED' });
+            if (String(response?.device_id_str ?? response?.device_id) === '0'
+                && String(response?.install_id_str ?? response?.install_id) === '0') {
+                throw Object.assign(new Error('Registration temporarily returned no identity'), { code: 'REGISTRATION_UNAVAILABLE' });
+            }
             if (!device_id || !iid) throw Object.assign(new Error('Invalid registration'), { code: 'INVALID_RESPONSE' });
         if (!options.isolated) registrationRetryAfter = 0;
         return Object.freeze({ device_id, iid, cdid, ...(options.captureCookies && cookie ? { cookie } : {}),
@@ -107,7 +111,7 @@ async function registerPlaybackDevice(requestJson, options = {}) {
         const registrationFailure = Number.isInteger(status) && status >= 300 && status <= 599 ? `HTTP_${status}`
             : ['ECONNABORTED', 'ETIMEDOUT'].includes(error?.code) ? 'TIMEOUT'
             : ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error?.code) ? 'NETWORK_ERROR'
-            : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.code) ? error.code : 'UNKNOWN';
+            : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'REGISTRATION_UNAVAILABLE'].includes(error?.code) ? error.code : 'UNKNOWN';
         if (!options.isolated) {
             registrationRetryAfter = Date.now() + 10000;
             lastRegistrationFailure = registrationFailure;

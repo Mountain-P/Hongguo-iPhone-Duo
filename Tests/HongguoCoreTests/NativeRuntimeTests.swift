@@ -241,6 +241,31 @@ struct NativeRuntimeTests {
         }
     }
 
+    @Test(arguments: [false, true])
+    func zeroRegistrationIDsStopImmediateRequestsAndPreserveBusinessDenial(denied: Bool) async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting("""
+        (() => {
+          let requests = 0;
+          const complete = globalThis._nativeComplete;
+          globalThis._nativeComplete = raw => {
+            globalThis._nativeComplete = complete;
+            complete(JSON.stringify({...JSON.parse(raw),requests}));
+          };
+          globalThis._nativeHTTP = (id,json) => {
+            requests++;
+            __httpDone(id,JSON.stringify({status:200,headers:{},data:JSON.stringify({
+              device_id_str:'0',install_id_str:'0',code:\(denied ? 9 : 0)
+            })}));
+          };
+          __startResolve('200','1004');
+          return new Promise(() => {});
+        })()
+        """)
+        let value = try dictionary(Data(result.utf8))
+        #expect(value["error"] as? String == (denied ? "BUSINESS_REJECTED" : "REGISTRATION_UNAVAILABLE"))
+        #expect(value["requests"] as? Int == 1)
+    }
+
     @Test func javascriptRecoveryHonorsBoundsAndTerminalDenials() async throws {
         let result = try await NativeJSRuntime().evaluateForTesting(#"""
         (async () => {

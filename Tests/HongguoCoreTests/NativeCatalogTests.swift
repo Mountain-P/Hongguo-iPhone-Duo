@@ -109,21 +109,22 @@ private actor OfflineSourceProbe: NativeOfflineMediaDownloading {
 }
 
 struct NativeCatalogTests {
-    @Test(arguments: ["OFFLINE_CLEAR_UNAVAILABLE", "HTTP_401", "HTTP_403", "HTTP_429", "BUSINESS_REJECTED", "SECURITY_BLOCKED", "ERR_NETWORK"])
-    func offlineUsesTheExactPlayableEpisodeOnlyWhenNoClearSourceExists(_ code: String) async throws {
+    @Test(arguments: ["OFFLINE_CLEAR_UNAVAILABLE", "EMPTY_RESPONSE", "HTTP_401", "HTTP_403", "HTTP_429", "BUSINESS_REJECTED", "SECURITY_BLOCKED", "ERR_NETWORK"])
+    func offlineUsesTheExactPlayableEpisodeForUnavailableOrTransientDirectSources(_ code: String) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
         let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(episodes: ["200"], accessible: 1))
         let service = NativeCatalogService(transport: transport, quality: .dataSaver)
         let probe = OfflineSourceProbe()
+        let usesPlayable = ["OFFLINE_CLEAR_UNAVAILABLE", "EMPTY_RESPONSE", "ERR_NETWORK"].contains(code)
         do {
             try await service.downloadOffline(seriesID: "100", episodeID: "200", to: directory.appendingPathComponent("episode.mp4"),
                 maximumBytes: 2048, resolve: { try await probe.resolve($0, $1, $2, playable: false, errorCode: code) },
                 resolvePlayable: { try await probe.resolve($0, $1, $2, playable: true) }, downloader: probe, progress: { _, _ in })
             Issue.record("The fixture always stops before publishing")
         } catch {
-            if code == "OFFLINE_CLEAR_UNAVAILABLE" {
+            if usesPlayable {
                 #expect(error as? NativeMediaError == .network)
             } else {
                 #expect((error as? NativeSourceError)?.code == code)
@@ -131,7 +132,6 @@ struct NativeCatalogTests {
         }
         let clear = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1004", quality: .dataSaver, playable: false)
         let playable = OfflineSourceProbe.Resolution(episodeID: "200", contentType: "1004", quality: .dataSaver, playable: true)
-        let usesPlayable = code == "OFFLINE_CLEAR_UNAVAILABLE"
         #expect(await probe.calls == (usesPlayable ? [clear, playable, clear, playable] : [clear]))
         #expect(await probe.transfers.count == (usesPlayable ? 2 : 0))
     }

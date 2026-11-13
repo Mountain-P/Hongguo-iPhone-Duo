@@ -33,6 +33,7 @@ public struct NativeSourceError: Error, Sendable, LocalizedError {
         case "OFFLINE_CLEAR_UNAVAILABLE": "來源未提供可離線儲存的未加密 MP4。"
         case "BUSINESS_REJECTED", "HTTP_401", "HTTP_403": "來源目前未授權提供本集播放。"
         case "EMPTY_RESPONSE": "來源未回傳影片資料，請稍後重試。"
+        case "REGISTRATION_UNAVAILABLE": "來源暫時無法建立播放連線，請稍後重試。"
         case "HTTP_429": "來源暫時限制請求，請稍後重試。"
         case "ETIMEDOUT": "影片準備逾時，請重試。"
         case "APP_INPUT": "分集或內容類型無效。"

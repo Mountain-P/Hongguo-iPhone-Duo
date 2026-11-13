@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Protocol contract checked against aston314/hongguo-tv 36508246eeca2cf5ef1f29f7f17f8e985d50ae2e.
-// Anonymous video_tab identity is separate from each legacy POST resolution.
+// Tab and legacy identities use separate scopes; a second recovery round renews legacy.
 const LEGACY_HOSTS = Object.freeze(['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
 const RETRYABLE_HTTP = new Set([408, 425, 500, 502, 503, 504]);
 const RETRYABLE_NETWORK = new Set(['ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK']);
@@ -14,6 +14,8 @@ function checkActive(signal, deadline, now = Date.now) {
 }
 function terminal(error) {
     return TERMINAL_HTTP.has(Number(error?.status))
+        // Zero IDs are temporary but require a caller cooldown, not more immediate registrations.
+        || error?.registrationFailure === 'REGISTRATION_UNAVAILABLE'
         || DENIAL_CODES.has(error?.code) || DENIAL_CODES.has(error?.registrationFailure)
         || ['NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE', 'ERR_CANCELED', 'ABORT_ERR'].includes(error?.code)
         || error?.name === 'AbortError';
@@ -60,7 +62,7 @@ function createPlaybackRecovery({ register, getModel, postModel, consume, now = 
         for (let round = 0; round < 2; round++) {
             checkActive(signal, deadline, now);
             let identity;
-            try { identity = await register({ scope: 'legacy', signal, deadline }); }
+            try { identity = await register({ scope: 'legacy', fresh: round > 0, signal, deadline }); }
             catch (error) {
                 checkActive(signal, deadline, now);
                 if (terminal(error)) throw error;

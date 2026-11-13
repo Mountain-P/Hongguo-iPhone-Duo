@@ -18,8 +18,15 @@ private actor OfflineEvents {
     }
     private(set) var resolutions: [Resolution] = []
     private(set) var progress: [(Int64, Int64?)] = []
+    private(set) var delays: [Duration] = []
+    func delayed(_ duration: Duration) { delays.append(duration) }
+    private var resolutionWaiters: [CheckedContinuation<Void, Never>] = []
     func resolved(_ episode: String, _ type: String, _ quality: NativePlaybackQuality) {
         resolutions.append(.init(episode: episode, contentType: type, quality: quality))
+        resolutionWaiters.forEach { $0.resume() }; resolutionWaiters.removeAll()
+    }
+    func waitForResolution() async {
+        if resolutions.isEmpty { await withCheckedContinuation { resolutionWaiters.append($0) } }
     }
     func advanced(_ received: Int64, _ expected: Int64?) { progress.append((received, expected)) }
 }
@@ -220,6 +227,198 @@ struct NativeOfflineDownloadTests {
         #expect(requests.count == 1)
         #expect(requests.first?.value(forHTTPHeaderField: "Authorization") == nil)
         #expect(requests.first?.value(forHTTPHeaderField: "Cookie") == nil)
+    }
+
+    @Test(arguments: ["EMPTY_RESPONSE", "OFFLINE_CLEAR_UNAVAILABLE", "ETIMEDOUT", "ERR_NETWORK", "HTTP_503"])
+    func directSourceFailureUsesPlaybackRecovery(code: String) async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage")
+        let media = clearMP4(), direct = OfflineEvents(), playable = OfflineEvents()
+        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media))
+        defer { OfflineHTTPSFixtures.shared.remove(url) }
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture(), quality: .dataSaver)
+        try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+            resolve: { episode, type, quality in
+                await direct.resolved(episode, type, quality)
+                throw NativeSourceError(code: code)
+            }, resolvePlayable: { episode, type, quality in
+                await playable.resolved(episode, type, quality)
+                return source(url)
+            }, downloader: httpDownloader(), progress: { _, _ in })
+        #expect(try Data(contentsOf: destination) == media)
+        #expect(await direct.resolutions == [.init(episode: "200", contentType: "1005", quality: .dataSaver)])
+        #expect(await playable.resolutions == [.init(episode: "200", contentType: "1005", quality: .dataSaver)])
+    }
+
+    @Test(arguments: ["HTTP_401", "HTTP_403", "HTTP_429", "BUSINESS_REJECTED", "SECURITY_BLOCKED",
+                      "MISSING_MODEL", "INVALID_RESPONSE", "NO_COMPATIBLE_SOURCE"])
+    func terminalDirectSourceFailureDoesNotTryAnotherRoute(code: String) async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        do {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { _, _, _ in throw NativeSourceError(code: code) },
+                resolvePlayable: { episode, type, quality in
+                    await playable.resolved(episode, type, quality)
+                    throw NativeMediaError.invalidResponse
+                }, downloader: httpDownloader(), progress: { _, _ in })
+            Issue.record("Expected source failure")
+        } catch let error as NativeSourceError { #expect(error.code == code) }
+        #expect(await playable.resolutions.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test(arguments: ["EMPTY_RESPONSE", "HTTP_403", "HTTP_429", "BUSINESS_REJECTED"])
+    func exhaustedPlaybackRecoveryIsBoundedAndStopsOnDenial(code: String) async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        do {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { _, _, _ in throw NativeSourceError(code: "EMPTY_RESPONSE") },
+                resolvePlayable: { episode, type, quality in
+                    await playable.resolved(episode, type, quality)
+                    throw NativeSourceError(code: code)
+                }, downloader: httpDownloader(), progress: { _, _ in })
+            Issue.record("Expected exhausted source recovery")
+        } catch let error as NativeSourceError { #expect(error.code == code) }
+        #expect(await playable.resolutions.count == (code == "EMPTY_RESPONSE" ? 2 : 1))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test(arguments: ["EMPTY_RESPONSE", "ETIMEDOUT"])
+    func delayedFreshLookupCanCompleteTheDownload(code: String) async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let media = clearMP4()
+        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media))
+        defer { OfflineHTTPSFixtures.shared.remove(url) }
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+            resolve: { _, _, _ in throw NativeSourceError(code: "EMPTY_RESPONSE") },
+            resolvePlayable: { episode, type, quality in
+                await playable.resolved(episode, type, quality)
+                if await playable.resolutions.count == 1 { throw NativeSourceError(code: code) }
+                return source(url)
+            }, downloader: httpDownloader(), progress: { _, _ in })
+        #expect(await playable.resolutions.count == 2)
+        #expect(try Data(contentsOf: destination) == media)
+    }
+
+    @Test func cancellingTheSourceRetryDelayDoesNotMakeAnotherRequest() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        let task = Task {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { _, _, _ in throw NativeSourceError(code: "EMPTY_RESPONSE") },
+                resolvePlayable: { episode, type, quality in
+                    await playable.resolved(episode, type, quality)
+                    throw NativeSourceError(code: "EMPTY_RESPONSE")
+                }, downloader: httpDownloader(), progress: { _, _ in })
+        }
+        await playable.waitForResolution()
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await playable.resolutions.count == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test func unavailableRegistrationWaitsBeforeContinuingTheSameEpisode() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
+        let media = clearMP4()
+        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media))
+        defer { OfflineHTTPSFixtures.shared.remove(url) }
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+            resolve: { episode, type, quality in
+                await events.resolved(episode, type, quality)
+                if await events.resolutions.count <= 2 { throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE") }
+                return source(url)
+            }, downloader: httpDownloader(), sourceRetryDelay: { await events.delayed($0) }, progress: { _, _ in })
+        #expect(await events.resolutions.count == 3)
+        #expect(await events.delays == [.seconds(10), .seconds(20)])
+        #expect(try Data(contentsOf: destination) == media)
+    }
+
+    @Test func registrationCooldownIsBounded() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        do {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { episode, type, quality in
+                    await events.resolved(episode, type, quality)
+                    throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
+                }, downloader: httpDownloader(), sourceRetryDelay: { await events.delayed($0) }, progress: { _, _ in })
+            Issue.record("Expected registration failure after bounded waits")
+        } catch let error as NativeSourceError { #expect(error.code == "REGISTRATION_UNAVAILABLE") }
+        #expect(await events.resolutions.count == 4)
+        #expect(await events.delays == [.seconds(10), .seconds(20), .seconds(40)])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test func cancellingRegistrationCooldownStopsTheDownload() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents(), waiting = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        let task = Task {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { episode, type, quality in
+                    await events.resolved(episode, type, quality)
+                    throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
+                }, downloader: httpDownloader(), sourceRetryDelay: { duration in
+                    await waiting.resolved("200", "1005", .automatic)
+                    try await Task.sleep(for: duration)
+                }, progress: { _, _ in })
+        }
+        await waiting.waitForResolution()
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await events.resolutions.count == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
+    }
+
+    @Test func mediaRefreshAlsoRecoversAnEmptyDirectSource() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let media = clearMP4()
+        let expired = OfflineHTTPSFixtures.shared.register(.init(status: 503, headers: [:], body: Data()))
+        let refreshed = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media))
+        defer { OfflineHTTPSFixtures.shared.remove(expired); OfflineHTTPSFixtures.shared.remove(refreshed) }
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+            resolve: { _, _, _ in throw NativeSourceError(code: "EMPTY_RESPONSE") },
+            resolvePlayable: { episode, type, quality in
+                await playable.resolved(episode, type, quality)
+                return source(await playable.resolutions.count == 1 ? expired : refreshed)
+            }, downloader: httpDownloader(), progress: { _, _ in })
+        #expect(await playable.resolutions.count == 2)
+        #expect(OfflineHTTPSFixtures.shared.requests(to: expired).count == 1)
+        #expect(OfflineHTTPSFixtures.shared.requests(to: refreshed).count == 1)
+        #expect(try Data(contentsOf: destination) == media)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["episode.stage"])
+    }
+
+    @Test func cancellationAfterDirectFailureStopsBeforePlaybackRecovery() async throws {
+        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("episode.stage"), playable = OfflineEvents()
+        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
+        let task = Task {
+            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
+                resolve: { _, _, _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    throw NativeSourceError(code: "EMPTY_RESPONSE")
+                }, resolvePlayable: { episode, type, quality in
+                    await playable.resolved(episode, type, quality)
+                    throw NativeMediaError.invalidResponse
+                }, downloader: httpDownloader(), progress: { _, _ in })
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await playable.resolutions.isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
     @Test func wrongEpisodeAndExistingDestinationStopBeforeResolution() async throws {

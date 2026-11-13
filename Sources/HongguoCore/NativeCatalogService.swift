@@ -71,7 +71,7 @@ public struct NativeCatalogService: CatalogService {
         try await downloadOffline(seriesID: seriesID, episodeID: episodeID, to: destination, maximumBytes: maximumBytes,
                                   resolve: { episodeID, contentType, quality in
             try await NativeJSRuntime().resolve(episodeID: episodeID, contentType: contentType,
-                                                quality: quality, offlineDirect: true)
+                                                quality: quality)
         }, resolvePlayable: { episodeID, contentType, quality in
             try await NativeJSRuntime().resolve(episodeID: episodeID, contentType: contentType, quality: quality)
         }, downloader: NativeMediaHTTPDownload(), progress: progress)
@@ -81,6 +81,7 @@ public struct NativeCatalogService: CatalogService {
                          resolve: @Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource,
                          resolvePlayable: (@Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource)? = nil,
                          downloader: any NativeOfflineMediaDownloading,
+                         sourceRetryDelay: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
                          progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         try validateID(seriesID)
         try validateID(episodeID)
@@ -96,15 +97,43 @@ public struct NativeCatalogService: CatalogService {
               let episode = entry.detail.episodes.first(where: { $0.id == episodeID }) else { throw CatalogError.invalidID }
         guard episode.isAvailable else { throw CatalogError.protectedPlayback }
 
-        func resolveSource() async throws -> NativeMediaSource {
+        func lookupSource() async throws -> NativeMediaSource {
             try Task.checkCancellation()
             do {
                 return try await resolve(episodeID, entry.contentType, playbackQuality)
-            } catch let error as NativeSourceError where error.code == "OFFLINE_CLEAR_UNAVAILABLE" {
+            } catch where (error as? NativeSourceError).map({
+                ["OFFLINE_CLEAR_UNAVAILABLE", "EMPTY_RESPONSE"].contains($0.code)
+            }) == true || PlaybackRecovery.shouldRetry(error, attempt: 0) {
+                // Downloads use the same complete source lookup as playback.
+                // A transient/empty response can receive a fresh lookup; explicit
+                // denials, invalid episode models and cancellation remain terminal.
                 guard let resolvePlayable else { throw error }
                 try Task.checkCancellation()
-                return try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+                do {
+                    return try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+                } catch where (error as? NativeSourceError)?.code == "EMPTY_RESPONSE"
+                    || PlaybackRecovery.shouldRetry(error, attempt: 0) {
+                    // A batch can outlast a transient API outage. Give this same
+                    // episode one delayed fresh lookup, without cycling the queue
+                    // indefinitely or retrying a provider denial.
+                    try await Task.sleep(for: .seconds(1))
+                    return try await resolvePlayable(episodeID, entry.contentType, playbackQuality)
+                }
             }
+        }
+
+        func resolveSource() async throws -> NativeMediaSource {
+            let cooldowns: [Duration] = [.seconds(10), .seconds(20), .seconds(40)]
+            for attempt in 0...cooldowns.count {
+                do { return try await lookupSource() }
+                catch let error as NativeSourceError where error.code == "REGISTRATION_UNAVAILABLE" && attempt < cooldowns.count {
+                    // Keep this episode queued while the provider recovers instead
+                    // of rapidly failing every following episode on zero IDs.
+                    try Task.checkCancellation()
+                    try await sourceRetryDelay(cooldowns[attempt])
+                }
+            }
+            throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
         }
 
         let source = try await resolveSource()
