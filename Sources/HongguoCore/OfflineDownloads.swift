@@ -35,6 +35,9 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
         // Older builds saved clear-only failures as unsupported. The episode can now be retried.
         state == .failed && offlineUnsupported == true && failure != "來源未提供可離線儲存的未加密 MP4。"
     }
+    public var canRetryFailedDownload: Bool {
+        state == .failed && key.scope != OfflineDownloads.importedScope && !isOfflineUnsupported
+    }
 
     public init(key: OfflineDownloadKey, seriesTitle: String, episodeNumber: Int, episodeTitle: String = "",
                 position: Double = 0, duration: Double = 0) {
@@ -230,6 +233,24 @@ public actor OfflineDownloads {
         updated.append(record)
         try commit(updated)
         startNext()
+    }
+
+    /// Requeues only still-failed, supported downloads from the requested snapshot.
+    /// Persist the whole batch before starting work; preserve the active queue and completed files.
+    @discardableResult
+    public func retryFailed(_ keys: [OfflineDownloadKey]) throws -> Int {
+        let requested = Set(keys)
+        var retried = records.filter { requested.contains($0.item.key) && $0.item.canRetryFailedDownload }
+        guard !retried.isEmpty else { return 0 }
+        for index in retried.indices {
+            try disk.deleteFile(disk.movie(retried[index].fileID))
+            retried[index].item.resetTransfer(to: .queued)
+            retried[index].checksum = nil
+        }
+        let retriedKeys = Set(retried.map(\.item.key))
+        try commit(records.filter { !retriedKeys.contains($0.item.key) } + retried)
+        startNext()
+        return retried.count
     }
 
     public func delete(_ key: OfflineDownloadKey) throws {

@@ -10,6 +10,7 @@ final class OfflineDownloadModel: ObservableObject {
     @Published private(set) var isReady = false
     @Published private(set) var storageUnavailable = false
     @Published private(set) var isImporting = false
+    @Published private(set) var isRetryingFailed = false
     @Published var error: String?
 
     private var storage: OfflineDownloads?
@@ -114,6 +115,19 @@ final class OfflineDownloadModel: ObservableObject {
     func retry(_ key: OfflineDownloadKey) async {
         do { try await storage?.retry(key) }
         catch { report(error) }
+    }
+
+    func retryFailed(_ keys: [OfflineDownloadKey]) async {
+        guard let storage, !isRetryingFailed else { return }
+        isRetryingFailed = true
+        defer { isRetryingFailed = false }
+        do {
+            try await storage.retryFailed(keys)
+            // Refresh before enabling the button again, even if the observer has not delivered yet.
+            items = await storage.snapshot().filter {
+                $0.key.scope == Self.scope || $0.key.scope == OfflineDownloads.importedScope
+            }
+        } catch { report(error) }
     }
 
     func delete(_ keys: [OfflineDownloadKey]) async {
@@ -328,6 +342,13 @@ struct OfflineDownloadsView: View {
                 ProgressView("正在匯入影片…")
                     .accessibilityIdentifier("offline.import.progress")
             }
+            if downloads.items.contains(where: \.canRetryFailedDownload) {
+                Section {
+                    OfflineRetryFailedButton(items: downloads.items, identifier: "offline.retryAllFailed")
+                } footer: {
+                    Text("一次重試所有劇集下載失敗的集數。")
+                }
+            }
             ForEach(groups) { group in
                 if case let .series(_, seriesID) = group.id {
                     HStack {
@@ -414,6 +435,25 @@ struct OfflineDownloadsView: View {
             }
         }
         return result
+    }
+}
+
+private struct OfflineRetryFailedButton: View {
+    let items: [OfflineDownloadItem]
+    let identifier: String
+    @EnvironmentObject private var downloads: OfflineDownloadModel
+
+    var body: some View {
+        let keys = items.filter(\.canRetryFailedDownload).map(\.key)
+        if !keys.isEmpty {
+            Button {
+                Task { await downloads.retryFailed(keys) }
+            } label: {
+                Label("全部重試（\(keys.count) 集）", systemImage: "arrow.clockwise")
+            }
+            .disabled(!downloads.isReady || downloads.isRetryingFailed)
+            .accessibilityIdentifier(identifier)
+        }
     }
 }
 
@@ -589,6 +629,7 @@ private struct OfflineDownloadGroupView: View {
         let start = saved.first(where: \.canResumeOffline)
             ?? saved.first(where: { !$0.isFinishedOffline }) ?? saved.first
         return Section {
+            OfflineRetryFailedButton(items: items, identifier: "offline.retryFailedSeries")
             if let start {
                 Button {
                     openPlayback(start)

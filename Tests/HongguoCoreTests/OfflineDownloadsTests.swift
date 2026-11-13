@@ -5,6 +5,67 @@ import Testing
 @testable import HongguoCore
 
 struct OfflineDownloadsTests {
+    @Test func batchRetryPreservesCompletedAndActiveWorkAndOnlyRequeuesRequestedFailuresOnce() async throws {
+        let directory = temporaryLibrary()
+        let transfer = ControlledOfflineTransfer()
+        defer {
+            Task { await transfer.releaseAll() }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let failed = [episode(1), episode(2)]
+        let other = OfflineDownloadItem(key: .init(scope: "another", seriesID: "50", episodeID: "1"),
+                                       seriesTitle: "另一部劇", episodeNumber: 1)
+        let imported = OfflineDownloadItem(key: .init(scope: OfflineDownloads.importedScope,
+                                                      seriesID: "imported", episodeID: "imported"),
+                                          seriesTitle: "匯入影片", episodeNumber: 1)
+        let unsupported = episode(5), complete = episode(6)
+        let original = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            if item.key == complete.key { try await writeFixture(item, destination, maximum, progress) }
+            else if item.key == unsupported.key { throw NativeMediaError.unsupportedEncryption }
+            else { throw NativeSourceError(code: "EMPTY_RESPONSE") }
+        }
+        try await original.enqueue(failed + [other, imported, unsupported, complete])
+        try await wait { await original.snapshot().allSatisfy { [.failed, .completed].contains($0.state) } }
+        try await original.recordProgress(for: complete.key, position: 12, duration: 30)
+        let completedURL = try #require(try await original.localURL(for: complete.key))
+
+        let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            try await transfer.download(item, destination, maximum, progress)
+        }
+        let active = episode(7), waiting = episode(8), cancelled = episode(9)
+        try await queue.enqueue([active, waiting, cancelled])
+        try await wait { await transfer.count == 1 }
+        try await queue.cancel(cancelled.key)
+        let requested = (failed + [failed[0], imported, unsupported, complete, active, waiting, cancelled, episode(99)]).map(\.key)
+        #expect(try await queue.retryFailed(requested) == 2)
+        #expect(try await queue.retryFailed(requested) == 0)
+        let snapshot = await queue.snapshot()
+        #expect(snapshot.suffix(2).map(\.key) == failed.map(\.key))
+        #expect(snapshot.filter { $0.state == .queued }.map(\.key) == [waiting.key] + failed.map(\.key))
+        #expect(snapshot.first { $0.key == active.key }?.state == .downloading)
+        #expect(snapshot.first { $0.key == cancelled.key }?.state == .cancelled)
+        #expect(snapshot.first { $0.key == other.key }?.state == .failed)
+        #expect(snapshot.first { $0.key == unsupported.key }?.canRetryFailedDownload == false)
+        #expect(snapshot.first { $0.key == imported.key }?.canRetryFailedDownload == false)
+        #expect(snapshot.first { $0.key == complete.key }?.position == 12)
+        #expect(try await queue.localURL(for: complete.key) == completedURL)
+        #expect(try Data(contentsOf: completedURL) == fixture)
+        #expect(await transfer.count == 1)
+
+        let index = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("index.json"))) as? [String: Any])
+        let persisted = try #require(index["records"] as? [[String: Any]])
+        #expect(persisted.suffix(2).allSatisfy { ($0["item"] as? [String: Any])?["state"] as? String == "queued" })
+        for (index, expected) in [waiting, failed[0], failed[1]].enumerated() {
+            await transfer.release(index)
+            try await wait { await transfer.count == index + 2 }
+            #expect(await transfer.key(at: index + 1) == expected.key)
+        }
+        await transfer.release(3)
+        try await wait { await queue.snapshot().filter { failed.map(\.key).contains($0.key) }.allSatisfy { $0.state == .completed } }
+        #expect(await transfer.count == 4)
+        #expect(await queue.snapshot().count == 9)
+    }
+
     @Test func unsupportedSourceIsNotRetriedAndDoesNotBlockOtherEpisodes() async throws {
         let directory = temporaryLibrary()
         defer { try? FileManager.default.removeItem(at: directory) }
