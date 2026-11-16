@@ -342,11 +342,18 @@ struct OfflineDownloadsView: View {
                 ProgressView("正在匯入影片…")
                     .accessibilityIdentifier("offline.import.progress")
             }
+            if let waiting = downloads.items.first(where: { $0.state == .waiting }) {
+                Section {
+                    OfflineDownloadStatus(item: waiting)
+                } footer: {
+                    Text("同一來源的待下載集數一起等待，恢復後依序下載；可進入劇集取消個別項目。")
+                }
+            }
             if downloads.items.contains(where: \.canRetryFailedDownload) {
                 Section {
                     OfflineRetryFailedButton(items: downloads.items, identifier: "offline.retryAllFailed")
                 } footer: {
-                    Text("一次重試所有劇集下載失敗的集數。")
+                    Text("一次重試所有劇集下載失敗或因來源異常暫停的集數。")
                 }
             }
             ForEach(groups) { group in
@@ -476,10 +483,14 @@ private struct OfflineDownloadGroup: Identifiable {
         if id == .imported { return "\(items.count) 部影片" }
         let complete = items.lazy.filter { $0.state == .completed }.count
         let active = items.lazy.filter { !$0.canDeleteOffline }.count
+        let waiting = items.lazy.filter { $0.state == .waiting }.count
+        let paused = items.lazy.filter { $0.state == .paused }.count
         let unfinished = items.count - complete - active
         var parts = ["已下載 \(complete)／\(items.count) 集"]
-        if active > 0 { parts.append("\(active) 集處理中") }
-        if unfinished > 0 { parts.append("\(unfinished) 集未完成") }
+        if active > waiting { parts.append("\(active - waiting) 集處理中") }
+        if waiting > 0 { parts.append("\(waiting) 集等待重試") }
+        if paused > 0 { parts.append("\(paused) 集已暫停") }
+        if unfinished > paused { parts.append("\(unfinished - paused) 集未完成") }
         return parts.joined(separator: " · ")
     }
 
@@ -703,10 +714,10 @@ private struct OfflineDownloadGroupView: View {
                     .disabled(opening != nil)
                     .accessibilityIdentifier("offline.play.\(item.key.episodeID)")
                     if opening == item.key { ProgressView() }
-                case .queued, .downloading:
+                case .queued, .downloading, .waiting:
                     Button("取消") { Task { await downloads.cancel(item.key) } }
                         .accessibilityIdentifier("offline.cancel.\(item.key.episodeID)")
-                case .failed, .cancelled:
+                case .failed, .cancelled, .paused:
                     if !item.isImportedVideo && !item.isOfflineUnsupported {
                         Button("重試") { Task { await downloads.retry(item.key) } }
                             .accessibilityIdentifier("offline.retry.\(item.key.episodeID)")
@@ -745,6 +756,15 @@ private struct OfflineDownloadStatus: View {
         Group {
             switch item.state {
             case .queued: Text("等待下載")
+            case .waiting:
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let seconds = max(0, Int(ceil((item.retryAfter ?? context.date).timeIntervalSince(context.date))))
+                    Text("來源連線暫時異常 · \(seconds) 秒後重試（\(item.sourceRetryAttempt ?? 1)/3）")
+                }
+                .accessibilityIdentifier("offline.waiting.\(item.key.episodeID)")
+            case .paused:
+                Text("\(item.failure ?? "來源仍未恢復。") 已暫停，可按「全部重試」。")
+                    .accessibilityIdentifier("offline.paused.\(item.key.episodeID)")
             case .downloading:
                 if let total = item.totalBytes, total > 0 {
                     let fraction = min(1, Double(item.receivedBytes) / Double(total))
@@ -778,7 +798,7 @@ private struct OfflineDownloadStatus: View {
 
 private extension OfflineDownloadItem {
     var isImportedVideo: Bool { key.scope == OfflineDownloads.importedScope }
-    var canDeleteOffline: Bool { state != .queued && state != .downloading }
+    var canDeleteOffline: Bool { ![.queued, .downloading, .waiting].contains(state) }
     var isFinishedOffline: Bool { duration > 0 && position >= duration - 0.25 }
     var canResumeOffline: Bool { position > 0 && duration > 0 && !isFinishedOffline }
 }

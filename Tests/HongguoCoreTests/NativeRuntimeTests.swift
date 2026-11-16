@@ -241,6 +241,47 @@ struct NativeRuntimeTests {
         }
     }
 
+    @Test func registrationCausesSurviveJavaScriptToSwiftWithoutWeakeningDenials() async throws {
+        let cases: [(String, String, Int?, String)] = [
+            ("DEVICE_REGISTRATION_FAILED", "TIMEOUT", nil, "REGISTRATION_TIMEOUT"),
+            ("DEVICE_REGISTRATION_FAILED", "NETWORK_ERROR", nil, "REGISTRATION_NETWORK_ERROR"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_500", 500, "REGISTRATION_HTTP_500"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_502", nil, "REGISTRATION_HTTP_502"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_503", 503, "REGISTRATION_HTTP_503"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_504", nil, "REGISTRATION_HTTP_504"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_501", nil, "DEVICE_REGISTRATION_FAILED"),
+            ("DEVICE_REGISTRATION_FAILED", "REGISTRATION_UNAVAILABLE", nil, "REGISTRATION_UNAVAILABLE"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_401", nil, "HTTP_401"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_403", nil, "HTTP_403"),
+            ("DEVICE_REGISTRATION_FAILED", "HTTP_429", nil, "HTTP_429"),
+            ("DEVICE_REGISTRATION_FAILED", "BUSINESS_REJECTED", 503, "BUSINESS_REJECTED"),
+            ("DEVICE_REGISTRATION_FAILED", "SECURITY_BLOCKED", nil, "SECURITY_BLOCKED"),
+            ("BUSINESS_REJECTED", "TIMEOUT", 503, "BUSINESS_REJECTED"),
+            ("ABORT_ERR", "TIMEOUT", 503, "ABORT_ERR"),
+            ("ERR_CANCELED", "NETWORK_ERROR", nil, "ERR_CANCELED"),
+            ("DEVICE_REGISTRATION_FAILED", "TIMEOUT", 403, "HTTP_403")
+        ]
+        for (code, cause, status, expected) in cases {
+            let result = try await NativeJSRuntime().evaluateForTesting("""
+            (() => {
+              require('app-source').fetchAppPlayUrl = async () => {
+                throw Object.assign(new Error('fixture'), {code:'\(code)',registrationFailure:'\(cause)',status:\(status.map(String.init) ?? "null")});
+              };
+              __startResolve('100','1004');
+              return new Promise(() => {});
+            })()
+            """)
+            do {
+                _ = try NativeJSRuntime.parseSource(result, preference: .automatic, offlineDirect: false)
+                Issue.record("Expected a classified source error")
+            } catch let error as NativeSourceError {
+                #expect(error.code == expected)
+                #expect(OfflineSourceRecovery.shouldWait(error) == expected.hasPrefix("REGISTRATION_"))
+                #expect(!PlaybackRecovery.shouldRetry(error, attempt: 0))
+            }
+        }
+    }
+
     @Test(arguments: [false, true])
     func zeroRegistrationIDsStopImmediateRequestsAndPreserveBusinessDenial(denied: Bool) async throws {
         let result = try await NativeJSRuntime().evaluateForTesting("""

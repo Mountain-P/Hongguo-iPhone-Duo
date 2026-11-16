@@ -81,7 +81,6 @@ public struct NativeCatalogService: CatalogService {
                          resolve: @Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource,
                          resolvePlayable: (@Sendable (String, String, NativePlaybackQuality) async throws -> NativeMediaSource)? = nil,
                          downloader: any NativeOfflineMediaDownloading,
-                         sourceRetryDelay: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
                          progress: @escaping @Sendable (Int64, Int64?) async -> Void) async throws {
         try validateID(seriesID)
         try validateID(episodeID)
@@ -122,27 +121,15 @@ public struct NativeCatalogService: CatalogService {
             }
         }
 
-        func resolveSource() async throws -> NativeMediaSource {
-            let cooldowns: [Duration] = [.seconds(10), .seconds(20), .seconds(40)]
-            for attempt in 0...cooldowns.count {
-                do { return try await lookupSource() }
-                catch let error as NativeSourceError where error.code == "REGISTRATION_UNAVAILABLE" && attempt < cooldowns.count {
-                    // Keep this episode queued while the provider recovers instead
-                    // of rapidly failing every following episode on zero IDs.
-                    try Task.checkCancellation()
-                    try await sourceRetryDelay(cooldowns[attempt])
-                }
-            }
-            throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
-        }
-
-        let source = try await resolveSource()
+        // Registration recovery belongs to the shared offline queue, so other
+        // episodes cannot immediately repeat an exhausted registration attempt.
+        let source = try await lookupSource()
         do {
             try await file.write(source: source, downloader: downloader, progress: progress)
         } catch where PlaybackRecovery.shouldRetryAssetRead(error) {
             // The writer removed the partial file. Resolve this episode again
             // before opening a fresh file so bytes from two versions cannot mix.
-            let refreshed = try await resolveSource()
+            let refreshed = try await lookupSource()
             try await file.write(source: refreshed, downloader: downloader, progress: progress)
         }
     }

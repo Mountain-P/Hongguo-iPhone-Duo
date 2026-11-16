@@ -325,25 +325,8 @@ struct NativeOfflineDownloadTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
-    @Test func unavailableRegistrationWaitsBeforeContinuingTheSameEpisode() async throws {
-        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
-        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
-        let media = clearMP4()
-        let url = OfflineHTTPSFixtures.shared.register(.init(headers: ["Content-Type": "video/mp4"], body: media))
-        defer { OfflineHTTPSFixtures.shared.remove(url) }
-        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
-        try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
-            resolve: { episode, type, quality in
-                await events.resolved(episode, type, quality)
-                if await events.resolutions.count <= 2 { throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE") }
-                return source(url)
-            }, downloader: httpDownloader(), sourceRetryDelay: { await events.delayed($0) }, progress: { _, _ in })
-        #expect(await events.resolutions.count == 3)
-        #expect(await events.delays == [.seconds(10), .seconds(20)])
-        #expect(try Data(contentsOf: destination) == media)
-    }
-
-    @Test func registrationCooldownIsBounded() async throws {
+    @Test(arguments: ["REGISTRATION_UNAVAILABLE", "REGISTRATION_TIMEOUT", "REGISTRATION_NETWORK_ERROR", "REGISTRATION_HTTP_503"])
+    func temporaryRegistrationFailureReachesSharedQueueWithoutPerEpisodeWaits(_ code: String) async throws {
         let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents()
         let service = NativeCatalogService(transport: OfflineCatalogueFixture())
@@ -351,32 +334,13 @@ struct NativeOfflineDownloadTests {
             try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
                 resolve: { episode, type, quality in
                     await events.resolved(episode, type, quality)
-                    throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
-                }, downloader: httpDownloader(), sourceRetryDelay: { await events.delayed($0) }, progress: { _, _ in })
-            Issue.record("Expected registration failure after bounded waits")
-        } catch let error as NativeSourceError { #expect(error.code == "REGISTRATION_UNAVAILABLE") }
-        #expect(await events.resolutions.count == 4)
-        #expect(await events.delays == [.seconds(10), .seconds(20), .seconds(40)])
-        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
-    }
-
-    @Test func cancellingRegistrationCooldownStopsTheDownload() async throws {
-        let directory = try makeDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
-        let destination = directory.appendingPathComponent("episode.stage"), events = OfflineEvents(), waiting = OfflineEvents()
-        let service = NativeCatalogService(transport: OfflineCatalogueFixture())
-        let task = Task {
-            try await service.downloadOffline(seriesID: "100", episodeID: "200", to: destination, maximumBytes: 2048,
-                resolve: { episode, type, quality in
-                    await events.resolved(episode, type, quality)
-                    throw NativeSourceError(code: "REGISTRATION_UNAVAILABLE")
-                }, downloader: httpDownloader(), sourceRetryDelay: { duration in
-                    await waiting.resolved("200", "1005", .automatic)
-                    try await Task.sleep(for: duration)
-                }, progress: { _, _ in })
-        }
-        await waiting.waitForResolution()
-        task.cancel()
-        await #expect(throws: CancellationError.self) { try await task.value }
+                    throw NativeSourceError(code: code)
+                }, resolvePlayable: { _, _, _ in
+                    Issue.record("Registration failure must not immediately repeat the full source lookup")
+                    throw NativeSourceError(code: "UNEXPECTED")
+                }, downloader: httpDownloader(), progress: { _, _ in })
+            Issue.record("Expected classified registration failure")
+        } catch let error as NativeSourceError { #expect(error.code == code) }
         #expect(await events.resolutions.count == 1)
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }

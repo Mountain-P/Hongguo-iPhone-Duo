@@ -141,10 +141,19 @@
             const status = Number(error.status);
             const registrationFailure = error.registrationFailure;
             let code = String(error.code || 'SOURCE_UNAVAILABLE');
-            if (Number.isInteger(status) && status >= 400 && status <= 599) code = `HTTP_${status}`;
-            else if (['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'REGISTRATION_UNAVAILABLE'].includes(registrationFailure)) {
+            const terminal = ['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'ABORT_ERR', 'ERR_CANCELED'];
+            if (['ABORT_ERR', 'ERR_CANCELED'].includes(code) || error.name === 'AbortError') {
+                if (error.name === 'AbortError') code = 'ABORT_ERR';
+            } else if ([401, 403, 429].includes(status)) code = `HTTP_${status}`;
+            else if (terminal.includes(code)) { /* Explicit refusal takes precedence. */ }
+            else if (terminal.includes(registrationFailure) || registrationFailure === 'REGISTRATION_UNAVAILABLE') {
                 code = registrationFailure;
-            }
+            } else if (code === 'DEVICE_REGISTRATION_FAILED'
+                && ['TIMEOUT', 'NETWORK_ERROR', 'HTTP_500', 'HTTP_502', 'HTTP_503', 'HTTP_504'].includes(registrationFailure)) {
+                // Preserve the registration cause for the offline queue's bounded cooldown.
+                // Do not turn an explicit provider denial into a transport retry.
+                code = `REGISTRATION_${registrationFailure}`;
+            } else if (Number.isInteger(status) && status >= 400 && status <= 599) code = `HTTP_${status}`;
             global._nativeComplete(JSON.stringify({ error: code }));
         });
     };

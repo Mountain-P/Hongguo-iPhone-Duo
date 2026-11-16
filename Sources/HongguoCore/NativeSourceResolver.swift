@@ -34,6 +34,10 @@ public struct NativeSourceError: Error, Sendable, LocalizedError {
         case "BUSINESS_REJECTED", "HTTP_401", "HTTP_403": "來源目前未授權提供本集播放。"
         case "EMPTY_RESPONSE": "來源未回傳影片資料，請稍後重試。"
         case "REGISTRATION_UNAVAILABLE": "來源暫時無法建立播放連線，請稍後重試。"
+        case "REGISTRATION_TIMEOUT": "來源連線建立逾時，請稍後重試。"
+        case "REGISTRATION_NETWORK_ERROR": "建立來源連線時網路中斷，請稍後重試。"
+        case "REGISTRATION_HTTP_500", "REGISTRATION_HTTP_502", "REGISTRATION_HTTP_503", "REGISTRATION_HTTP_504":
+            "來源連線服務暫時異常，請稍後重試。"
         case "HTTP_429": "來源暫時限制請求，請稍後重試。"
         case "ETIMEDOUT": "影片準備逾時，請重試。"
         case "APP_INPUT": "分集或內容類型無效。"

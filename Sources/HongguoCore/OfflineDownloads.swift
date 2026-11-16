@@ -15,7 +15,7 @@ public struct OfflineDownloadKey: Hashable, Codable, Sendable {
 }
 
 public enum OfflineDownloadState: String, Codable, Sendable {
-    case queued, downloading, completed, failed, cancelled
+    case queued, downloading, waiting, paused, completed, failed, cancelled
 }
 
 public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
@@ -27,6 +27,8 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
     public fileprivate(set) var receivedBytes: Int64 = 0
     public fileprivate(set) var totalBytes: Int64?
     public fileprivate(set) var failure: String?
+    public fileprivate(set) var retryAfter: Date?
+    public fileprivate(set) var sourceRetryAttempt: Int?
     private var offlineUnsupported: Bool?
     public fileprivate(set) var position: Double = 0
     public fileprivate(set) var duration: Double = 0
@@ -36,7 +38,7 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
         state == .failed && offlineUnsupported == true && failure != "來源未提供可離線儲存的未加密 MP4。"
     }
     public var canRetryFailedDownload: Bool {
-        state == .failed && key.scope != OfflineDownloads.importedScope && !isOfflineUnsupported
+        [.failed, .paused].contains(state) && key.scope != OfflineDownloads.importedScope && !isOfflineUnsupported
     }
 
     public init(key: OfflineDownloadKey, seriesTitle: String, episodeNumber: Int, episodeTitle: String = "",
@@ -56,6 +58,8 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
         totalBytes = nil
         self.failure = failure
         self.offlineUnsupported = offlineUnsupported
+        retryAfter = nil
+        sourceRetryAttempt = nil
     }
 }
 
@@ -118,24 +122,42 @@ public actor OfflineDownloads {
         var lastCheckpoint: TimeInterval = -.infinity
     }
 
+    private struct Cooldown {
+        let token: UUID
+        let deadline: Date
+        let task: Task<Void, Never>
+    }
+
     private let disk: Disk
     private let limits: Limits
     private let provider: Provider
     private var records: [Record]
     private var job: Job?
+    private var cooldown: Cooldown?
+    private let now: @Sendable () -> Date
+    private let sleep: @Sendable (Duration) async throws -> Void
     private var isImporting = false
     private var observers: [UUID: AsyncStream<[OfflineDownloadItem]>.Continuation] = [:]
 
     public init(directory: URL, limits: Limits = .init(), provider: @escaping Provider) throws {
+        try self.init(directory: directory, limits: limits, now: Date.init,
+                      sleep: { try await Task.sleep(for: $0) }, provider: provider)
+    }
+
+    init(directory: URL, limits: Limits = .init(), now: @escaping @Sendable () -> Date,
+         sleep: @escaping @Sendable (Duration) async throws -> Void, provider: @escaping Provider) throws {
         let disk = try Disk(directory: directory)
         self.disk = disk
         self.limits = limits
         self.provider = provider
         self.records = try disk.load()
+        self.now = now
+        self.sleep = sleep
     }
 
     deinit {
         job?.task.cancel()
+        cooldown?.task.cancel()
         for observer in observers.values { observer.finish() }
     }
 
@@ -166,6 +188,14 @@ public actor OfflineDownloads {
             guard keys.insert(item.key).inserted else { continue }
             guard updated.count < limits.maximumItems else { throw OfflineDownloadError.tooManyItems }
             item.resetTransfer(to: .queued)
+            if let pending = updated.first(where: {
+                $0.item.key.scope == item.key.scope && [.waiting, .paused].contains($0.item.state)
+            })?.item {
+                item.state = pending.state
+                item.failure = pending.failure
+                item.retryAfter = pending.retryAfter
+                item.sourceRetryAttempt = pending.sourceRetryAttempt
+            }
             updated.append(Record(item: item, fileID: UUID()))
         }
         guard updated.count != records.count else { return }
@@ -214,7 +244,7 @@ public actor OfflineDownloads {
     }
 
     public func cancel(_ key: OfflineDownloadKey) throws {
-        guard let index = index(for: key), [.queued, .downloading].contains(records[index].item.state) else { return }
+        guard let index = index(for: key), [.queued, .downloading, .waiting, .paused].contains(records[index].item.state) else { return }
         var updated = records
         updated[index].item.resetTransfer(to: .cancelled)
         try commit(updated)
@@ -223,13 +253,14 @@ public actor OfflineDownloads {
     }
 
     public func retry(_ key: OfflineDownloadKey) throws {
-        guard key.scope != Self.importedScope, let index = index(for: key), [.failed, .cancelled].contains(records[index].item.state),
+        guard key.scope != Self.importedScope, let index = index(for: key), [.failed, .cancelled, .paused].contains(records[index].item.state),
               !records[index].item.isOfflineUnsupported else { return }
         var updated = records
         var record = updated.remove(at: index)
         // A corrupt movie may still be present after earlier cleanup was refused.
         try disk.deleteFile(disk.movie(record.fileID))
         record.item.resetTransfer(to: .queued)
+        inheritActiveCooldown(&record.item)
         updated.append(record)
         try commit(updated)
         startNext()
@@ -245,6 +276,7 @@ public actor OfflineDownloads {
         for index in retried.indices {
             try disk.deleteFile(disk.movie(retried[index].fileID))
             retried[index].item.resetTransfer(to: .queued)
+            inheritActiveCooldown(&retried[index].item)
             retried[index].checksum = nil
         }
         let retriedKeys = Set(retried.map(\.item.key))
@@ -327,6 +359,7 @@ public actor OfflineDownloads {
     }
 
     private func startNext() {
+        armCooldown()
         guard job == nil, !isImporting else { return }
         while let index = records.firstIndex(where: { $0.item.state == .queued }) {
             let token = UUID()
@@ -336,7 +369,9 @@ public actor OfflineDownloads {
                 let maximumBytes = try transferLimit()
                 try disk.createDirectory(folder)
                 var updated = records
+                let attempt = updated[index].item.sourceRetryAttempt
                 updated[index].item.resetTransfer(to: .downloading)
+                updated[index].item.sourceRetryAttempt = attempt
                 try commit(updated)
                 let item = records[index].item
                 let provider = provider
@@ -421,9 +456,97 @@ public actor OfflineDownloads {
             updated[index].item.state = .completed
             updated[index].item.receivedBytes = size
             updated[index].item.totalBytes = size
+            updated[index].item.sourceRetryAttempt = nil
+            // Only a successful provider transfer clears the queue's retry budget.
+            // Reading a completed local file or importing a movie never gets here.
+            for i in updated.indices where updated[i].item.key.scope == current.key.scope
+                && updated[i].item.state == .queued {
+                updated[i].item.sourceRetryAttempt = nil
+            }
             do { try commit(updated) }
             catch { disk.remove(final); throw error }
-        } catch { _ = fail(index: index, error: error) }
+        } catch {
+            if OfflineSourceRecovery.shouldWait(error), current.key.scope != Self.importedScope {
+                deferSource(index: index, error: error)
+            } else { _ = fail(index: index, error: error) }
+        }
+    }
+
+    private func inheritActiveCooldown(_ item: inout OfflineDownloadItem) {
+        guard let pending = records.first(where: {
+            $0.item.key.scope == item.key.scope && $0.item.state == .waiting
+        })?.item else { return }
+        item.state = .waiting
+        item.failure = pending.failure
+        item.retryAfter = pending.retryAfter
+        item.sourceRetryAttempt = pending.sourceRetryAttempt
+    }
+
+    private func deferSource(index: Int, error: any Error) {
+        let scope = records[index].item.key.scope
+        let attempt = (records[index].item.sourceRetryAttempt ?? 0) + 1
+        let automatic = attempt <= OfflineSourceRecovery.delays.count
+        let deadline = automatic ? now().addingTimeInterval(OfflineSourceRecovery.delays[attempt - 1]) : nil
+        var updated = records
+        for i in updated.indices where updated[i].item.key.scope == scope
+            && (i == index || [.queued, .waiting].contains(updated[i].item.state)) {
+            updated[i].item.resetTransfer(to: automatic ? .waiting : .paused,
+                failure: (error as? NativeSourceError)?.errorDescription ?? "來源連線暫時異常。")
+            updated[i].item.retryAfter = deadline
+            updated[i].item.sourceRetryAttempt = min(attempt, OfflineSourceRecovery.delays.count)
+        }
+        do { try commit(updated) }
+        catch {
+            // Keep the whole affected queue stopped even when the index cannot be saved.
+            for i in updated.indices where updated[i].item.key.scope == scope
+                && [.waiting, .paused].contains(updated[i].item.state) {
+                updated[i].item.resetTransfer(to: .paused, failure: OfflineDownloadError.storageUnavailable.localizedDescription)
+            }
+            records = updated
+            publish()
+        }
+    }
+
+    private func armCooldown() {
+        let deadline = records.filter { $0.item.state == .waiting }.compactMap(\.item.retryAfter).min()
+        guard deadline != cooldown?.deadline else { return }
+        cooldown?.task.cancel()
+        cooldown = nil
+        guard let deadline else { return }
+        let token = UUID(), sleep = sleep
+        // A wall-clock change must not create an unbounded wait after reopening.
+        let delay = min(max(deadline.timeIntervalSince(now()), 0), OfflineSourceRecovery.delays.last!)
+        let task = Task { [weak self] in
+            do {
+                try await sleep(.seconds(delay))
+                try Task.checkCancellation()
+                await self?.resumeWaiting(token: token, deadline: deadline)
+            } catch { /* Cancellation cannot requeue removed or cancelled episodes. */ }
+        }
+        cooldown = Cooldown(token: token, deadline: deadline, task: task)
+    }
+
+    private func resumeWaiting(token: UUID, deadline: Date) {
+        guard cooldown?.token == token else { return }
+        cooldown = nil
+        var updated = records
+        let ready = updated.indices.filter {
+            updated[$0].item.state == .waiting && updated[$0].item.retryAfter.map { $0 <= deadline } == true
+        }
+        for i in ready {
+            let attempt = updated[i].item.sourceRetryAttempt
+            updated[i].item.resetTransfer(to: .queued)
+            updated[i].item.sourceRetryAttempt = attempt
+        }
+        do { try commit(updated) }
+        catch {
+            for i in ready {
+                updated[i].item.resetTransfer(to: .paused, failure: OfflineDownloadError.storageUnavailable.localizedDescription)
+            }
+            records = updated
+            publish()
+        }
+        startNext()
     }
 
     /// A failed write leaves the previous index intact. Keep the row in memory
@@ -556,6 +679,10 @@ public actor OfflineDownloads {
                 && item.episodeNumber > 0 && item.receivedBytes >= 0
                 && item.totalBytes.map { $0 > 0 && $0 >= item.receivedBytes } != false
                 && item.failure.map { validText($0, maximum: 512) } != false
+                && item.sourceRetryAttempt.map { (1...OfflineSourceRecovery.delays.count).contains($0) } != false
+                && item.retryAfter.map { $0.timeIntervalSince1970.isFinite } != false
+                && (item.state != .waiting || (item.retryAfter != nil && item.sourceRetryAttempt != nil))
+                && (item.state == .waiting || item.retryAfter == nil)
                 && item.position.isFinite && item.duration.isFinite
                 && item.position >= 0 && item.duration >= item.position
         }
