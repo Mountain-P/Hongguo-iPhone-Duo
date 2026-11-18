@@ -12,9 +12,12 @@ enum CatalogSource: String, CaseIterable, Identifiable {
 }
 
 enum PlaybackMode: String, CaseIterable, Identifiable {
-    case native, bridge
+    case native, relay, bridge
     var id: String { rawValue }
-    var title: String { self == .native ? "內建播放" : "自訂播放服務" }
+    var title: String {
+        switch self { case .native: "內建播放"; case .relay: "家中中繼"; case .bridge: "自訂播放服務" }
+    }
+    var supportsAccount: Bool { self != .bridge }
 }
 
 @MainActor
@@ -23,6 +26,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var playbackMode: PlaybackMode
     @Published private(set) var nativePlaybackQuality: NativePlaybackQuality
     @Published private(set) var serverURL: String
+    @Published private(set) var relayDirectFallback = true
     @Published private(set) var revision = UUID()
     @Published var searchHistory: [String]
     @Published private(set) var recommendationPreferences: RecommendationPreferences
@@ -86,7 +90,8 @@ final class AppModel: ObservableObject {
     var retryRequiredSyncCount: Int { library.retryRequiredCount }
     var accountNeedsLogin: Bool { library.needsLogin }
     var libraryCoverageText: String? { library.coverageText }
-    var canUseAccountLibrary: Bool { playbackMode == .native && hasAccount }
+    var supportsAccountPlayback: Bool { playbackMode.supportsAccount }
+    var canUseAccountLibrary: Bool { supportsAccountPlayback && hasAccount }
 
     init() {
         let initialPlayback = UserDefaults.standard.string(forKey: "playbackMode").flatMap(PlaybackMode.init(rawValue:)) ?? .native
@@ -98,6 +103,7 @@ final class AppModel: ObservableObject {
             ?? (legacyMode == "bridge" ? .bridge : .website)
         if initialPlayback == .native { catalogSource = .website }
         serverURL = UserDefaults.standard.string(forKey: "serverURL") ?? ""
+        relayDirectFallback = defaults.object(forKey: "relayDirectFallback") as? Bool ?? true
         searchHistory = UserDefaults.standard.stringArray(forKey: "searchHistory") ?? []
         let preferenceData = UserDefaults.standard.data(forKey: "recommendationPreferences.v1")
         recommendationPreferences = preferenceData.flatMap { data in
@@ -114,9 +120,9 @@ final class AppModel: ObservableObject {
     }
 
     private var libraryKey: String {
-        let origin = playbackMode == .native ? "public" : serverURL
+        let origin = playbackMode.supportsAccount ? "public" : serverURL
         let digest = SHA256.hash(data: Data(origin.utf8)).map { String(format: "%02x", $0) }.joined()
-        return "library.v1.\(playbackMode == .native ? "direct" : "bridge").\(digest)"
+        return "library.v1.\(playbackMode.supportsAccount ? "direct" : "bridge").\(digest)"
     }
 
     var isPlaybackConfigured: Bool { playbackMode == .native || !serverURL.isEmpty }
@@ -137,27 +143,56 @@ final class AppModel: ObservableObject {
     func playbackService() throws -> any CatalogService {
         if playbackMode == .native { return NativeCatalogService(quality: nativePlaybackQuality) }
         guard !serverURL.isEmpty else { throw AppError.message("請先設定播放服務，才能查詢可選集數與播放影片。") }
+        if playbackMode == .relay {
+            return HomeRelayService(configuration: try ServerConfiguration(baseURL: serverURL, token: token(for: serverURL)),
+                                    usesServerLibrary: catalogSource == .bridge,
+                                    allowsDirectFallback: relayDirectFallback,
+                                    direct: NativeCatalogService(quality: nativePlaybackQuality))
+        }
         return BridgeService(configuration: try ServerConfiguration(baseURL: serverURL, token: token(for: serverURL)))
     }
 
     func token(for address: String) -> String { KeychainToken.read(account: address) }
 
+    static func downloadForCurrentRoute(item: OfflineDownloadItem, destination: URL, maximumBytes: Int64,
+                                        progress: @escaping OfflineDownloads.Progress) async throws {
+        let report: @Sendable (Int64, Int64?) -> Void = { bytes, total in Task { await progress(bytes, total) } }
+        let settings = UserDefaults.standard
+        if settings.string(forKey: "playbackMode") == PlaybackMode.relay.rawValue {
+            let address = settings.string(forKey: "serverURL") ?? ""
+            let relay = HomeRelayService(configuration: try .init(baseURL: address, token: KeychainToken.read(account: address)),
+                allowsDirectFallback: settings.object(forKey: "relayDirectFallback") as? Bool ?? true)
+            try await relay.downloadOffline(seriesID: item.key.seriesID, episodeID: item.key.episodeID,
+                to: destination, maximumBytes: maximumBytes, progress: report)
+        } else {
+            try await NativeCatalogService().downloadOffline(seriesID: item.key.seriesID, episodeID: item.key.episodeID,
+                to: destination, maximumBytes: maximumBytes, progress: report)
+        }
+    }
+
     /// Verify the bridge contract before any URL/token is persisted. Cancellation leaves the existing configuration intact.
-    func connect(address: String, token: String, catalogSource: CatalogSource) async throws -> Int {
+    func connect(address: String, token: String, catalogSource: CatalogSource, mode: PlaybackMode = .bridge) async throws -> Int {
         let configuration = try ServerConfiguration(baseURL: address, token: token)
-        let count = try await BridgeService(configuration: configuration).verifyConnection()
+        let bridge = BridgeService(configuration: configuration)
+        let count = mode == .relay ? try await bridge.verifyRelayConnection() : try await bridge.verifyConnection()
         try Task.checkCancellation()
         let normalized = configuration.baseURL.absoluteString
         try KeychainToken.save(configuration.token, account: normalized)
         self.serverURL = normalized
         self.catalogSource = catalogSource
-        self.playbackMode = .bridge
-        defaults.set(PlaybackMode.bridge.rawValue, forKey: "playbackMode")
+        self.playbackMode = mode
+        defaults.set(mode.rawValue, forKey: "playbackMode")
         defaults.set(catalogSource.rawValue, forKey: "catalogSource")
         defaults.set(normalized, forKey: "serverURL")
         restoreLibrary()
         revision = UUID()
         return count
+    }
+
+    func setRelayDirectFallback(_ enabled: Bool) {
+        relayDirectFallback = enabled
+        defaults.set(enabled, forKey: "relayDirectFallback")
+        revision = UUID()
     }
 
     func useWebsiteCatalog() {
@@ -347,7 +382,7 @@ final class AppModel: ObservableObject {
     }
 
     private func restoreLibrary() {
-        library.selectSource(libraryKey, legacy: defaults.data(forKey: libraryKey), allowsAccount: playbackMode == .native)
+        library.selectSource(libraryKey, legacy: defaults.data(forKey: libraryKey), allowsAccount: supportsAccountPlayback)
         reloadTopicPreferences()
     }
 }

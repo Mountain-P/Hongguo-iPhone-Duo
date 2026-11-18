@@ -23,8 +23,8 @@ final class OfflineDownloadModel: ObservableObject {
                                                    appropriateFor: nil, create: true)
             .appendingPathComponent("OfflineEpisodes.v1", isDirectory: true)
         return try OfflineDownloads(directory: directory) { item, destination, maximumBytes, progress in
-            try await NativeCatalogService().downloadOffline(seriesID: item.key.seriesID, episodeID: item.key.episodeID,
-                to: destination, maximumBytes: maximumBytes, progress: progress)
+            try await AppModel.downloadForCurrentRoute(item: item, destination: destination,
+                                                       maximumBytes: maximumBytes, progress: progress)
         }
     }) {
         self.openStorage = openStorage

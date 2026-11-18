@@ -66,6 +66,11 @@ async function registerPlaybackDevice(requestJson, options = {}) {
                 custom: { account_region_src: 'fallback', account_region: 'cn', host_bit: 64, dragon_device_type: 'phone' }, pre_installed_channel: '',
                 apk_first_install_time: now, is_system_app: 0, sdk_flavor: 'china', guest_mode: 0,
             };
+            // Account registration is explicit and isolated; the default playback profile is unchanged.
+            if (options.accountProfile === true) Object.assign(header, {
+                app_version: '7.3.5.32', app_version_minor: '7.3.5.32', version_code: 73532,
+                update_version_code: 73532, manifest_version_code: 73532,
+            });
             const compressed = gzipSync(Buffer.from(JSON.stringify({ magic_tag: 'ss_app_log', header, _gen_time: now })));
             const random = crypto.randomBytes(32);
             const derived = crypto.createHash('sha512').update(Buffer.concat([
@@ -77,7 +82,7 @@ async function registerPlaybackDevice(requestJson, options = {}) {
             const response = await requestJson(REGISTER_URL, {
                 method: 'POST',
                 headers: {
-                    'User-Agent': 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)',
+                    'User-Agent': options.accountProfile === true ? 'com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)' : 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)',
                     Accept: 'application/json', 'Content-Type': 'application/octet-stream;tt-data=a',
                     'log-encode-type': 'gzip', 'x-ss-dp': '8662', 'x-ss-req-ticket': String(now),
                     'x-vc-bdturing-sdk-version': '4.0.3.cn', lc: '101', 'sdk-version': '2',
@@ -92,16 +97,21 @@ async function registerPlaybackDevice(requestJson, options = {}) {
             const device_id = responseId(response, 'device_id');
             const iid = responseId(response, 'install_id');
             if (Number(response?.code ?? response?.Code ?? 0) !== 0) throw Object.assign(new Error('Registration rejected'), { code: 'BUSINESS_REJECTED' });
+            if (String(response?.device_id_str ?? response?.device_id) === '0'
+                && String(response?.install_id_str ?? response?.install_id) === '0') {
+                throw Object.assign(new Error('Registration temporarily returned no identity'), { code: 'REGISTRATION_UNAVAILABLE' });
+            }
             if (!device_id || !iid) throw Object.assign(new Error('Invalid registration'), { code: 'INVALID_RESPONSE' });
         if (!options.isolated) registrationRetryAfter = 0;
-        return Object.freeze({ device_id, iid, cdid, ...(options.captureCookies && cookie ? { cookie } : {}) });
+        return Object.freeze({ device_id, iid, cdid, ...(options.captureCookies && cookie ? { cookie } : {}),
+            ...(options.accountProfile === true ? { clientudid: header.clientudid, openudid: header.openudid, createdAtMilliseconds: now } : {}) });
     } catch (error) {
         if (options.signal?.aborted) throw options.signal.reason;
         const status = Number(error?.status);
         const registrationFailure = Number.isInteger(status) && status >= 300 && status <= 599 ? `HTTP_${status}`
             : ['ECONNABORTED', 'ETIMEDOUT'].includes(error?.code) ? 'TIMEOUT'
             : ['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error?.code) ? 'NETWORK_ERROR'
-            : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.code) ? error.code : 'UNKNOWN';
+            : ['EMPTY_RESPONSE', 'INVALID_RESPONSE', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'REGISTRATION_UNAVAILABLE'].includes(error?.code) ? error.code : 'UNKNOWN';
         if (!options.isolated) {
             registrationRetryAfter = Date.now() + 10000;
             lastRegistrationFailure = registrationFailure;

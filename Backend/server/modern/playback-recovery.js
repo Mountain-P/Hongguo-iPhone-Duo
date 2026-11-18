@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Protocol contract checked against aston314/hongguo-tv 36508246eeca2cf5ef1f29f7f17f8e985d50ae2e.
-// Anonymous video_tab identity is separate from each legacy POST resolution.
+// Tab and legacy identities use separate scopes; a second recovery round renews legacy.
 const LEGACY_HOSTS = Object.freeze(['api5-normal-sinfonlineb.fqnovel.com', 'api5-normal-hl.fqnovel.com']);
-const RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_HTTP = new Set([408, 425, 500, 502, 503, 504]);
 const RETRYABLE_NETWORK = new Set(['ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_NETWORK']);
+const TERMINAL_HTTP = new Set([401, 403, 429]);
+const DENIAL_CODES = new Set(['HTTP_401', 'HTTP_403', 'HTTP_429', 'BUSINESS_REJECTED', 'SECURITY_BLOCKED']);
 
 function failure(code, message) { return Object.assign(new Error(message), { code }); }
 function checkActive(signal, deadline, now = Date.now) {
@@ -11,9 +13,12 @@ function checkActive(signal, deadline, now = Date.now) {
     if (now() >= deadline) throw failure('ETIMEDOUT', '播放准备超时，请重试');
 }
 function terminal(error) {
-    return [401, 403].includes(Number(error?.status))
-        || ['BUSINESS_REJECTED', 'SECURITY_BLOCKED', 'NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE'].includes(error?.code)
-        || ['BUSINESS_REJECTED', 'SECURITY_BLOCKED'].includes(error?.registrationFailure);
+    return TERMINAL_HTTP.has(Number(error?.status))
+        // Zero IDs are temporary but require a caller cooldown, not more immediate registrations.
+        || error?.registrationFailure === 'REGISTRATION_UNAVAILABLE'
+        || DENIAL_CODES.has(error?.code) || DENIAL_CODES.has(error?.registrationFailure)
+        || ['NO_COMPATIBLE_SOURCE', 'QUALITY_UNAVAILABLE', 'ERR_CANCELED', 'ABORT_ERR'].includes(error?.code)
+        || error?.name === 'AbortError';
 }
 function retryable(error) {
     if (error?.stage && error.stage !== 'multi_video_model') return false;
@@ -21,16 +26,16 @@ function retryable(error) {
         || RETRYABLE_NETWORK.has(error?.code) || RETRYABLE_HTTP.has(Number(error?.status));
 }
 
-function normalizeVideoTabEnvelope(vid, response) {
+function normalizeVideoTabEnvelope(vid, response, contentType = '1004') {
     if (Number(response?.Code || response?.code || 0) !== 0) throw failure('BUSINESS_REJECTED', '来源未授权提供本集播放信息');
-    const rows = response?.data?.video_model_data || response?.data;
+    const rows = response?.data?.[contentType] ?? response?.data?.video_model_data ?? response?.data;
     // Never substitute the first unrelated result for the requested episode.
     const entry = rows?.[vid];
     if (!entry || !entry.video_model) throw failure('MISSING_MODEL', '来源未返回所选分集');
     return { code: 0, data: { [vid]: entry } };
 }
 
-function createPlaybackRecovery({ register, getModel, postModel, consume, now = Date.now, tabTTL = 300000 }) {
+function createPlaybackRecovery({ register, getModel, postModel, consume, now = Date.now, tabTTL = 300000, primaryScope = 'tab', primaryRoute = 'video_tab' }) {
     let tabIdentity;
     let tabIdentityExpires = 0;
     return async function resolve(vid, { signal, deadline = now() + 30000, contentType = '1004', options = {} } = {}) {
@@ -38,26 +43,26 @@ function createPlaybackRecovery({ register, getModel, postModel, consume, now = 
         let lastError;
         try {
             if (!tabIdentity || tabIdentityExpires <= now()) {
-                const identity = await register({ scope: 'tab', signal, deadline });
+                const identity = await register({ scope: primaryScope, signal, deadline });
                 checkActive(signal, deadline, now);
                 tabIdentity = identity;
                 tabIdentityExpires = now() + tabTTL;
             }
-            const response = normalizeVideoTabEnvelope(vid, await getModel(vid, tabIdentity, { signal, deadline }));
+            const response = normalizeVideoTabEnvelope(vid, await getModel(vid, tabIdentity, { signal, deadline, contentType }), contentType);
             checkActive(signal, deadline, now);
-            const value = await consume(response, vid, options, { signal, deadline });
+            const value = await consume(response, vid, options, { signal, deadline, route: primaryRoute });
             checkActive(signal, deadline, now);
-            return { value, recovery: { route: 'video_tab', attempts: 1 } };
+            return { value, recovery: { route: primaryRoute, attempts: 1 } };
         } catch (error) {
             checkActive(signal, deadline, now);
-            if (terminal(error)) throw error;
+            if (options.offlineDirect === true || terminal(error)) throw error;
             lastError = error;
         }
         let attempts = 0;
         for (let round = 0; round < 2; round++) {
             checkActive(signal, deadline, now);
             let identity;
-            try { identity = await register({ scope: 'legacy', signal, deadline }); }
+            try { identity = await register({ scope: 'legacy', fresh: round > 0, signal, deadline }); }
             catch (error) {
                 checkActive(signal, deadline, now);
                 if (terminal(error)) throw error;

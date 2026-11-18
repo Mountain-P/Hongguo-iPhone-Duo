@@ -12,6 +12,9 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         let allToEnd: Bool
         var delivered: Int64 = 0
         var targetLength: Int64?
+        var totalLength: Int64?
+        var etag: String?
+        var retries = 0
 
         init(_ request: AVAssetResourceLoadingRequest, offset: Int64, length: Int, allToEnd: Bool) {
             self.request = request
@@ -23,9 +26,11 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
 
     private let sourceURL: URL
     private let headers: [String: String]
+    private let resumesInterruptedRanges: Bool
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.media")
     private var pending: [Int: Pending] = [:]
     private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
+    private var retrying: [ObjectIdentifier: Pending] = [:]
     private var stopped = false
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -39,9 +44,10 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         return URLSession(configuration: configuration, delegate: self, delegateQueue: operations)
     }()
 
-    init(url: URL, headers: [String: String]) {
+    init(url: URL, headers: [String: String], resumesInterruptedRanges: Bool = false) {
         self.sourceURL = url
         self.headers = headers
+        self.resumesInterruptedRanges = resumesInterruptedRanges
         super.init()
     }
 
@@ -57,10 +63,11 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         queue.async { [self] in
             guard !stopped else { return }
             stopped = true
-            for entry in pending.values {
+            for entry in Array(pending.values) + Array(retrying.values) {
                 entry.request.finishLoading(with: Self.failure("播放已停止。"))
             }
             pending.removeAll()
+            retrying.removeAll()
             tasks.removeAll()
             session.invalidateAndCancel()
         }
@@ -97,6 +104,7 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
                         didCancel loadingRequest: AVAssetResourceLoadingRequest) {
+        retrying.removeValue(forKey: ObjectIdentifier(loadingRequest))
         guard let task = tasks.removeValue(forKey: ObjectIdentifier(loadingRequest)) else { return }
         pending.removeValue(forKey: task.taskIdentifier)
         task.cancel()
@@ -110,13 +118,16 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
             return
         }
         guard http.statusCode == 200 || http.statusCode == 206 else {
+            if [408, 429, 500, 502, 503, 504].contains(http.statusCode), retry(dataTask, entry: entry) {
+                completionHandler(.cancel); return
+            }
             finish(dataTask, error: Self.failure(http.statusCode == 401 ? "影片授權已失效，請檢查服務口令。" : "影片服務暫時無法提供資料。"))
             completionHandler(.cancel)
             return
         }
         let contentRange = http.value(forHTTPHeaderField: "Content-Range").flatMap(MediaByteRange.parse)
-        guard (http.statusCode == 206 && contentRange?.start == entry.offset)
-                || (http.statusCode == 200 && entry.offset == 0) else {
+        guard (http.statusCode == 206 && contentRange?.start == entry.offset + entry.delivered)
+                || (http.statusCode == 200 && entry.offset + entry.delivered == 0) else {
             finish(dataTask, error: Self.failure("影片服務未正確回應快轉所需的資料範圍。"))
             completionHandler(.cancel)
             return
@@ -127,6 +138,14 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
             completionHandler(.cancel)
             return
         }
+        let etag = http.value(forHTTPHeaderField: "ETag")
+        guard entry.totalLength == nil || entry.totalLength == total,
+              entry.etag == nil || entry.etag == etag else {
+            finish(dataTask, error: Self.failure("影片版本已變更，請重新取源。"))
+            completionHandler(.cancel); return
+        }
+        entry.totalLength = total
+        entry.etag = etag
         if let info = entry.request.contentInformationRequest {
             info.contentLength = total
             info.contentType = response.mimeType.flatMap { UTType(mimeType: $0)?.identifier } ?? UTType.mpeg4Movie.identifier
@@ -155,6 +174,12 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let entry = pending[task.taskIdentifier], let dataTask = task as? URLSessionDataTask else { return }
         if error != nil || entry.delivered != entry.targetLength {
+            let network = error as? URLError
+            let transient = error == nil || network.map {
+                [.timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+                 .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable].contains($0.code)
+            } == true
+            if transient, retry(dataTask, entry: entry) { return }
             finish(dataTask, error: Self.failure("影片連線中斷，請重試。"))
         } else {
             finish(dataTask)
@@ -183,6 +208,38 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
             for (name, value) in headers { redirected.setValue(value, forHTTPHeaderField: name) }
         }
         completionHandler(redirected)
+    }
+
+    /// Resume only an immutable, authenticated relay URL. A delivered prefix requires
+    /// an unchanged ETag/total; retries never combine bytes from re-resolved sources.
+    private func retry(_ task: URLSessionDataTask, entry: Pending) -> Bool {
+        guard resumesInterruptedRanges, !stopped, entry.retries < 4,
+              entry.delivered == 0 || entry.etag != nil else { return false }
+        let delays: [Double] = [0.5, 1, 2, 5]
+        let delay = delays[entry.retries]; entry.retries += 1
+        let key = ObjectIdentifier(entry.request)
+        pending.removeValue(forKey: task.taskIdentifier); tasks.removeValue(forKey: key)
+        retrying[key] = entry
+        task.cancel()
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.stopped, self.retrying[key] === entry else { return }
+            self.retrying.removeValue(forKey: key)
+            let remaining = (entry.targetLength ?? entry.requestedLength) - entry.delivered
+            guard remaining > 0, remaining <= Int64(Int.max),
+                  let range = MediaByteRange.requestHeader(offset: entry.offset + entry.delivered,
+                    length: Int(remaining), allToEnd: entry.allToEnd) else {
+                entry.request.finishLoading(with: Self.failure("影片資料範圍無效。")); return
+            }
+            var request = URLRequest(url: self.sourceURL)
+            for (name, value) in self.headers { request.setValue(value, forHTTPHeaderField: name) }
+            request.setValue(range, forHTTPHeaderField: "Range")
+            request.setValue(entry.etag, forHTTPHeaderField: "If-Range")
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            let resumed = self.session.dataTask(with: request)
+            self.pending[resumed.taskIdentifier] = entry; self.tasks[key] = resumed
+            resumed.resume()
+        }
+        return true
     }
 
     private func finish(_ task: URLSessionDataTask, error: Error? = nil) {

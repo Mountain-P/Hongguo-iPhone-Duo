@@ -24,9 +24,16 @@ struct SettingsView: View {
             appSection
             playbackSection
             if playbackMode == .native { playbackCacheSection }
-            if playbackMode == .bridge {
+            if playbackMode != .native {
                 bridgeSection
                 catalogSection
+            }
+            if playbackMode == .relay {
+                Section("中繼備援") {
+                    Toggle("中繼無法連線時使用手機取源", isOn: Binding(get: { model.relayDirectFallback }, set: { model.setRelayDirectFallback($0) }))
+                    Text("中繼連線或取源暫時失敗時改用內建播放；口令錯誤不會自動略過。手機取源也可能需要更新才能使用。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             watchingSection
             projectSection
@@ -87,18 +94,18 @@ struct SettingsView: View {
             Text("下次取源時生效，不會即時切換目前影片。省流量優先選較低畫質；來源沒有較低版本時，仍使用可播放畫質。只作用於內建播放。")
                 .font(.footnote).foregroundStyle(.secondary)
         } else {
-            Text("選用功能：連接你自行架設的相容服務。完成驗證後才會切換。")
+            Text(playbackMode == .relay ? "由伺服器準備影片再送到手機，完成驗證後才會切換。家中中繼會保留帳號、收藏與觀看進度。" : "連接你自行架設的相容服務，完成驗證後才會切換。")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }
     }
 
     private var bridgeSection: some View {
-    Section("自訂播放服務") {
+    Section(playbackMode == .relay ? "家中中繼服務" : "自訂播放服務") {
         TextField("https://video.example.com", text: $address)
             .textContentType(.URL).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
             .accessibilityLabel("播放服務網址").disabled(isConnecting)
-        SecureField("服務口令（未啟用可留空）", text: $token)
+        SecureField(playbackMode == .relay ? "中繼口令（必填）" : "服務口令（未啟用可留空）", text: $token)
             .textInputAutocapitalization(.never).autocorrectionDisabled().disabled(isConnecting)
         Text("請填入本專案橋接服務的網址。其他短劇網站或 Quest 影院網址不能直接當作此服務使用。外網使用 HTTPS；區域網路可使用 HTTP。")
             .font(.footnote).foregroundStyle(.secondary)
@@ -136,9 +143,9 @@ struct SettingsView: View {
     private var catalogSection: some View {
     Section("瀏覽目錄") {
         Picker("目錄來源", selection: $catalogSource) {
-            ForEach(CatalogSource.allCases) { Text($0.title).tag($0) }
+            ForEach(CatalogSource.allCases) { Text(playbackMode == .relay && $0 == .bridge ? "伺服器已存劇集" : $0.title).tag($0) }
         }.disabled(isConnecting)
-        Text("選擇自訂服務後，可繼續使用內建目錄找劇。播放將使用已驗證的自訂服務。")
+        Text(playbackMode == .relay ? "伺服器已存劇集只列出家中已下載的集數。選擇內建目錄可找更多劇，播放仍由中繼準備。" : "選擇自訂服務後，可繼續使用內建目錄找劇。播放將使用已驗證的自訂服務。")
             .font(.footnote).foregroundStyle(.secondary)
         Button("使用內建目錄瀏覽") {
             catalogSource = .website
@@ -193,12 +200,13 @@ struct SettingsView: View {
         let draftAddress = address
         let draftToken = token
         let draftCatalog = catalogSource
+        let draftMode = playbackMode
         isConnecting = true
         status = nil
         connectionTask = Task {
             defer { if request == operationID { isConnecting = false; connectionTask = nil } }
             do {
-                let count = try await model.connect(address: draftAddress, token: draftToken, catalogSource: draftCatalog)
+                let count = try await model.connect(address: draftAddress, token: draftToken, catalogSource: draftCatalog, mode: draftMode)
                 guard request == operationID, !Task.isCancelled else { return }
                 status = "服務協定與目錄已確認，取得 \(count) 部劇集。各集播放結果仍以實際取源為準。"
                 if isSetupSheet { dismiss() }

@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import axios from 'axios';
 import modern from './modern/app-source.js';
 import streamCache from './modern/stream-cache.js';
+import { clearHeaderPatches, applyClearHeaderPatches } from './relay/clear-header.mjs';
 
 const SITE = 'https://hongguoduanju.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
@@ -47,9 +48,29 @@ async function prepare(vid, { signal } = {}) {
   if (!['h264', 'avc', 'avc1', 'hevc', 'h265', 'hvc1', 'hev1'].includes(source.codec)) throw Object.assign(new Error('No compatible iPhone codec'), { code: 'NO_COMPATIBLE_SOURCE' });
   const key = source.contentKey ? Buffer.from(source.contentKey, 'hex') : null;
   if (key && key.length !== 16) throw new Error('Invalid content key');
-  let knownTotal;
+  let knownTotal, knownValidator;
+  function checkedMediaURL(value) {
+    const url = new URL(value);
+    const domains = ['fqnovelvod.com', 'qznovelvod.com', 'snssdk.com', 'bytecdn.cn', 'bytecdn.com', 'douyinvod.com'];
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.port ||
+        !domains.some(domain => url.hostname === domain || url.hostname.endsWith('.' + domain))) {
+      throw Object.assign(new Error('Unsupported media origin'), { code: 'SECURITY_BLOCKED', status: 403 });
+    }
+    return url.href;
+  }
   async function range(start, end, requestSignal) {
-    const response = await http.get(source.url, { signal: requestSignal, responseType: 'arraybuffer', headers: { 'User-Agent': source.userAgent || UA, Referer: source.referer || 'https://novel.snssdk.com/', Range: `bytes=${start}-${end}` } });
+    let url = checkedMediaURL(source.url), response;
+    for (let redirects = 0; redirects < 5; redirects++) {
+      response = await http.get(url, { signal: requestSignal, maxRedirects: 0, validateStatus: () => true,
+        responseType: 'arraybuffer', headers: { 'User-Agent': source.userAgent || UA,
+        Referer: source.referer || 'https://novel.snssdk.com/', Range: `bytes=${start}-${end}` } });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      url = checkedMediaURL(new URL(response.headers.location, url).href);
+    }
+    if (![200, 206].includes(response.status)) throw Object.assign(new Error('Media request failed'), { status: response.status });
+    const validator = response.headers.etag || response.headers['last-modified'];
+    if (knownValidator && validator !== knownValidator) throw Object.assign(new Error('Media changed'), { code: 'MEDIA_CHANGED', status: 409 });
+    if (validator) knownValidator = validator;
     let data = Buffer.from(response.data);
     const total = Number(String(response.headers['content-range'] || '').match(/\/(\d+)$/)?.[1] || response.headers['content-length'] || data.length);
     if (response.status === 200) data = data.subarray(start, end + 1);
@@ -59,7 +80,7 @@ async function prepare(vid, { signal } = {}) {
       const bounds = String(response.headers['content-range'] || '').match(/^bytes (\d+)-(\d+)\/(\d+)$/);
       if (!bounds || Number(bounds[1]) !== start || Number(bounds[2]) !== Math.min(end, total - 1)) throw new Error('Mismatched media range');
     }
-    if (knownTotal && knownTotal !== total) throw new Error('Media changed during playback');
+    if (knownTotal && knownTotal !== total) throw Object.assign(new Error('Media changed during playback'), { code: 'MEDIA_CHANGED', status: 409 });
     knownTotal = total;
     return { data, total };
   }
@@ -80,6 +101,7 @@ async function prepare(vid, { signal } = {}) {
       if (at >= 4 && head.readUInt32BE(at - 4) >= 8 && at - 4 + head.readUInt32BE(at - 4) <= head.length) prepared.header.write('avc1', at, 'ascii');
     }
   }
+  applyClearHeaderPatches(prepared.header, 0, clearHeaderPatches(prepared.header));
   return { total: first.total, chunk: async (start, end, { signal: chunkSignal } = {}) => media.decryptPartial((await range(start, end, chunkSignal)).data, start, key, prepared) };
 }
 

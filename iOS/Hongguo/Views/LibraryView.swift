@@ -70,7 +70,7 @@ struct LibraryView: View {
                 model.selectLibraryOwner(.guest)
             } else if model.canUseAccountLibrary, let profile = model.accountProfile {
                 model.selectLibraryOwner(.account(id: profile.id))
-            } else if model.playbackMode == .native {
+            } else if model.supportsAccountPlayback {
                 showingLogin = true
             }
         }
@@ -114,7 +114,7 @@ struct LibraryView: View {
                     if model.showingAccountLibrary {
                         accountSyncPanel
                     } else {
-                        Text(model.playbackMode == .native
+                        Text(model.supportsAccountPlayback
                              ? "本機片庫保存在這部 iPhone。登入後可自行選擇匯入帳號。"
                              : "目前使用自訂播放服務，收藏與觀看紀錄保存在本機片庫。")
                             .font(.caption).foregroundStyle(Theme.muted)
@@ -370,7 +370,7 @@ struct LibraryView: View {
                 if let profile = model.accountProfile {
                     Text(profile.maskedPhone.isEmpty ? "紅果帳號" : profile.maskedPhone)
                         .font(.caption).foregroundStyle(Theme.muted)
-                } else if model.playbackMode == .native {
+                } else if model.supportsAccountPlayback {
                     Button("手機驗證碼登入") { showingLogin = true }
                         .font(.subheadline.weight(.medium)).buttonStyle(.borderedProminent)
                         .tint(Theme.accent).foregroundStyle(.black).controlSize(.small)
@@ -416,7 +416,7 @@ struct LibraryView: View {
             Text("帳號片庫").tag(true)
         }
         .pickerStyle(.segmented)
-        .disabled(model.playbackMode != .native)
+        .disabled(!model.supportsAccountPlayback)
     }
 
     private var accountSyncPanel: some View {

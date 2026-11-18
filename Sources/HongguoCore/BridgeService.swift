@@ -45,9 +45,21 @@ public struct ServerConfiguration: Hashable, Sendable {
 public struct BridgeService: CatalogService {
     public let configuration: ServerConfiguration
     private let transport: any HTTPTransport
+    private let includesSeriesContext: Bool
 
-    public init(configuration: ServerConfiguration, transport: any HTTPTransport = URLSessionTransport()) {
+    public init(configuration: ServerConfiguration, transport: any HTTPTransport = URLSessionTransport(),
+                includesSeriesContext: Bool = false) {
         self.configuration = configuration; self.transport = transport
+        self.includesSeriesContext = includesSeriesContext
+    }
+
+    public func verifyRelayConnection() async throws -> Int {
+        let health = try await get("health")
+        guard string(health["service"]) == "hongguotv", integer(health["apiVersion"]) == 1,
+              (health["capabilities"] as? [String])?.contains("home-relay-v1") == true else {
+            throw CatalogError.incompatibleBridge
+        }
+        return try await home(page: 1).items.count
     }
 
     public func checkConnection() async throws {
@@ -121,7 +133,9 @@ public struct BridgeService: CatalogService {
 
     public func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
         try validateID(seriesID); try validateID(episodeID)
-        let data = try await get("api/episodes/\(episodeID)/play", query: fresh ? [.init(name: "fresh", value: "1")] : [])
+        var query: [URLQueryItem] = fresh ? [.init(name: "fresh", value: "1")] : []
+        if includesSeriesContext { query.append(.init(name: "series_id", value: seriesID)) }
+        let data = try await get("api/episodes/\(episodeID)/play", query: query)
         let path = string(data["path"])
         let url = try playbackURL(path)
         let contentType = string(data["contentType"])

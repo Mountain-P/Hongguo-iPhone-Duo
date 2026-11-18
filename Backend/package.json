@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "license": "GPL-3.0-only",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "setup": "npm ci --prefix server --no-audit --no-fund",
     "start": "node server/modern-index.mjs",
@@ -12,6 +14,7 @@
     "start:legacy": "node server/index.mjs",
     "test": "node --test tests/*.test.mjs",
     "probe": "node scripts/probe.mjs",
-    "fixture": "node fixtures/server.mjs"
+    "fixture": "node fixtures/server.mjs",
+    "start:relay": "node server/relay-index.mjs"
   }
 }

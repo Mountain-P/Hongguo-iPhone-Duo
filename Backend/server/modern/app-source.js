@@ -6,6 +6,7 @@
 // bounded HTTPS transport; exact episode matching; supported codec selection.
 // Crypto tables and SDK protocol constants below are not user credentials.
 const crypto = require('node:crypto');
+const { gzipSync } = require('node:zlib');
 const { registerPlaybackDevice } = require('./playback-device');
 const sm3 = require('./sm3');
 const { normalizeDownloadQuality, meetsDownloadQuality } = require('./download-quality');
@@ -14,10 +15,10 @@ const localId = () => String(1000000000000000n + BigInt('0x' + crypto.randomByte
 const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
-const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
+const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
-const PLAYBACK_UA = 'com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)';
+const PLAYBACK_UA = VIDEO_UA.replace('71332', '74332');
 const SEARCH_UA = 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)';
 const DEVICE = {
     ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
@@ -27,6 +28,8 @@ const DEVICE = {
     update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
     compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
+const PRIMARY_INLINE_UA = PLAYBACK_UA;
+
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
 function cleanUrl(value) { return str(value).replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&'); }
 function jsonBody(value) { try { return JSON.parse(value); } catch { return null; } }
@@ -136,30 +139,50 @@ function helios(khronos) {
 
 function branchOf(url, body, khronos) { const bodyMd5 = body ? crypto.createHash('md5').update(body).digest() : Buffer.alloc(16); const q = sm3(url.split('?')[1]); const iv = getIv(getIv(getIv(0x20230928, q), bodyMd5), le32(khronos)); const low = iv & 15; return low - (((low * 171) >> 9) * 3); }
 function playbackRequest(payload, identity, host = new URL(VIDEO_API).hostname) {
-    const body = Buffer.from(payload);
-    const khronos = Math.floor(Date.now() / 1000), ticketBase = Date.now();
+    // Match the current upstream POST contract as well as the primary GET.
+    // The signature and stub must describe the compressed bytes actually sent.
+    const { signPlayer } = require('./playback-signature');
+    const body = gzipSync(Buffer.from(payload));
+    const requestTicket = Date.now(), khronos = Math.floor(requestTicket / 1000);
     // Registration Cookies and other account/profile fields never enter this signed query.
-    const device = { ...DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
-    let query, url, requestTicket;
-    for (let n = 0; n < 256; n += 1) {
-        requestTicket = ticketBase + n;
-        query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
-        url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
-        if (branchOf(url, body, khronos) === 2) break;
-        if (n === 255) throw new Error('无法生成播放请求签名');
-    }
+    const device = { ...DEVICE, version_code: '74332', version_name: '7.4.3.32',
+        manifest_version_code: '74332', update_version_code: '74332', pv_player: '74332',
+        device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
+    const query = pythonUrlEncode({ ...device, ts: String(khronos), _rticket: String(requestTicket) });
+    const url = `https://${host}/novel/player/multi_video_model/v1/?${query}`;
+    const signed = signPlayer({ query, body, ts: khronos });
     return { url, body, headers: {
-        'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
+        'User-Agent': VIDEO_UA.replace(DEVICE.version_code, device.version_code), Accept: 'application/json; charset=utf-8,application/x-protobuf',
         'Content-Type': 'application/json; charset=UTF-8',
-        'x-ss-stub': md5(body), 'passport-sdk-version': '50561',
-        'x-tt-request-tag': 't=0;n=0', 'x-vc-bdturing-sdk-version': '3.7.2.cn',
-        'x-ss-req-ticket': String(requestTicket), 'sdk-version': '2', 'x-xs-from-web': '0',
-        'x-khronos': String(khronos),
-        'x-gorgon': xGorgon(query, body, khronos, Math.floor(Math.random() * 65536)),
-        'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-        'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos, device), 'x-tt-dt': '',
+        'Content-Encoding': 'gzip', 'x-ss-stub': signed['x-ss-stub'], 'passport-sdk-version': '5051452',
+        'x-ss-req-ticket': signed['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
+        'x-ss-dp': String(device.aid), 'x-khronos': signed['x-khronos'],
+        'x-ladon': signed['x-ladon'], 'x-argus': signed['x-argus'], 'x-tt-dt': '',
         'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
     } };
+}
+
+// Playback-only v5 protocol from jackotom/hongguo-drama 100d7c7bfa40328d2304b29eb852ca304f53e59b.
+// Sign the exact gzip bytes sent on the wire. Account/search profiles stay separate.
+function primaryPlaybackRequest(vid, identity, contentType = '1004', alternate = false) {
+    const { signPlaybackV5 } = require('./playback-v5');
+    const payload = JSON.stringify({
+        biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false,
+            disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false,
+            use_os_player: false, use_server_dns: false, video_platform: 1024 },
+        mixed_video_id_map: { [contentType]: [vid] }, dr_scene: 'player',
+    });
+    const body = gzipSync(Buffer.from(payload));
+    const signed = signPlaybackV5({
+        base: alternate ? PLAYER_API.replace('sinfonlineb.', 'sinfonlinea.') : PLAYER_API,
+        values: { aid: '8662', app_name: 'novelread', version_code: '74332', version_name: '7.4.3.32',
+            channel: 'vivo_8662_64', device_platform: 'android', device_type: 'PGT-AN10', os_version: '12',
+            update_version_code: '74332', iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id },
+        body, now: Date.now(),
+    });
+    return { ...signed, body, method: 'POST', headers: { ...signed.headers,
+        'User-Agent': 'com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)',
+        Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' } };
 }
 
 function parseSearchInteger(value) {
@@ -263,6 +286,87 @@ function signedAccountRequest(apiPath, values = {}, identity) {
         'x-medusa': buildMedusa(url, null, khronos, device), 'x-tt-dt': '',
     };
     return { url, headers };
+}
+
+// Local native App account adapter. Crypto primitives above remain unchanged.
+function nativeAppQuery(identity) {
+    if (![identity?.device_id, identity?.iid].every(value => typeof value === 'string' && /^\d{1,30}$/.test(value) && /[1-9]/.test(value)) ||
+        typeof identity?.cdid !== 'string' || !/^[a-f0-9-]{36}$/i.test(identity.cdid)) throw Object.assign(new Error('Invalid App device'), { code: 'INVALID_INPUT' });
+    return { ac: 'wifi', aid: '8662', app_name: 'novelread', channel: 'update_64', device_brand: 'Redmi', device_id: identity.device_id,
+        device_platform: 'android', device_type: '25053RT47C', dpi: '520', iid: identity.iid, language: 'zh', manifest_version_code: '73532',
+        os: 'android', os_api: '36', os_version: '16', resolution: '1280*2772', ssmix: 'a', update_version_code: '73532', version_code: '73532',
+        version_name: '7.3.5.32', cdid: identity.cdid, ...(identity.openudid ? { openudid: identity.openudid } : {}) };
+}
+
+// Standard RC4 mode-4 Gorgon, independently expressed from the package protocol/vector facts.
+function internationalGorgon(query, body, timestamp, nonce) {
+    const data = Buffer.alloc(20);
+    crypto.createHash('md5').update(query).digest().copy(data, 0, 0, 4);
+    if (body?.length) crypto.createHash('md5').update(body).digest().copy(data, 4, 0, 4);
+    data.writeUInt32LE(67503104, 12); data.writeUInt32BE(timestamp >>> 0, 16);
+    const key = [0x4a, 0x40, 0x16, (nonce >>> 8) & 255, 0x47, 0x6c, 1, nonce & 255];
+    const permutation = Array.from({ length: 256 }, (_, index) => index);
+    let cursor = 0;
+    for (let index = 0; index < 256; index++) {
+        cursor = (cursor + permutation[index] + key[index % 8]) & 255;
+        [permutation[index], permutation[cursor]] = [permutation[cursor], permutation[index]];
+    }
+    let first = 0; cursor = 0;
+    for (let index = 0; index < data.length; index++) {
+        first = (first + 1) & 255; cursor = (cursor + permutation[first]) & 255;
+        [permutation[first], permutation[cursor]] = [permutation[cursor], permutation[first]];
+        data[index] ^= permutation[(permutation[first] + permutation[cursor]) & 255];
+    }
+    for (let index = 0; index < data.length; index++) {
+        data[index] = ((data[index] << 4) | (data[index] >>> 4)) & 255;
+        data[index] = ~(reverseBits(data[index] ^ data[(index + 1) % data.length]) ^ 20) & 255;
+    }
+    return Buffer.concat([Buffer.from([0x84, 4, nonce & 255, (nonce >>> 8) & 255, 0x40, 1]), data]).toString('hex');
+}
+
+function nativeAppRequest(method, apiPath, values, identity, payload, mode = 0, contentType = 'application/json; charset=utf-8') {
+    const body = payload === null ? null : Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    const device = nativeAppQuery(identity), stamp = Date.now(), ts = Math.floor(stamp / 1000);
+    let query, url, ticket;
+    for (let offset = 0; offset < 256; offset++) {
+        ticket = stamp + offset; query = pythonUrlEncode({ ...values, ...device, _rticket: String(ticket) });
+        url = 'https://api5-normal-lq.fqnovel.com' + apiPath + '?' + query;
+        if (branchOf(url, body, ts) === 2) break;
+        if (offset === 255) throw Object.assign(new Error('App signing unavailable'), { code: 'SIGNING_UNAVAILABLE' });
+    }
+    const headers = { 'User-Agent': 'com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)',
+        Accept: 'application/json', 'x-xs-from-web': '0', 'sdk-version': '2', 'passport-sdk-version': '6031190', 'x-ss-dp': '8662',
+        'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did', 'x-khronos': String(ts), 'x-ss-req-ticket': String(ticket), 'x-helios': helios(ts) };
+    const nonce = Math.floor(Math.random() * 65536);
+    if (mode === 4) {
+        headers['x-gorgon'] = internationalGorgon(query, body, ts, nonce);
+        headers['x-argus'] = le32(ts).toString('base64'); headers['x-ladon'] = be32(ts).toString('base64');
+        const trace = (stamp >>> 0).toString(16).padStart(8, '0') + '10' + crypto.randomBytes(8).toString('hex');
+        headers['x-tt-trace-id'] = '00-' + trace + '-' + trace.slice(0, 16) + '-01';
+    } else {
+        headers['x-gorgon'] = xGorgon(query, body, ts, nonce);
+        headers['x-medusa'] = buildMedusa(url, body, ts, device);
+    }
+    if (apiPath.startsWith('/passport/')) {
+        headers['passport-sdk-version'] = '5051452'; headers['x-vc-bdturing-sdk-version'] = '4.0.3.cn'; headers.lc = '101';
+    }
+    if (body) { headers['Content-Type'] = contentType; headers['x-ss-stub'] = md5(body); }
+    return { url, headers, body };
+}
+
+function signedAccountLibraryRequest(method, apiPath, values = {}, identity, payload = null) {
+    const routes = ['GET /reading/bookapi/read_history/list/v', 'GET /reading/bookapi/bookshelf/video/list/v',
+        'POST /reading/bookapi/bookshelf/video/update/v', 'POST /reading/bookapi/read_history/update/v', 'POST /reading/bookapi/read_progress/upload/v'];
+    if (!routes.includes(method + ' ' + apiPath) || (method === 'GET' && payload !== null) || (method === 'POST' && payload === null)) {
+        throw Object.assign(new Error('Unsupported native account route'), { code: 'INVALID_INPUT' });
+    }
+    return nativeAppRequest(method, apiPath, values, identity, payload);
+}
+
+function signedNativePhoneRequest(apiPath, identity, form, mode) {
+    if (!['/passport/mobile/send_code/v1/', '/passport/mobile/sms_login/', '/passport/upsms/verify/'].includes(apiPath) ||
+        typeof form !== 'string' || form.length > 32768 || ![0, 4].includes(mode)) throw Object.assign(new Error('Unsupported phone request'), { code: 'INVALID_INPUT' });
+    return nativeAppRequest('POST', apiPath, {}, identity, form, mode, 'application/x-www-form-urlencoded; charset=UTF-8');
 }
 
 function parseFallback(value) {
@@ -389,17 +493,38 @@ function boundedSignal(signal, deadline, limit) {
     return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+async function playbackDevice({ scope, signal, deadline, fresh = false }) {
+    checkActive(signal, deadline);
+    const shared = ['tab', 'legacy'].includes(scope)
+        && typeof globalThis._nativeReadPlaybackIdentity === 'function'
+        && typeof globalThis._nativeWritePlaybackIdentity === 'function';
+    if (shared && !fresh) {
+        const cached = JSON.parse(globalThis._nativeReadPlaybackIdentity(scope));
+        if (cached) return Object.freeze(cached);
+    }
+    const identity = await registerPlaybackDevice(requestJson, { isolated: true, signal, deadline });
+    checkActive(signal, deadline);
+    if (shared) globalThis._nativeWritePlaybackIdentity(scope, JSON.stringify(identity));
+    return identity;
+}
+
 const playbackRecovery = createPlaybackRecovery({
-    register: ({ scope, signal, deadline }) => registerPlaybackDevice(requestJson, {
-        isolated: true, captureCookies: scope === 'tab', signal, deadline,
-    }),
-    getModel: (vid, identity, { signal, deadline }) => {
-        const query = pythonUrlEncode({ ...DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid,
-            _rticket: String(Date.now()), video_id: vid, video_id_type: '0', device_level: '1',
-            need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0', video_platform: '1024', source: '0', from_video_id: '' });
-        return requestJson(`${VIDEO_TAB_API}?${query}`, { forbidRedirects: true,
-            headers: { 'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8', ...(identity.cookie ? { Cookie: identity.cookie } : {}) } },
-        Math.min(deadline, Date.now() + 5000), boundedSignal(signal, deadline, 5000));
+    register: playbackDevice,
+    primaryScope: 'player_v5', primaryRoute: 'player_v5', tabTTL: 0,
+    getModel: async (vid, identity, { signal, deadline, contentType }) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            checkActive(signal, deadline);
+            const request = primaryPlaybackRequest(vid, identity, contentType, attempt > 0);
+            try {
+                return await requestJson(request.url, { method: request.method, headers: request.headers,
+                    data: request.body, forbidRedirects: true },
+                    Math.min(deadline, Date.now() + 5000), boundedSignal(signal, deadline, 5000));
+            } catch (error) {
+                checkActive(signal, deadline);
+                // Only an empty response permits the second official host. Denials stop here.
+                if (attempt || error.code !== 'EMPTY_RESPONSE' || Number(error.status) !== 200) throw error;
+            }
+        }
     },
     postModel: (vid, contentType, identity, host, { signal, deadline, hostIndex }) => {
         const payload = JSON.stringify({
@@ -415,13 +540,17 @@ const playbackRecovery = createPlaybackRecovery({
     consume: consumeAppPlayResponse,
 });
 
-async function consumeAppPlayResponse(response, vid, options, { signal, deadline }) {
+async function consumeAppPlayResponse(response, vid, options, { signal, deadline, route }) {
     checkActive(signal, deadline);
     if (Number(response.Code || response.code || 0) !== 0) throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
     const entry = response.data?.[vid];
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
-    if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
-    const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
+    if (!model || typeof model !== 'object' || Array.isArray(model)) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
+    const inline = model.video_list && typeof model.video_list === 'object' && Object.keys(model.video_list).length > 0;
+    if (options.offlineDirect === true) {
+        if (!inline || model.key_seed) throw offlineSourceUnavailable();
+        return parseAppPlayModel(model, vid, { ...options, inlineUserAgent: PRIMARY_INLINE_UA }, true);
+    }
     const readFallback = async () => {
         const fallback = parseFallback(model.fallback_api);
         if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
@@ -435,7 +564,8 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     };
     if (!inline) return parseAppPlayModel(await readFallback(), vid, options, false);
     try {
-        return parseAppPlayModel(model, vid, options, true);
+        const inlineUserAgent = route === 'video_tab' ? PRIMARY_INLINE_UA : PLAYBACK_UA;
+        return parseAppPlayModel(model, vid, { ...options, inlineUserAgent }, true);
     } catch (error) {
         // Only absent encryption metadata enables this recovery path; the fallback
         // must independently pass identity, duration, encryption and URL validation.
@@ -452,8 +582,20 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     }
 }
 
+function offlineSourceUnavailable() {
+    return Object.assign(new Error('来源未提供未加密的直连 MP4'), { code: 'OFFLINE_CLEAR_UNAVAILABLE' });
+}
+
+function isExplicitlyClear(item) {
+    if (item.spade_a || item.encrypt_info?.spade_a) return false;
+    const flags = [item.encrypt, item.encrypt_info?.encrypt].filter(value => value != null);
+    return flags.length > 0 && flags.every(value => [false, 0, '0', 'false'].includes(value));
+}
+
 function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata = inline, minimumPixels = 0) {
     const requestedQuality = normalizeDownloadQuality(options.quality);
+    // Local iOS policy: choose from actual compatible model rows, not invented resolutions.
+    const dataSaver = options.playbackQuality === 'dataSaver';
     const allowLowerQuality = options.allowLowerQuality === true && requestedQuality !== 'auto';
     if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
     const compatibleRows = Object.values(info?.video_list || {}).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
@@ -468,7 +610,16 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     }).filter(row => row.codecRank < 3 && (!minimumPixels || Math.min(row.width, row.height) >= minimumPixels)
         && (row.codecRank !== 2 || (row.width > 0 && row.height > 0 && typeof info.video_id === 'string'
             && info.video_id.trim() && Number.isFinite(Number(info.video_duration)) && Number(info.video_duration) > 0)));
-    const rows = compatibleRows.filter(row => allowLowerQuality || meetsDownloadQuality(row, requestedQuality)).sort((a, b) => {
+    const offlineDirect = options.offlineDirect === true;
+    const eligibleRows = offlineDirect ? compatibleRows.filter(row => row.codecRank < 2 && isExplicitlyClear(row.item)) : compatibleRows;
+    if (offlineDirect && !eligibleRows.length) throw offlineSourceUnavailable();
+    const rows = eligibleRows.filter(row => (!dataSaver || row.codecRank < 2)
+        && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
+        if (dataSaver) {
+            const aKnown = a.width > 0 && a.height > 0, bKnown = b.width > 0 && b.height > 0;
+            if (aKnown !== bKnown) return Number(bKnown) - Number(aKnown);
+            return (aKnown ? a.pixels - b.pixels : 0) || a.codecRank - b.codecRank;
+        }
         if (requestedQuality === 'auto') return a.codecRank - b.codecRank || b.pixels - a.pixels;
         const aMeets = meetsDownloadQuality(a, requestedQuality), bMeets = meetsDownloadQuality(b, requestedQuality);
         if (aMeets !== bMeets) return Number(bMeets) - Number(aMeets);
@@ -490,10 +641,12 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     let incompleteEncryptionMetadata = false;
     const variants = [];
     const seen = new Set();
+    let primaryRowVariantCount = 0;
     // Auto means "best available". Keep every compatible encoding at the same
     // resolution tier, but never silently fall through to a lower rendition.
     const bestPixels = rows[0].pixels;
-    const selectedRows = requestedQuality === 'auto'
+    const saverTiers = [...new Set(rows.filter(row => row.width > 0 && row.height > 0).map(row => row.pixels))];
+    const selectedRows = requestedQuality === 'auto' && !dataSaver
         ? (bestPixels > 0 ? rows.filter(row => row.pixels === bestPixels) : rows.slice(0, 1))
         : rows;
     for (const selected of selectedRows) {
@@ -517,16 +670,26 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
                     if (seen.has(identity)) continue;
                     seen.add(identity);
                     variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, source: 'app', vid,
-                        userAgent: inline ? PLAYBACK_UA : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
+                        userAgent: inline ? (options.inlineUserAgent ?? PLAYBACK_UA) : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
                         ...(requestedQuality === 'auto' ? {} : { width: selected.width, height: selected.height }) });
+                    if (options.playbackQuality) Object.assign(variants[variants.length - 1], {
+                        width: selected.width || undefined, height: selected.height || undefined,
+                        qualityFallback: dataSaver && (saverTiers.length < 2 || !selected.width || !selected.height
+                            || selected.pixels > Math.min(...saverTiers)),
+                    });
                     if (selected.codec === 'bytevc2') Object.assign(variants[variants.length - 1], {
                         width: selected.width, height: selected.height, duration: Number(info.video_duration),
                     });
                 } catch (error) { lastError = error; }
             }
         } catch (error) { lastError = error; }
+        if (primaryRowVariantCount === 0) primaryRowVariantCount = variants.length;
     }
-    if (variants.length) return { ...variants[0], variants };
+    if (variants.length) {
+        // Only URLs from the selected row can reuse its rendition metadata.
+        const alternateURLs = variants.slice(1, Math.min(primaryRowVariantCount, 3)).map(variant => variant.url);
+        return { ...variants[0], variants, ...(offlineDirect ? {} : { alternateURLs }) };
+    }
     throw lastError?.code === 'SECURITY_BLOCKED' ? lastError
         : Object.assign(new Error('本集片源地址或密钥无法解析'), {
             code: 'INVALID_RESPONSE',
@@ -537,4 +700,4 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
         });
 }
 
-module.exports = { fetchAppPlayUrl, signedSearchRequest, signedMetadataRequest, signedAccountRequest, parseSearchInteger, preserveLargeJsonIntegers, requestJson, SEARCH_API, SEARCH_UA };
+module.exports = { fetchAppPlayUrl, signedSearchRequest, signedMetadataRequest, signedAccountRequest, signedAccountLibraryRequest, signedNativePhoneRequest, internationalGorgon, parseSearchInteger, preserveLargeJsonIntegers, requestJson, SEARCH_API, SEARCH_UA };

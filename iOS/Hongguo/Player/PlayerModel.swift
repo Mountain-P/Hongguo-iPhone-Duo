@@ -931,7 +931,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         } else if source.headers.isEmpty {
             asset = AVURLAsset(url: source.url)
         } else {
-            let resourceLoader = AuthenticatedMediaLoader(url: source.url, headers: source.headers)
+            let resourceLoader = AuthenticatedMediaLoader(url: source.url, headers: source.headers, resumesInterruptedRanges: service is HomeRelayService)
             loader = resourceLoader
             asset = resourceLoader.makeAsset()
         }
@@ -1130,7 +1130,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         guard let currentEpisode else { cancelNextEpisodePrefetch(); return }
         let context = EpisodePrefetchState.Context(elapsed: elapsed, duration: duration, rate: effectiveSpeed,
             bufferedAhead: bufferedSeconds(at: elapsed),
-            allowed: !isPreview && service is NativeCatalogService && autoNext && sceneActive && hasStarted
+            allowed: !isPreview && (service is NativeCatalogService || service is HomeRelayService) && autoNext && sceneActive && hasStarted
                 && playbackSpeed.wantsPlayback && isPlaying && !isLoading && !isBuffering
                 && errorMessage == nil && prefetchNetworkAllowed && recoveryPreparation == nil)
         switch nextPrefetchState.update(episodeID: currentEpisode.id, nextEpisodeID: nextEpisode?.id, context: context) {
@@ -1142,7 +1142,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             nextPrefetchTask = Task(priority: .utility) {
                 do {
                     try Task.checkCancellation()
-                    _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service, warmOpening: true, playbackRate: rate)
+                    if let relay = service as? HomeRelayService {
+                        _ = try await relay.playback(seriesID: seriesID, episodeID: episodeID, fresh: false)
+                    } else {
+                        _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service, warmOpening: true, playbackRate: rate)
+                    }
                 } catch { /* Optional work cannot become a visible playback error. */ }
             }
         }
