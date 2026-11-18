@@ -12,6 +12,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Record compiler and source revision
+        run: |
+          git rev-parse HEAD
+          xcode-select -p
+          xcodebuild -version
+          swift --version
       - name: Test content protocols
         run: swift test --disable-xctest
 

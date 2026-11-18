@@ -159,12 +159,13 @@ public actor NativeProgressiveMedia {
         let request = UUID(); requests[key] = request
         let byteLimit = NativePrefetchContext.maximumBytes
         let route = PlaybackRoute(episodeID: episodeID, preference: source.preference)
-        let host = source.url.host?.lowercased(), routes = failedRoutes, now = now
+        let host = source.url.host?.lowercased(), routes = failedRoutes
+        let currentDate = self.now
         do {
             let stream = try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
                 group.addTask {
                     try await self.prepare(source: source, fetcher: fetcher, byteLimit: byteLimit, diskCache: .shared) {
-                        if let host { routes.record(host, for: route, now: now()) }
+                        if let host { routes.record(host, for: route, now: currentDate()) }
                     }
                 }
                 group.addTask {
