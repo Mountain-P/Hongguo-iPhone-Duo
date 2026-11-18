@@ -12,7 +12,10 @@
     global.require = function require(name) {
         name = name.replace(/^\.\//, '').replace(/\.js$/, '');
         if (name === 'node:crypto') return crypto;
-        if (name === 'node:zlib') return { gzipSync: data => Buffer.from(native('gzip', { data: Buffer.from(data).toString('base64') }), 'base64') };
+        if (name === 'node:zlib') return {
+            gzipSync: data => Buffer.from(native('gzip', { data: Buffer.from(data).toString('base64') }), 'base64'),
+            gunzipSync: data => Buffer.from(native('gunzip', { data: Buffer.from(data).toString('base64') }), 'base64'),
+        };
         if (name === 'axios') return axios;
         if (modules[name]) return modules[name].exports;
         const source = sources[name];

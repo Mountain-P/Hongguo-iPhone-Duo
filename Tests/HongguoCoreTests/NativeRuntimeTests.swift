@@ -80,7 +80,7 @@ struct NativeRuntimeTests {
               const wire=Buffer.from(request.body,'base64');
               const unzipped=JSON.parse(_nativeInvoke('gunzip',JSON.stringify({data:request.body})));
               bodies.push(JSON.parse(Buffer.from(unzipped.value,'base64').toString('utf8')));
-              if(request.headers['x-ss-stub']!==require('node:crypto').createHash('md5').update(wire).digest('hex')) throw new Error('Incorrect wire stub');
+              if(request.headers['x-ss-stub'].toLowerCase()!==require('node:crypto').createHash('md5').update(wire).digest('hex')) throw new Error('Incorrect wire stub');
               if(url.hostname==='api5-normal-hl.fqnovel.com') {
                 data=JSON.stringify({data:{'200':{video_model:{video_list:{main:{main_url:'https://unit.fqnovelvod.com/test.mp4',codec_type:'h264',width:1080,height:1920,encrypt:false}}}}}});
               }
@@ -94,8 +94,8 @@ struct NativeRuntimeTests {
         """#)
         let value = try dictionary(Data(result.utf8))
         #expect(value["registrations"] as? Int == 2)
-        #expect(value["gets"] as? Int == 1)
-        #expect(value["posts"] as? Int == 2)
+        #expect(value["gets"] as? Int == 0)
+        #expect(value["posts"] as? Int == 4)
         #expect(value["attempts"] as? Int == 2)
         #expect(value["route"] as? String == "registered_post")
         #expect(value["correct"] as? Bool == true)
@@ -114,18 +114,18 @@ struct NativeRuntimeTests {
             cdid:'00000000-0000-4000-8000-000000000001',cookie:'sessionid=DO_NOT_USE',version_name:'9.9.9'};
           const request = require('app-source').audit.primaryPlaybackRequest('7000000000000000003', identity);
           const url = new URL(request.url);
-          return {method:request.method, emptyBody:request.body == null, host:url.hostname,
-            episode:url.searchParams.get('video_id'), profile:url.searchParams.get('version_name'),
-            signed:['x-argus','x-ladon'].every(name => typeof request.headers[name] === 'string' && request.headers[name].length > 8),
+          return {method:request.method, gzip:request.headers['Content-Encoding']==='gzip', host:url.hostname,
+            episode:JSON.parse(require('node:zlib').gunzipSync(request.body).toString()).mixed_video_id_map['1004'][0], profile:url.searchParams.get('version_name'),
+            signed:['x-medusa','x-helios'].every(name => typeof request.headers[name] === 'string' && request.headers[name].length > 8),
             noCookie:!url.searchParams.has('cookie') && !Object.keys(request.headers).some(name => name.toLowerCase() === 'cookie')};
         })()
         """#)
         let value = try dictionary(Data(result.utf8))
-        #expect(value["method"] as? String == "GET")
+        #expect(value["method"] as? String == "POST")
         #expect(value["host"] as? String == "api5-normal-sinfonlineb.fqnovel.com")
         #expect(value["episode"] as? String == "7000000000000000003")
-        #expect(value["profile"] as? String == "7.3.9.32")
-        for key in ["emptyBody", "signed", "noCookie"] { #expect(value[key] as? Bool == true) }
+        #expect(value["profile"] as? String == "7.4.3.32")
+        for key in ["gzip", "signed", "noCookie"] { #expect(value[key] as? Bool == true) }
     }
 
     @Test func keyedInlineModelStillRequiresTheRequestedEpisodeAndTrustedMedia() async throws {

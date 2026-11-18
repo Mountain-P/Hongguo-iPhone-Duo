@@ -26,16 +26,16 @@ function retryable(error) {
         || RETRYABLE_NETWORK.has(error?.code) || RETRYABLE_HTTP.has(Number(error?.status));
 }
 
-function normalizeVideoTabEnvelope(vid, response) {
+function normalizeVideoTabEnvelope(vid, response, contentType = '1004') {
     if (Number(response?.Code || response?.code || 0) !== 0) throw failure('BUSINESS_REJECTED', '来源未授权提供本集播放信息');
-    const rows = response?.data?.video_model_data || response?.data;
+    const rows = response?.data?.[contentType] ?? response?.data?.video_model_data ?? response?.data;
     // Never substitute the first unrelated result for the requested episode.
     const entry = rows?.[vid];
     if (!entry || !entry.video_model) throw failure('MISSING_MODEL', '来源未返回所选分集');
     return { code: 0, data: { [vid]: entry } };
 }
 
-function createPlaybackRecovery({ register, getModel, postModel, consume, now = Date.now, tabTTL = 300000 }) {
+function createPlaybackRecovery({ register, getModel, postModel, consume, now = Date.now, tabTTL = 300000, primaryScope = 'tab', primaryRoute = 'video_tab' }) {
     let tabIdentity;
     let tabIdentityExpires = 0;
     return async function resolve(vid, { signal, deadline = now() + 30000, contentType = '1004', options = {} } = {}) {
@@ -43,16 +43,16 @@ function createPlaybackRecovery({ register, getModel, postModel, consume, now = 
         let lastError;
         try {
             if (!tabIdentity || tabIdentityExpires <= now()) {
-                const identity = await register({ scope: 'tab', signal, deadline });
+                const identity = await register({ scope: primaryScope, signal, deadline });
                 checkActive(signal, deadline, now);
                 tabIdentity = identity;
                 tabIdentityExpires = now() + tabTTL;
             }
-            const response = normalizeVideoTabEnvelope(vid, await getModel(vid, tabIdentity, { signal, deadline }));
+            const response = normalizeVideoTabEnvelope(vid, await getModel(vid, tabIdentity, { signal, deadline, contentType }), contentType);
             checkActive(signal, deadline, now);
-            const value = await consume(response, vid, options, { signal, deadline, route: 'video_tab' });
+            const value = await consume(response, vid, options, { signal, deadline, route: primaryRoute });
             checkActive(signal, deadline, now);
-            return { value, recovery: { route: 'video_tab', attempts: 1 } };
+            return { value, recovery: { route: primaryRoute, attempts: 1 } };
         } catch (error) {
             checkActive(signal, deadline, now);
             if (options.offlineDirect === true || terminal(error)) throw error;

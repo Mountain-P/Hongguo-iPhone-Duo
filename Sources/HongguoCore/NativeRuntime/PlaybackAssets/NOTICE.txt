@@ -35,3 +35,20 @@ persistent identity or retained device_token. The same in-memory identity is
 shared by all playback requests in one process. Search/catalogue signatures
 remain unchanged. app-source.js also accepts the current inline video_list
 without requesting the legacy fallback endpoint.
+
+
+2026-11-18 iPhone playback protocol update (0.16.5)
+------------------------------------------------
+playback-v5.js is copied byte-for-byte from jackotom/hongguo-drama
+100d7c7bfa40328d2304b29eb852ca304f53e59b, src/native/playback-v5.js
+(GPL-3.0-only; Git blob 4019afdd2a8fe707cc31895502622e2f0ac5082b).
+It ports N3urda/hongguoTV 18c37c2afd0567520135abcae312352542f09083
+Signer.kt, AesV3.kt and V5Constants.kt, with the original drpys attribution
+retained in the module header.
+
+The local iPhone adapter signs the exact gzip POST bytes for the current
+player/v1 endpoint and supports content-type-keyed model responses. It uses a
+fresh anonymous registration for each v5 resolution; one empty primary
+response permits the second official host with that same identity. Account
+profiles and media validation remain separate. This notice supersedes the
+earlier shared-playback-identity description for the new primary route.

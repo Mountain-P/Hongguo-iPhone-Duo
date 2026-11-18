@@ -15,7 +15,7 @@ const localId = () => String(1000000000000000n + BigInt('0x' + crypto.randomByte
 const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
-const VIDEO_TAB_API = 'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/';
+const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const PLAYBACK_UA = VIDEO_UA.replace('71332', '74332');
@@ -28,9 +28,6 @@ const DEVICE = {
     update_version_code: '71332', host_abi: 'arm64-v8a', dragon_device_type: 'phone', pv_player: '71332',
     compliance_status: '0', need_personal_recommend: '1', player_so_load: '1', is_android_pad_screen: '0',
 };
-const VIDEO_TAB_DEVICE = { ...DEVICE, version_code: '73932', version_name: '7.3.9.32',
-    manifest_version_code: '73932', update_version_code: '73932', pv_player: '73932' };
-
 const PRIMARY_INLINE_UA = PLAYBACK_UA;
 
 function str(value, fallback = '') { return String(value == null ? fallback : value).trim(); }
@@ -165,30 +162,27 @@ function playbackRequest(payload, identity, host = new URL(VIDEO_API).hostname) 
     } };
 }
 
-// The current anonymous model request follows jackotom/hongguo-drama v7.0.
-// Only the playback route uses this signer; metadata and account helpers retain theirs.
-function primaryPlaybackRequest(vid, identity) {
-    const { signPlayer } = require('./playback-signature');
-    const requestTicket = Date.now();
-    const timestamp = Math.floor(requestTicket / 1000);
-    const device = { ...VIDEO_TAB_DEVICE, device_id: identity.device_id, iid: identity.iid, cdid: identity.cdid };
-    const query = pythonUrlEncode({ ...device, video_id: vid, video_id_type: '0', device_level: '1',
-        need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0',
-        video_platform: '1024', source: '0', from_video_id: '', ts: String(timestamp), _rticket: String(requestTicket) });
-    const signed = signPlayer({ query, body: null, ts: timestamp });
-    return {
-        url: `${VIDEO_TAB_API}?${query}`,
-        method: 'GET',
-        headers: {
-            'User-Agent': VIDEO_UA.replace(DEVICE.version_code, device.version_code),
-            Accept: 'application/json; charset=utf-8,application/x-protobuf',
-            'x-ss-req-ticket': signed['x-ss-req-ticket'], 'sdk-version': '2', 'x-xs-from-web': '0',
-            'passport-sdk-version': '50561', 'x-ss-dp': String(device.aid),
-            'x-khronos': signed['x-khronos'], 'x-ladon': signed['x-ladon'], 'x-argus': signed['x-argus'],
-            'x-tt-dt': '', 'x-tt-store-region': 'cn', 'x-tt-store-region-src': 'did',
-            'x-tt-request-tag': 't=0;n=0',
-        },
-    };
+// Playback-only v5 protocol from jackotom/hongguo-drama 100d7c7bfa40328d2304b29eb852ca304f53e59b.
+// Sign the exact gzip bytes sent on the wire. Account/search profiles stay separate.
+function primaryPlaybackRequest(vid, identity, contentType = '1004', alternate = false) {
+    const { signPlaybackV5 } = require('./playback-v5');
+    const payload = JSON.stringify({
+        biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false,
+            disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false,
+            use_os_player: false, use_server_dns: false, video_platform: 1024 },
+        mixed_video_id_map: { [contentType]: [vid] }, dr_scene: 'player',
+    });
+    const body = gzipSync(Buffer.from(payload));
+    const signed = signPlaybackV5({
+        base: alternate ? PLAYER_API.replace('sinfonlineb.', 'sinfonlinea.') : PLAYER_API,
+        values: { aid: '8662', app_name: 'novelread', version_code: '74332', version_name: '7.4.3.32',
+            channel: 'vivo_8662_64', device_platform: 'android', device_type: 'PGT-AN10', os_version: '12',
+            update_version_code: '74332', iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id },
+        body, now: Date.now(),
+    });
+    return { ...signed, body, method: 'POST', headers: { ...signed.headers,
+        'User-Agent': 'com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)',
+        Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' } };
 }
 
 function parseSearchInteger(value) {
@@ -516,10 +510,21 @@ async function playbackDevice({ scope, signal, deadline, fresh = false }) {
 
 const playbackRecovery = createPlaybackRecovery({
     register: playbackDevice,
-    getModel: (vid, identity, { signal, deadline }) => {
-        const request = primaryPlaybackRequest(vid, identity);
-        return requestJson(request.url, { method: request.method, headers: request.headers, forbidRedirects: true },
-        Math.min(deadline, Date.now() + 5000), boundedSignal(signal, deadline, 5000));
+    primaryScope: 'player_v5', primaryRoute: 'player_v5', tabTTL: 0,
+    getModel: async (vid, identity, { signal, deadline, contentType }) => {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            checkActive(signal, deadline);
+            const request = primaryPlaybackRequest(vid, identity, contentType, attempt > 0);
+            try {
+                return await requestJson(request.url, { method: request.method, headers: request.headers,
+                    data: request.body, forbidRedirects: true },
+                    Math.min(deadline, Date.now() + 5000), boundedSignal(signal, deadline, 5000));
+            } catch (error) {
+                checkActive(signal, deadline);
+                // Only an empty response permits the second official host. Denials stop here.
+                if (attempt || error.code !== 'EMPTY_RESPONSE' || Number(error.status) !== 200) throw error;
+            }
+        }
     },
     postModel: (vid, contentType, identity, host, { signal, deadline, hostIndex }) => {
         const payload = JSON.stringify({
