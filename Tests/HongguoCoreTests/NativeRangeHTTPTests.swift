@@ -94,7 +94,7 @@ private final class RangeURLProtocol: URLProtocol, @unchecked Sendable {
 struct NativeRangeHTTPTests {
     private let scheduledOrigin = "v5-reading-video-a.qznovelvod.com"
 
-    private func client(_ scenario: RangeScenario, host: String = "unit.fqnovelvod.com") throws -> (NativeRangeHTTP, URL) {
+    private func makeClient(_ scenario: RangeScenario, host: String = "unit.fqnovelvod.com") throws -> (NativeRangeHTTP, URL) {
         let url = RangeScenarios.shared.register(scenario, host: host)
         let source = NativeMediaSource(url: url, contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
         let configuration = URLSessionConfiguration.ephemeral
@@ -103,7 +103,7 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func actualURLSessionLimitsConcurrencyAndCancellationIsPerRequest() async throws {
-        let (client, url) = try client(.init(delay: 0.06)); defer { client.close() }
+        let (client, url) = try makeClient(.init(delay: 0.06)); defer { client.close() }
         try await withThrowingTaskGroup(of: Void.self) { group in
             for index in 0..<6 {
                 group.addTask {
@@ -124,14 +124,14 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func delegateRejectsExtraBytesAndRangeIgnoringServers() async throws {
-        let (excess, _) = try client(.init(excess: true)); defer { excess.close() }
+        let (excess, _) = try makeClient(.init(excess: true)); defer { excess.close() }
         await #expect(throws: NativeProgressiveError.invalidRange) { try await excess.fetch(range: 0..<16) }
-        let (ignored, _) = try client(.init(status: 200)); defer { ignored.close() }
+        let (ignored, _) = try makeClient(.init(status: 200)); defer { ignored.close() }
         await #expect(throws: NativeProgressiveError.unsupportedRange) { try await ignored.fetch(range: 0..<16) }
     }
 
     @Test func validRangeWithAnEarlyEndIsRetriedOnce() async throws {
-        let (client, url) = try client(.init(shortBodies: 1)); defer { client.close() }
+        let (client, url) = try makeClient(.init(shortBodies: 1)); defer { client.close() }
         let range = 32..<48
         let response = try await client.fetch(range: range)
         #expect(response.range == range)
@@ -140,13 +140,13 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func repeatedEarlyEndsReturnANetworkErrorAfterTwoAttempts() async throws {
-        let (client, url) = try client(.init(shortBodies: 3)); defer { client.close() }
+        let (client, url) = try makeClient(.init(shortBodies: 3)); defer { client.close() }
         await #expect(throws: NativeMediaError.network) { try await client.fetch(range: 32..<48) }
         #expect(RangeScenarios.shared.counts(url.path).requests == 2)
     }
 
     @Test func authorizationDenialIsTerminalDespiteHugeBinaryBody() async throws {
-        let (client, url) = try client(.init(status: 403)); defer { client.close() }
+        let (client, url) = try makeClient(.init(status: 403)); defer { client.close() }
         await #expect(throws: CatalogError.httpStatus(403)) { try await client.fetch(range: 0..<16) }
         let count = RangeScenarios.shared.counts(url.path).requests
         await #expect(throws: CatalogError.httpStatus(403)) { try await client.fetch(range: 32..<48) }
@@ -154,7 +154,7 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func rejectedFinalResponseRetiresActiveAndQueuedReads() async throws {
-        let (client, url) = try client(.init(responseOutsidePolicy: true)); defer { client.close() }
+        let (client, url) = try makeClient(.init(responseOutsidePolicy: true)); defer { client.close() }
         await withTaskGroup(of: Void.self) { group in
             for index in 0..<6 {
                 group.addTask {
@@ -171,7 +171,7 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func rejectedRedirectDoesNotFollowTargetOrStartMoreReads() async throws {
-        let (client, url) = try client(.init(status: 302, redirectHosts: ["blocked.invalid"])); defer { client.close() }
+        let (client, url) = try makeClient(.init(status: 302, redirectHosts: ["blocked.invalid"])); defer { client.close() }
         await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
         await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 32..<48) }
         #expect(RangeScenarios.shared.counts(url.path).requests == 1)
@@ -182,7 +182,7 @@ struct NativeRangeHTTPTests {
                                   ("v5-reading-video-b.qznovelvod.com", ["relay-b7.bdcgslb.com"]),
                                   ("v5-ex-reading-video-a.qznovelvod.com", ["relay-b7.bdcgslb.com"]),
                                   (scheduledOrigin, ["relay-a9.vegslb.com", "relay-b7.bdcgslb.com"])] {
-            let (client, url) = try client(.init(status: 302, redirectHosts: targets), host: origin)
+            let (client, url) = try makeClient(.init(status: 302, redirectHosts: targets), host: origin)
             defer { client.close() }
             for range in [0..<16, 32..<48] {
                 #expect(try await client.fetch(range: range).range == range)
@@ -202,7 +202,7 @@ struct NativeRangeHTTPTests {
             (scheduledOrigin, 302, ["relay-a.bdcgslb.com", "relay-b.vegslb.com"], 2),
             (scheduledOrigin, 302, ["relay-a.vegslb.com", "relay-b.bdcgslb.com", "relay-c.bdcgslb.com"], 3),
         ] {
-            let (client, url) = try client(.init(status: status, redirectHosts: targets), host: origin)
+            let (client, url) = try makeClient(.init(status: status, redirectHosts: targets), host: origin)
             defer { client.close() }
             await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
             #expect(RangeScenarios.shared.counts(url.path).requests == requests)
@@ -210,9 +210,9 @@ struct NativeRangeHTTPTests {
     }
 
     @Test func schedulerDestinationCannotBeUsedAsADirectSourceOrSubstituteResponse() async throws {
-        #expect(throws: NativeMediaError.unsafeURL) { try client(.init(), host: "relay-a.vegslb.com") }
+        #expect(throws: NativeMediaError.unsafeURL) { try makeClient(.init(), host: "relay-a.vegslb.com") }
         let scenario = RangeScenario(status: 302, redirectHosts: ["relay-a.vegslb.com"], redirectedResponseHost: "relay-b.vegslb.com")
-        let (client, url) = try client(scenario, host: scheduledOrigin)
+        let (client, url) = try makeClient(scenario, host: scheduledOrigin)
         defer { client.close() }
         await #expect(throws: NativeMediaError.unsafeURL) { try await client.fetch(range: 0..<16) }
         #expect(RangeScenarios.shared.counts(url.path).requests == 2)
