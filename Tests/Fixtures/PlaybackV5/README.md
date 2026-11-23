@@ -13,3 +13,11 @@ permutations inside the app's JavaScriptCore/native crypto environment.
 
 - signing-v5-f13.json SHA256: cc6863401ab7904b035940310612403b859e09703332c86450f7a20cd2a1c7bd
 - signing-v5-carrier.json SHA256: 850b53855444fa94b0bd3bcf6fa8a21254c585926080267b5ea2ffa177fe68a7
+
+The full current Medusa/Helios wire vector in
+`Backend/tests/fixtures/signing-v5-playback-312.json` is copied unchanged from
+N3urda/hongguoTV `ef328f3a3dc28479d90608a507996136672cf946`,
+`kotlin-tv/core/src/test/resources/signing-v5-playback-312.json` (GPL-3.0-only).
+It uses only public synthetic inputs. Both Node and JavaScriptCore match the
+independent Kotlin output, including field 21 = 312. The short body is a signing
+fixture, not a valid network request; the production gzip validator is unchanged.

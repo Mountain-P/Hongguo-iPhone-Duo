@@ -29,3 +29,12 @@ The profile used by anonymous media acquisition remains separate from account an
 catalog requests. No phone/account tokens or upstream signed URLs are persisted
 by the relay. The relay modules and iOS transport integration are GPL-3.0-only
 project code. Existing `vendor` CENC primitives retain their pinned provenance.
+
+## 2026-11-24 playback compatibility
+
+The playback-only request profile and Medusa field 21 follow N3urda/hongguoTV
+`ef328f3a3dc28479d90608a507996136672cf946` (GPL-3.0-only): current 7.4.5.32
+preload request and field 21 = 312. The two runtime modules match the bundled
+iOS copies exactly. See `Sources/HongguoCore/NativeRuntime/UPSTREAM.md` and
+`Tests/Fixtures/PlaybackV5/README.md` for the request boundary and independent
+synthetic full-wire vector. This source update does not itself deploy a server.

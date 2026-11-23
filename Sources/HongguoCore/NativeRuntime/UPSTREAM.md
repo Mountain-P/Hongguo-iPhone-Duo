@@ -1,5 +1,19 @@
 # On-device playback runtime
 
+## 2026-11-24 playback compatibility
+
+The playback-only request profile now follows N3urda/hongguoTV commit
+`ef328f3a3dc28479d90608a507996136672cf946` (`MobilePlayback.kt`, `V5Constants.kt`,
+GPL-3.0-only): App 7.4.5.32, `/novel/player/multi_video_model/preload/v1`,
+`dr_scene=preload`, device level 2, and Medusa field 21 = 312. The primary host is
+`reading.snssdk.com`; only an empty HTTP 200 response permits the existing bounded
+second request to `api5-normal-sinfonlinea.fqnovel.com`, using the same anonymous
+identity and freshly signed outgoing bytes. Explicit denials still stop recovery.
+Account, search and metadata profiles are unchanged. The field's internal SDK
+meaning is unknown; it is a wire constant, not a captured user/device credential.
+Node and iOS copies remain byte-identical. Full-wire regression provenance is in
+`Tests/Fixtures/PlaybackV5/README.md`.
+
 The five original modules in `PlaybackAssets` (`app-source.js`, `playback-device.js`, `playback-recovery.js`, `sm3.js`, `download-quality.js`) were copied from this project's GPL-3.0-only Backend modules as integrated on 2026-11-06. Their original source is jackotom/hongguo-drama commit `2bab5cf15529ece7bfe657f93c6d1a2a4a17fef0`; existing signing and anonymous-registration provenance is preserved in each source header and the bundled `NOTICE.txt` / `LICENSE.drpys.txt`. `app-source.js` has narrowly scoped account and phone signing exports; its existing signature primitives remain unchanged. Since 0.7.0, the local iOS copy additionally supports an explicit data-saver source-selection policy: it orders actual compatible video-model rows by their supplied dimensions, preserves the original automatic selection, and reports safe rendition metadata and fallback status. It does not invent resolutions, change signing or registration, or switch an already-playing file. `playback-device.js` adds an explicit account-only 7.3.5.32 registration option while preserving its default playback profile. The full project GPL license is bundled as `LICENSE.GPL-3.0-only.txt`. Backend provenance and local changes are described in `Backend/server/modern/UPSTREAM.md`.
 
 The request ordering, branch-2 signing and playback profile were checked against the user-provided Quest source and aston314/hongguo-tv commit `36508246eeca2cf5ef1f29f7f17f8e985d50ae2e`. No Go implementation was copied. Synthetic vector facts in `Backend/tests/fixtures/signing-vectors.json` are reused by the native runtime tests, with no live credentials, device identities or signed URLs.

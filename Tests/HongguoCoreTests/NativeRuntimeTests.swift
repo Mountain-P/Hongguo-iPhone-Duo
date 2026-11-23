@@ -122,9 +122,9 @@ struct NativeRuntimeTests {
         """#)
         let value = try dictionary(Data(result.utf8))
         #expect(value["method"] as? String == "POST")
-        #expect(value["host"] as? String == "api5-normal-sinfonlineb.fqnovel.com")
+        #expect(value["host"] as? String == "reading.snssdk.com")
         #expect(value["episode"] as? String == "7000000000000000003")
-        #expect(value["profile"] as? String == "7.4.3.32")
+        #expect(value["profile"] as? String == "7.4.5.32")
         for key in ["gzip", "signed", "noCookie"] { #expect(value[key] as? Bool == true) }
     }
 

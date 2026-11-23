@@ -15,7 +15,7 @@ const localId = () => String(1000000000000000n + BigInt('0x' + crypto.randomByte
 const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
-const PLAYER_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/player/v1';
+const PLAYER_API = 'https://reading.snssdk.com/novel/player/multi_video_model/preload/v1';
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const PLAYBACK_UA = VIDEO_UA.replace('71332', '74332');
@@ -162,26 +162,28 @@ function playbackRequest(payload, identity, host = new URL(VIDEO_API).hostname) 
     } };
 }
 
-// Playback-only v5 protocol from jackotom/hongguo-drama 100d7c7bfa40328d2304b29eb852ca304f53e59b.
+// Current playback request profile: N3urda/hongguoTV ef328f3 (2026-11-23).
 // Sign the exact gzip bytes sent on the wire. Account/search profiles stay separate.
 function primaryPlaybackRequest(vid, identity, contentType = '1004', alternate = false) {
     const { signPlaybackV5 } = require('./playback-v5');
     const payload = JSON.stringify({
-        biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false,
+        biz_param: { detail_page_version: 0, device_level: 2, disable_digg_stat: false,
             disable_video_relate_book: false, need_all_video_definition: true, need_mp4_align: false,
             use_os_player: false, use_server_dns: false, video_platform: 1024 },
-        mixed_video_id_map: { [contentType]: [vid] }, dr_scene: 'player',
+        mixed_video_id_map: { [contentType]: [vid] }, dr_scene: 'preload',
     });
     const body = gzipSync(Buffer.from(payload));
     const signed = signPlaybackV5({
-        base: alternate ? PLAYER_API.replace('sinfonlineb.', 'sinfonlinea.') : PLAYER_API,
-        values: { aid: '8662', app_name: 'novelread', version_code: '74332', version_name: '7.4.3.32',
-            channel: 'vivo_8662_64', device_platform: 'android', device_type: 'PGT-AN10', os_version: '12',
-            update_version_code: '74332', iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id },
+        base: alternate ? PLAYER_API.replace('reading.snssdk.com', 'api5-normal-sinfonlinea.fqnovel.com') : PLAYER_API,
+        values: { aid: '8662', app_name: 'novelread', version_code: '74532', version_name: '7.4.5.32',
+            update_version_code: '74532', manifest_version_code: '74532', os: 'android', ssmix: 'a',
+            channel: 'update_64', device_platform: 'android', device_type: '25053RT47C', device_brand: 'Redmi',
+            os_version: '16', os_api: '36', ac: 'wifi', language: 'zh', host_abi: 'arm64-v8a',
+            iid: identity.iid, cdid: identity.cdid, device_id: identity.device_id },
         body, now: Date.now(),
     });
     return { ...signed, body, method: 'POST', headers: { ...signed.headers,
-        'User-Agent': 'com.phoenix.read/73932 (Linux; U; Android 12; zh_CN_#Hans; PGT-AN10; Build/V417IR;tt-ok/3.12.13.20)',
+        'User-Agent': 'com.phoenix.read/73932 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)',
         Accept: 'application/json', 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip' } };
 }
 
@@ -551,9 +553,17 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
         if (!inline || model.key_seed) throw offlineSourceUnavailable();
         return parseAppPlayModel(model, vid, { ...options, inlineUserAgent: PRIMARY_INLINE_UA }, true);
     }
-    const readFallback = async () => {
-        const fallback = parseFallback(model.fallback_api);
+    const readFallback = async (codec) => {
+        let fallback = parseFallback(model.fallback_api);
         if (!fallback) throw Object.assign(new Error('App 接口未返回本集片源地址'), { code: 'MISSING_MODEL' });
+        if (codec) {
+            const endpoint = new URL(checkedUrl(fallback, ['fqnovel.com', 'snssdk.com']));
+            // Preserve all other query bytes; the embedded URL shim is read-only.
+            const query = endpoint.search.slice(1).split('&').filter(part => part
+                && decodeURIComponent(part.split('=')[0]) !== 'codec_type');
+            query.push('codec_type=' + codec);
+            fallback = endpoint.href.split(/[?#]/)[0] + '?' + query.join('&');
+        }
         let outer;
         try { outer = await requestJson(fallback, { headers: { 'User-Agent': VIDEO_UA } }, deadline, signal); }
         catch (error) { error.stage = 'fallback_api'; throw error; }
@@ -565,20 +575,33 @@ async function consumeAppPlayResponse(response, vid, options, { signal, deadline
     if (!inline) return parseAppPlayModel(await readFallback(), vid, options, false);
     try {
         const inlineUserAgent = route === 'video_tab' ? PRIMARY_INLINE_UA : PLAYBACK_UA;
-        return parseAppPlayModel(model, vid, { ...options, inlineUserAgent }, true);
+        const selected = parseAppPlayModel(model, vid, { ...options, inlineUserAgent }, true);
+        if (selected.codec !== 'bytevc2' || !model.fallback_api) return selected;
+        throw Object.assign(new Error('本集需要兼容的影片编码'), {
+            code: 'NO_COMPATIBLE_SOURCE', minimumPixels: Math.min(selected.width, selected.height),
+        });
     } catch (error) {
-        // Only absent encryption metadata enables this recovery path; the fallback
-        // must independently pass identity, duration, encryption and URL validation.
+        // Only a model-provided VOD endpoint may negotiate a compatible codec.
+        // It must retain the video identity, full duration and requested quality.
+        const codecRecovery = error.code === 'NO_COMPATIBLE_SOURCE';
         const duration = Number(model.video_duration);
-        if (!error.incompleteEncryptionMetadata || typeof model.video_id !== 'string' || !model.video_id.trim() || !Number.isFinite(duration) || duration <= 0
-            || !error.minimumPixels || !model.fallback_api) throw error;
-        const info = await readFallback();
-        const fallbackDuration = Number(info?.video_duration);
-        if (info?.video_id !== model.video_id || !Number.isFinite(fallbackDuration) || fallbackDuration <= 0
-            || Math.abs(fallbackDuration - duration) > 0.5) {
-            throw Object.assign(new Error('备用片源编号或完整时长无法确认，已停止取址'), { code: 'INVALID_RESPONSE' });
+        if ((!codecRecovery && !error.incompleteEncryptionMetadata) || typeof model.video_id !== 'string' || !model.video_id.trim()
+            || !Number.isFinite(duration) || duration <= 0 || (!codecRecovery && !error.minimumPixels) || !model.fallback_api) throw error;
+        for (const codec of codecRecovery ? ['1', '3'] : [null]) {
+            const info = await readFallback(codec);
+            const fallbackDuration = Number(info?.video_duration);
+            if (info?.video_id !== model.video_id || !Number.isFinite(fallbackDuration) || fallbackDuration <= 0
+                || Math.abs(fallbackDuration - duration) > 0.5) {
+                throw Object.assign(new Error('备用片源编号或完整时长无法确认，已停止取址'), { code: 'INVALID_RESPONSE' });
+            }
+            try {
+                const selected = parseAppPlayModel(info, vid, options, false, true, error.minimumPixels || 0);
+                if (!codecRecovery || selected.codec !== 'bytevc2') return selected;
+            } catch (fallbackError) {
+                if (!codecRecovery || fallbackError.code !== 'NO_COMPATIBLE_SOURCE') throw fallbackError;
+            }
         }
-        return parseAppPlayModel(info, vid, options, false, true, error.minimumPixels);
+        throw error;
     }
 }
 

@@ -198,7 +198,9 @@ function medusa(query, f13, ts, who) {
     [6,'646637794'], [7,who.version_name], [8,'v04.10.03-ml-android'], [9,0x040a0300,'sint'],
     [10,flags], [12,ts,'sint'], [13,f13], [14,query.subarray(0,6)],
     [15,proto([[1,1,'sint'], [2,1,'sint'], [3,1,'sint'], [5,1,'sint']])],
-    [17,ts,'sint'], [20,'none'], [21,377,'sint'], [23,env],
+    // Current wire value verified by N3urda/hongguoTV ef328f3 (2026-11-23).
+    // Its SDK meaning is unknown; the former 377 yields empty model responses.
+    [17,ts,'sint'], [20,'none'], [21,312,'sint'], [23,env],
     [24,'{"cmr":16777216,"cmr2":16777216,"un_h":11,"vpn":0,"kd":0,"dyn":"","do":1,"tk":true}']]);
   const nonce = random32(), high = (nonce >>> 16) & 255;
   const hash = sm3(Buffer.concat([SIGN_KEY, le32(nonce), SIGN_KEY]));
