@@ -34,6 +34,116 @@ struct NativeProgressiveTests {
         .init(url: URL(string: "https://unit.fqnovelvod.com/video.mp4")!, contentKey: key, userAgent: "Fixture", codec: "h264", quality: "1080p")
     }
 
+    private func waitForFetch(_ count: Int, on fixture: ProgressiveBytes) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while await fixture.ranges.count < count {
+            guard ContinuousClock.now < deadline else { throw URLError(.timedOut) }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
+    @Test func foregroundReadersShareOneRetriedChunkAndDeliverTheRequestedBytesExactlyOnce() async throws {
+        let chunk = 512 * 1024
+        let payload = Data((0..<(2 * chunk)).map { UInt8(truncatingIfNeeded: $0) })
+        let fixture = streamFixture(payload: payload, samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let first = (chunk - 12)..<chunk, crossing = (chunk - 12)..<(chunk + 35)
+        #expect(try await stream.read(range: first) == fixture.data.subdata(in: first))
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.network)
+        let reader = Task { try await stream.read(range: crossing, retriesTransientReads: true) }
+        try await waitForFetch(before + 1, on: bytes)
+        let overlapping = (chunk + 5)..<(chunk + 23)
+        async let other = stream.read(range: overlapping, retriesTransientReads: true)
+        let cancelled = Task { try await stream.read(range: crossing, retriesTransientReads: true) }
+        let joinDeadline = ContinuousClock.now + .seconds(3)
+        while await stream.pendingReaderCount < 3 {
+            guard ContinuousClock.now < joinDeadline else { throw URLError(.timedOut) }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) { try await cancelled.value }
+        await bytes.setFailure(nil)
+        let output = try await reader.value
+        let overlap = try await other
+        #expect(output == fixture.data.subdata(in: crossing))
+        #expect(overlap == fixture.data.subdata(in: overlapping))
+        let fetched = await bytes.ranges.dropFirst(before)
+        #expect(Array(fetched) == Array(repeating: chunk..<(2 * chunk), count: 2))
+    }
+
+    @Test(arguments: [401, 403, 429])
+    func foregroundReadDoesNotRetryDeniedStatus(_ status: Int) async throws {
+        let fixture = streamFixture(payload: Data(count: 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.httpStatus(status))
+        await #expect(throws: NativeMediaError.httpStatus(status)) {
+            try await stream.read(range: 600_000..<600_017, retriesTransientReads: true)
+        }
+        #expect(await bytes.ranges.count == before + 1)
+    }
+
+    @Test func changedVersionDuringForegroundRetryStopsWithoutDeliveringTheNewBytes() async throws {
+        let fixture = streamFixture(payload: Data(count: 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.network)
+        let reader = Task { try await stream.read(range: 600_000..<600_017, retriesTransientReads: true) }
+        try await waitForFetch(before + 1, on: bytes)
+        await bytes.setChanged()
+        await bytes.setFailure(nil)
+        await #expect(throws: NativeProgressiveError.changedSource) { try await reader.value }
+        #expect(await bytes.ranges.count == before + 2)
+    }
+
+    @Test func cancellingLastForegroundWaiterStopsScheduledRetry() async throws {
+        let fixture = streamFixture(payload: Data(count: 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.network)
+        let reader = Task { try await stream.read(range: 600_000..<600_017, retriesTransientReads: true) }
+        try await waitForFetch(before + 1, on: bytes)
+        reader.cancel()
+        await #expect(throws: CancellationError.self) { try await reader.value }
+        try await Task.sleep(for: .milliseconds(650))
+        #expect(await bytes.ranges.count == before + 1)
+    }
+
+    @Test func persistentlyUnavailableForegroundChunkStopsAfterFourRetries() async throws {
+        let fixture = streamFixture(payload: Data(count: 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.httpStatus(503))
+        await #expect(throws: NativeMediaError.httpStatus(503)) {
+            try await stream.read(range: 600_000..<600_017, retriesTransientReads: true)
+        }
+        #expect(await bytes.ranges.count == before + 5)
+    }
+
+    @Test func foregroundRetryDeadlineAlsoCancelsASlowNetworkAttempt() async throws {
+        let fixture = streamFixture(payload: Data(count: 1024 * 1024), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data)
+        let stream = try await NativeProgressiveMedia().prepare(source: source(), fetcher: bytes)
+        let before = await bytes.ranges.count
+        await bytes.setFailure(NativeMediaError.network)
+        let start = ContinuousClock.now
+        let reader = Task { try await stream.read(range: 600_000..<600_017, retriesTransientReads: true) }
+        try await waitForFetch(before + 1, on: bytes)
+        await bytes.setDelay(.seconds(60))
+        await #expect(throws: NativeMediaError.network) { try await reader.value }
+        let elapsed = start.duration(to: .now)
+        #expect(elapsed >= .seconds(8))
+        #expect(elapsed < .seconds(12))
+        #expect(await bytes.cancellations == 1)
+        #expect(await bytes.ranges.count == before + 2)
+    }
+
     @Test(arguments: [false, true])
     func testedDirectMirrorIsTriedFirstAndCanFailBack(_ directFails: Bool) async throws {
         let fixture = streamFixture(payload: Data([1, 2, 3]), samples: 1)

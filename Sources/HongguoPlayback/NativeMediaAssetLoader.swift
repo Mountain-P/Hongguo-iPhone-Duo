@@ -222,7 +222,7 @@ public final class NativeMediaAssetLoader: NSObject, AVAssetResourceLoaderDelega
                     try Task.checkCancellation()
                     let count = min(chunkSize, limit - cursor)
                     let next = cursor + count
-                    let bytes = try await stream.read(range: cursor..<next)
+                    let bytes = try await stream.read(range: cursor..<next, retriesTransientReads: true)
                     try Task.checkCancellation()
                     guard bytes.count == count else { throw NativeMediaError.invalidResponse }
                     guard let self, await self.deliver(bytes, offset: cursor, request: identifier, generation: generation) else { return }

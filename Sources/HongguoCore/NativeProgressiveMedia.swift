@@ -328,6 +328,7 @@ public actor NativeMediaStream: Hashable {
     private struct Waiter {
         let continuation: CheckedContinuation<RawChunk, any Error>
         let demand: Bool
+        let retriesTransientReads: Bool
     }
     private struct Flight {
         let id: UUID
@@ -378,7 +379,7 @@ public actor NativeMediaStream: Hashable {
         return permanentFailure
     }
 
-    public func read(range: Range<Int>) async throws -> Data {
+    public func read(range: Range<Int>, retriesTransientReads: Bool = false) async throws -> Data {
         try Task.checkCancellation()
         guard range.lowerBound >= 0, range.upperBound <= totalLength else { throw NativeProgressiveError.invalidRange }
         guard !range.isEmpty else { return Data() }
@@ -399,7 +400,7 @@ public actor NativeMediaStream: Hashable {
             if var cached = cache[index] {
                 access &+= 1; cached.access = access; cache[index] = cached; chunk = cached.data
             } else {
-                let raw = try await sharedChunk(index: index, range: start..<end, wantsClearBytes: true)
+                let raw = try await sharedChunk(index: index, range: start..<end, wantsClearBytes: true, retriesTransientReads: retriesTransientReads)
                 try Task.checkCancellation()
                 if let permanentFailure { throw permanentFailure }
                 // A demand may have joined a raw-only prefetch while its disk write
@@ -471,7 +472,7 @@ public actor NativeMediaStream: Hashable {
         return clear
     }
 
-    private func sharedChunk(index: Int, range: Range<Int>, wantsClearBytes: Bool) async throws -> RawChunk {
+    private func sharedChunk(index: Int, range: Range<Int>, wantsClearBytes: Bool, retriesTransientReads: Bool = false) async throws -> RawChunk {
         if let permanentFailure { throw permanentFailure }
         let waiter = UUID()
         return try await withTaskCancellationHandler {
@@ -484,13 +485,13 @@ public actor NativeMediaStream: Hashable {
                         continuation.resume(returning: RawChunk(data: raw, storedOnDisk: false))
                         return
                     }
-                    flight.waiters[waiter] = Waiter(continuation: continuation, demand: wantsClearBytes)
+                    flight.waiters[waiter] = Waiter(continuation: continuation, demand: wantsClearBytes, retriesTransientReads: retriesTransientReads)
                     flight.wantsClearBytes = flight.wantsClearBytes || wantsClearBytes
                     flights[index] = flight
                 } else {
                     let id = UUID()
                     flights[index] = Flight(id: id, task: nil,
-                        waiters: [waiter: Waiter(continuation: continuation, demand: wantsClearBytes)],
+                        waiters: [waiter: Waiter(continuation: continuation, demand: wantsClearBytes, retriesTransientReads: retriesTransientReads)],
                         wantsClearBytes: wantsClearBytes, raw: nil)
                     let task = Task { [weak self] in
                         guard let self else { return }
@@ -510,6 +511,51 @@ public actor NativeMediaStream: Hashable {
         if flight.waiters.isEmpty {
             flights.removeValue(forKey: index); flight.task?.cancel()
         } else { flights[index] = flight }
+    }
+
+    private func hasPlaybackWaiter(index: Int, id: UUID) -> Bool {
+        guard let flight = flights[index], flight.id == id else { return false }
+        return flight.waiters.values.contains(where: \.retriesTransientReads)
+    }
+
+    /// A single shared chunk flight retains its AVFoundation readers through a brief outage.
+    /// Only the retry path creates a timer. The budget includes the first request and all
+    /// subsequent delays and transfers; a slow successful first transfer is unaffected.
+    private func fetchForWaiters(index: Int, range: Range<Int>, id: UUID) async throws -> NativeRangeResponse {
+        let deadline = ContinuousClock.now + .seconds(9)
+        do { return try await fetcher.fetch(range: range) }
+        catch {
+            try Task.checkCancellation()
+            guard hasPlaybackWaiter(index: index, id: id), ContinuousClock.now < deadline,
+                  PlaybackRecovery.shouldRetry(error, attempt: 0) else { throw error }
+            return try await withThrowingTaskGroup(of: NativeRangeResponse.self) { group in
+                group.addTask { [self] in
+                    var lastError = error
+                    for delay in [Duration.milliseconds(500), .seconds(1), .seconds(2), .seconds(3)] {
+                        guard ContinuousClock.now + delay < deadline else { throw lastError }
+                        try await Task.sleep(for: delay)
+                        guard await hasPlaybackWaiter(index: index, id: id) else { throw lastError }
+                        do {
+                            return try await PlaybackTransferContext.$isBackground.withValue(false) {
+                                try await self.fetcher.fetch(range: range)
+                            }
+                        } catch {
+                            try Task.checkCancellation()
+                            guard PlaybackRecovery.shouldRetry(error, attempt: 0) else { throw error }
+                            lastError = error
+                        }
+                    }
+                    throw lastError
+                }
+                group.addTask {
+                    try await Task.sleep(until: deadline, clock: .continuous)
+                    throw NativeMediaError.network
+                }
+                defer { group.cancelAll() }
+                guard let result = try await group.next() else { throw CancellationError() }
+                return result
+            }
+        }
     }
 
     private func fetchChunk(index: Int, range: Range<Int>, id: UUID) async {
@@ -533,7 +579,7 @@ public actor NativeMediaStream: Hashable {
             }
             let hitDisk = raw != nil
             if raw == nil {
-                let response = try await fetcher.fetch(range: range)
+                let response = try await fetchForWaiters(index: index, range: range, id: id)
                 try Task.checkCancellation()
                 guard flights[index]?.id == id else { return }
                 try NativeProgressiveMedia.validate(response, requested: range, total: totalLength, validators: validators)
