@@ -52,10 +52,15 @@ public struct PlaybackSource: Hashable, Sendable {
 }
 
 public protocol CatalogService: Sendable {
+    var offlinePlayback: OfflinePlaybackAccess? { get }
     func home(page: Int) async throws -> SeriesPage
     func search(query: String, page: Int) async throws -> SeriesPage
     func detail(id: String) async throws -> SeriesDetail
     func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource
+}
+
+public extension CatalogService {
+    var offlinePlayback: OfflinePlaybackAccess? { nil }
 }
 
 public enum CatalogError: Error, LocalizedError, Equatable, Sendable {

@@ -4,9 +4,9 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class OfflineDownloadModel: ObservableObject {
-    static let scope = "native.public.v1"
-
-    @Published private(set) var items: [OfflineDownloadItem] = []
+    @Published var scope = OfflinePlaybackAccess.scope(for: .guest)
+    @Published private var allItems: [OfflineDownloadItem] = []
+    var items: [OfflineDownloadItem] { allItems.filter { $0.key.scope == scope || $0.isImportedVideo } }
     @Published private(set) var isReady = false
     @Published private(set) var storageUnavailable = false
     @Published private(set) var isImporting = false
@@ -14,6 +14,7 @@ final class OfflineDownloadModel: ObservableObject {
     @Published var error: String?
 
     private var storage: OfflineDownloads?
+    private var opening: Task<OfflineDownloads, any Error>?
     private var observation: Task<Void, Never>?
     private var progressWrite: Task<Void, Never>?
     private let openStorage: @Sendable () throws -> OfflineDownloads
@@ -32,27 +33,32 @@ final class OfflineDownloadModel: ObservableObject {
 
     deinit { observation?.cancel() }
 
+    private func loadStorage() async throws -> OfflineDownloads {
+        if let storage { return storage }
+        if let opening { return try await opening.value }
+        let open = openStorage
+        let task = Task.detached(priority: .utility) { try open() }
+        opening = task
+        defer { opening = nil }
+        let result = try await task.value
+        storage = result
+        return result
+    }
+
+    func storageForPlayback() async -> OfflineDownloads? { try? await loadStorage() }
+
     func startObserving() {
         guard observation == nil else { return }
         if storageUnavailable { error = nil }
         storageUnavailable = false
-        let openStorage = self.openStorage
-        let existing = storage
         observation = Task { [weak self] in
             defer { self?.observation = nil }
             do {
-                let library: OfflineDownloads
-                if let existing { library = existing }
-                else {
-                    library = try await Task.detached(priority: .utility) { try openStorage() }.value
-                    self?.storage = library
-                }
+                guard let library = try await self?.loadStorage() else { return }
                 let updates = await library.updates()
                 await library.start()
                 for await current in updates {
-                    self?.items = current.filter {
-                        $0.key.scope == Self.scope || $0.key.scope == OfflineDownloads.importedScope
-                    }
+                    self?.allItems = current
                     if self?.isReady == false { self?.isReady = true }
                 }
             } catch {
@@ -63,18 +69,18 @@ final class OfflineDownloadModel: ObservableObject {
     }
 
     func item(seriesID: String, episodeID: String) -> OfflineDownloadItem? {
-        items.first { $0.key.scope == Self.scope && $0.key.seriesID == seriesID && $0.key.episodeID == episodeID }
+        items.first { $0.key.scope == scope && $0.key.seriesID == seriesID && $0.key.episodeID == episodeID }
     }
 
-    func enqueue(series: Series, episodes: [Episode]) async -> Bool {
+    func enqueue(catalog: SeriesDetail, episodes: [Episode]) async -> Bool {
         guard let storage else { return false }
         do {
             let entries = episodes.filter(\.isAvailable).map { episode in
-                let key = OfflineDownloadKey(scope: Self.scope, seriesID: series.id, episodeID: episode.id)
-                return OfflineDownloadItem(key: key, seriesTitle: series.title, episodeNumber: episode.number,
+                let key = OfflineDownloadKey(scope: scope, seriesID: catalog.series.id, episodeID: episode.id)
+                return OfflineDownloadItem(key: key, seriesTitle: catalog.series.title, episodeNumber: episode.number,
                                            episodeTitle: episode.title)
             }
-            try await storage.enqueue(entries)
+            try await storage.enqueue(entries, catalog: catalog)
             return true
         } catch {
             report(error)
@@ -82,7 +88,10 @@ final class OfflineDownloadModel: ObservableObject {
         }
     }
 
+    private func visible(_ key: OfflineDownloadKey) -> Bool { key.scope == scope || key.scope == OfflineDownloads.importedScope }
+
     func cancel(_ key: OfflineDownloadKey) async {
+        guard visible(key) else { return }
         do { try await storage?.cancel(key) }
         catch { report(error) }
     }
@@ -113,6 +122,7 @@ final class OfflineDownloadModel: ObservableObject {
     }
 
     func retry(_ key: OfflineDownloadKey) async {
+        guard visible(key) else { return }
         do { try await storage?.retry(key) }
         catch { report(error) }
     }
@@ -122,21 +132,19 @@ final class OfflineDownloadModel: ObservableObject {
         isRetryingFailed = true
         defer { isRetryingFailed = false }
         do {
-            try await storage.retryFailed(keys)
+            try await storage.retryFailed(keys.filter(visible))
             // Refresh before enabling the button again, even if the observer has not delivered yet.
-            items = await storage.snapshot().filter {
-                $0.key.scope == Self.scope || $0.key.scope == OfflineDownloads.importedScope
-            }
+            allItems = await storage.snapshot()
         } catch { report(error) }
     }
 
     func delete(_ keys: [OfflineDownloadKey]) async {
-        do { try await storage?.delete(keys) }
+        do { try await storage?.delete(keys.filter(visible)) }
         catch { report(error) }
     }
 
     func deleteSeries(scope: String, id: String) async -> Bool {
-        guard let storage else { return false }
+        guard scope == self.scope, let storage else { return false }
         do {
             try await storage.deleteSeries(scope: scope, seriesID: id)
             return true
@@ -147,10 +155,11 @@ final class OfflineDownloadModel: ObservableObject {
     }
 
     func playback(_ item: OfflineDownloadItem, continuingSeries: Bool = false) async -> OfflinePlaybackRoute? {
-        guard let storage else { return nil }
+        guard visible(item.key), let storage else { return nil }
         // Wait for the last progress write when reopening immediately after close.
         await progressWrite?.value
         let snapshot = await storage.snapshot()
+        guard visible(item.key) else { return nil }
         let saved = snapshot.filter {
             $0.key.seriesID == item.key.seriesID && $0.key.scope == item.key.scope && $0.state == .completed
         }
@@ -241,7 +250,7 @@ struct OfflineEpisodeSelectionView: View {
 
     var body: some View {
         let existingIDs = Set(downloads.items.lazy.filter {
-            $0.key.scope == OfflineDownloadModel.scope && $0.key.seriesID == detail.series.id
+            $0.key.scope == downloads.scope && $0.key.seriesID == detail.series.id
         }.map(\.key.episodeID))
         let selectableIDs = Set(detail.episodes.lazy.filter { $0.isAvailable && !existingIDs.contains($0.id) }.map(\.id))
         let selectedIDs = selected.intersection(selectableIDs)
@@ -302,7 +311,7 @@ struct OfflineEpisodeSelectionView: View {
                         let episodes = detail.episodes.filter { selectedIDs.contains($0.id) }
                         submitting = true
                         Task {
-                            if await downloads.enqueue(series: detail.series, episodes: episodes) { dismiss() }
+                            if await downloads.enqueue(catalog: detail, episodes: episodes) { dismiss() }
                             submitting = false
                         }
                     }

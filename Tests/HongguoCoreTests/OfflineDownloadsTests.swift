@@ -268,7 +268,7 @@ struct OfflineDownloadsTests {
         #expect(await restored.snapshot().first?.position == 13.5)
     }
 
-    @Test func interruptedIndexKeepsWaitingJobsAndRequiresManualRetryForActiveJob() async throws {
+    @Test func terminatedTransferIsRequeuedOnceAndOtherJobsKeepRunning() async throws {
         let originalDirectory = temporaryLibrary()
         let restartDirectory = temporaryLibrary()
         let transfer = ControlledOfflineTransfer()
@@ -295,19 +295,107 @@ struct OfflineDownloadsTests {
         let orphan = restartDirectory.appendingPathComponent("completed/\(UUID().uuidString).mp4")
         try fixture.write(to: orphan)
         let restored = try OfflineDownloads(directory: restartDirectory, provider: writeFixture)
-        #expect(await restored.snapshot().map(\.state) == [.failed, .queued])
+        #expect(await restored.snapshot().map(\.state) == [.queued, .queued])
         #expect(await restored.snapshot().first?.receivedBytes == 0)
         #expect(!FileManager.default.fileExists(atPath: orphan.path))
         #expect(try FileManager.default.contentsOfDirectory(atPath: restartDirectory.appendingPathComponent("staging").path).isEmpty)
         await restored.start()
-        try await wait { await restored.snapshot().map(\.state) == [.failed, .completed] }
-        try await restored.retry(item.key)
         try await wait { await restored.snapshot().map(\.state) == [.completed, .completed] }
         #expect(try await restored.localURL(for: item.key) != nil)
         await transfer.release(0)
         try await wait { await transfer.count == 2 }
         await transfer.release(1)
         try await wait { await original.snapshot().map(\.state) == [.completed, .completed] }
+    }
+
+    @Test func secondTerminationRequiresUserRetryAndCancelledJobStaysCancelled() async throws {
+        let live = temporaryLibrary(), restoredURL = temporaryLibrary(), secondURL = temporaryLibrary()
+        let firstTransfer = ControlledOfflineTransfer(), secondTransfer = ControlledOfflineTransfer()
+        defer {
+            Task { await firstTransfer.releaseAll(); await secondTransfer.releaseAll() }
+            for url in [live, restoredURL, secondURL] { try? FileManager.default.removeItem(at: url) }
+        }
+        let source = try OfflineDownloads(directory: live) { item, file, maximum, progress in
+            try await firstTransfer.download(item, file, maximum, progress)
+        }
+        try await source.enqueue([episode(1), episode(2)])
+        try await wait { await firstTransfer.count == 1 }
+        try await source.cancel(episode(2).key)
+        try FileManager.default.copyItem(at: live, to: restoredURL)
+        let once = try OfflineDownloads(directory: restoredURL) { item, file, maximum, progress in
+            try await secondTransfer.download(item, file, maximum, progress)
+        }
+        await once.start()
+        try await wait { await secondTransfer.count == 1 }
+        try FileManager.default.copyItem(at: restoredURL, to: secondURL)
+        let twice = try OfflineDownloads(directory: secondURL, provider: writeFixture)
+        await twice.start()
+        #expect(await twice.snapshot().map(\.state) == [.failed, .cancelled])
+        try await twice.retry(episode(1).key)
+        try await wait { await twice.snapshot().contains { $0.key == episode(1).key && $0.state == .completed } }
+        #expect(await twice.snapshot().first { $0.key == episode(2).key }?.state == .cancelled)
+        await firstTransfer.releaseAll()
+        await secondTransfer.releaseAll()
+        try await wait { await source.snapshot().first?.state == .completed }
+        try await wait { await once.snapshot().first?.state == .completed }
+    }
+
+    @Test func scopedDownloadsKeepFullSeasonForContinuationAndFallBackWhenRemoved() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = OfflinePlaybackAccess.scope(for: .account(id: "test-owner"))
+        let other = OfflinePlaybackAccess.scope(for: .account(id: "other-owner"))
+        #expect(owner != other && OfflinePlaybackAccess.scope(for: .guest) == "native.public.v1")
+        let series = Series(id: "40", title: "測試")
+        let episodes = (1...3).map { Episode(id: String($0), number: $0, title: "第 \($0) 集") }
+        let detail = SeriesDetail(series: series, episodes: episodes)
+        let store = try OfflineDownloads(directory: directory, provider: writeFixture)
+        let entry = OfflineDownloadItem(key: .init(scope: owner, seriesID: series.id, episodeID: "2"),
+                                       seriesTitle: series.title, episodeNumber: 2)
+        try await store.enqueue([entry], catalog: detail)
+        try await wait { await store.snapshot().first?.state == .completed }
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        let access = OfflinePlaybackAccess(scope: owner) { reopened }
+        let otherAccess = OfflinePlaybackAccess(scope: other) { reopened }
+        let partial = WatchRecord(series: series, episode: episodes[1], seconds: 15, duration: 90)
+        #expect(await access.detail(for: partial) == detail)
+        #expect(await otherAccess.detail(for: partial) == nil)
+        #expect(await otherAccess.source(seriesID: series.id, episodeID: "2") == nil)
+        // The next episode is not downloaded; ask the normal catalogue instead.
+        #expect(await access.detail(for: WatchRecord(series: series, episode: episodes[1], seconds: 90, duration: 90)) == nil)
+        let network = OfflineCountingTransport()
+        let direct = NativeCatalogService(transport: network, offlinePlayback: access)
+        let relay = HomeRelayService(configuration: try .init(baseURL: "https://example.invalid"), allowsDirectFallback: false,
+                                    transport: network, offlinePlayback: access)
+        for service in [direct as any CatalogService, relay] {
+            let file = try await service.playback(seriesID: series.id, episodeID: "2", fresh: true)
+            #expect(try Data(contentsOf: file.url) == fixture)
+        }
+        #expect(await network.calls == 0)
+        try await reopened.delete(entry.key)
+        #expect(await access.detail(for: partial) == nil)
+        await #expect(throws: (any Error).self) { try await direct.playback(seriesID: series.id, episodeID: "2", fresh: false) }
+        #expect(await network.calls > 0)
+    }
+
+    @Test func legacyIndexCanResumeDownloadedEpisodeWithoutSkippingAMissingEpisode() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try OfflineDownloads(directory: directory, provider: writeFixture)
+        try await store.enqueue([episode(1), episode(3), episode(4)])
+        try await wait { await store.snapshot().allSatisfy { $0.state == .completed } }
+        let access = OfflinePlaybackAccess(scope: episode(1).key.scope) { store }
+        let series = Series(id: "40", title: "舊片庫")
+        func record(_ number: Int) -> WatchRecord {
+            .init(series: series, episode: .init(id: String(number), number: number, title: ""), seconds: 18, duration: 80)
+        }
+        #expect(await access.detail(for: record(3)) == nil)
+        #expect(await access.fallbackDetail(seriesID: series.id, continuing: record(2)) == nil)
+        let first = await access.fallbackDetail(seriesID: series.id, continuing: record(1))
+        #expect(first?.episodes.map(\.number) == [1])
+        let resumed = await access.fallbackDetail(seriesID: series.id, continuing: record(3))
+        #expect(resumed?.episodes.map(\.number) == [3, 4])
+        #expect(PlaybackContinuation.preferred(seriesID: series.id, episodes: resumed?.episodes ?? [], record: record(3))?.seconds == 18)
     }
 
     @Test func batchEnqueueValidatesTheWholeSelectionBeforeStartingDownloads() async throws {
@@ -657,4 +745,12 @@ private actor ControlledOfflineTransfer {
 private actor OfflineTransferCaps {
     private(set) var values: [Int64] = []
     func record(_ cap: Int64) { values.append(cap) }
+}
+
+private actor OfflineCountingTransport: HTTPTransport {
+    private(set) var calls = 0
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        calls += 1
+        throw URLError(.notConnectedToInternet)
+    }
 }

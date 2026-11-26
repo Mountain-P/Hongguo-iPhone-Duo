@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var topicPreferenceContextID = UUID()
     @Published var isImmersivePlayback = false
     @Published var isImmersivePreview = false
+    let downloads = OfflineDownloadModel()
     private let defaults = UserDefaults.standard
     private let library = AccountLibraryController()
     private var libraryObservation: AnyCancellable?
@@ -114,6 +115,7 @@ final class AppModel: ObservableObject {
         // This publisher supplies the incoming owner before the controller updates its property.
         // Clear the previous owner's choices synchronously, then load the captured new scope.
         topicOwnerObservation = library.$selectedOwner.removeDuplicates().sink { [weak self] owner in
+            self?.downloads.scope = OfflinePlaybackAccess.scope(for: owner)
             self?.reloadTopicPreferences(owner: owner)
         }
         restoreLibrary()
@@ -141,13 +143,16 @@ final class AppModel: ObservableObject {
     }
 
     func playbackService() throws -> any CatalogService {
-        if playbackMode == .native { return NativeCatalogService(quality: nativePlaybackQuality) }
+        let offline = OfflinePlaybackAccess(scope: OfflinePlaybackAccess.scope(for: selectedLibraryOwner)) { [downloads] in
+            await downloads.storageForPlayback()
+        }
+        if playbackMode == .native { return NativeCatalogService(quality: nativePlaybackQuality, offlinePlayback: offline) }
         guard !serverURL.isEmpty else { throw AppError.message("請先設定播放服務，才能查詢可選集數與播放影片。") }
         if playbackMode == .relay {
             return HomeRelayService(configuration: try ServerConfiguration(baseURL: serverURL, token: token(for: serverURL)),
                                     usesServerLibrary: catalogSource == .bridge,
                                     allowsDirectFallback: relayDirectFallback,
-                                    direct: NativeCatalogService(quality: nativePlaybackQuality))
+                                    direct: NativeCatalogService(quality: nativePlaybackQuality), offlinePlayback: offline)
         }
         return BridgeService(configuration: try ServerConfiguration(baseURL: serverURL, token: token(for: serverURL)))
     }

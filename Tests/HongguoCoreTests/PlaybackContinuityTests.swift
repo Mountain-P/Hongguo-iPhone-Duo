@@ -61,6 +61,25 @@ struct PlaybackContinuityTests {
         #expect(evaluate(14, waiting: true) == .stalled)
     }
 
+    @Test func boundedForegroundRetriesDeferSpeculationAndConfirmedTerminalFailureRemainsImmediate() {
+        var transfer = PlaybackTransferSnapshot(failures: 1)
+        var policy = PlaybackContinuityPolicy()
+        func update(_ time: Double, terminal: Bool = false) -> PlaybackContinuityPolicy.Reason? {
+            policy.update(now: time, eligible: true, terminal: terminal, waiting: true, bufferedWallSeconds: 0,
+                          requiredBytesPerSecond: 400_000, transfer: transfer)
+        }
+        #expect(update(0) == nil)
+        transfer.isRetryingForegroundRead = true
+        #expect(update(3) == nil)
+        #expect(update(7) == nil)
+        transfer.isRetryingForegroundRead = false
+        #expect(update(8) == nil)
+        #expect(update(11) == .stalled)
+        policy = PlaybackContinuityPolicy()
+        transfer.isRetryingForegroundRead = true
+        #expect(update(0, terminal: true) == .terminal)
+    }
+
     @Test func slowRouteNeedsSustainedMeasuredDeficitAndLowActualBuffer() {
         var policy = PlaybackContinuityPolicy()
         let slow = PlaybackTransferSnapshot(bytesPerSecond: 100_000, completedRanges: 4, activeRanges: 1)

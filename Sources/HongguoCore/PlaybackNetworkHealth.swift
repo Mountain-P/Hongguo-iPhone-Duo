@@ -7,6 +7,8 @@ public struct PlaybackTransferSnapshot: Sendable {
     public var failures: Int = 0
     public var idleSeconds: Double = 0
     public var activeRanges: Int = 0
+    public var isRetryingForegroundRead = false
+    public var lastValidatedForegroundRequestStartedAt: Double?
     public init(bytesPerSecond: Double = 0, completedRanges: Int = 0, failures: Int = 0, idleSeconds: Double = 0, activeRanges: Int = 0) {
         self.bytesPerSecond = bytesPerSecond; self.completedRanges = completedRanges
         self.failures = failures; self.idleSeconds = idleSeconds; self.activeRanges = activeRanges
@@ -18,6 +20,18 @@ final class NativeTransferHealth: @unchecked Sendable {
     private let lock = NSLock()
     private var active: [UUID: (start: Double, received: Double)] = [:]
     private var value = PlaybackTransferSnapshot()
+    private var foregroundRetries = Set<UUID>()
+    func setForegroundRetry(_ id: UUID, active: Bool) {
+        lock.withLock {
+            if active { foregroundRetries.insert(id) } else { foregroundRetries.remove(id) }
+            value.isRetryingForegroundRead = !foregroundRetries.isEmpty
+        }
+    }
+    func validatedForegroundRequest(startedAt: Double) {
+        lock.withLock {
+            value.lastValidatedForegroundRequestStartedAt = max(value.lastValidatedForegroundRequestStartedAt ?? startedAt, startedAt)
+        }
+    }
     func begin(id: UUID) {
         let now = ProcessInfo.processInfo.systemUptime
         lock.withLock { active[id] = (now, now) }
@@ -113,6 +127,9 @@ public struct PlaybackContinuityPolicy: Sendable {
                                 bufferedWallSeconds: Double, requiredBytesPerSecond: Double,
                                 transfer: PlaybackTransferSnapshot) -> Reason? {
         guard eligible, now.isFinite, bufferedWallSeconds.isFinite else { poorSince = nil; return nil }
+        // A playback reader already has a bounded retry. Leave the hard-stall
+        // watchdog active, but avoid launching a second source lookup in parallel.
+        if transfer.isRetryingForegroundRead && !terminal { poorSince = nil; return nil }
         let slow = transfer.activeRanges > 0 && transfer.completedRanges >= 3 && requiredBytesPerSecond > 0
             && transfer.bytesPerSecond < requiredBytesPerSecond * 1.15
         let poor = waiting || (bufferedWallSeconds < 12 && (slow || transfer.idleSeconds >= 3 || transfer.failures > 0))

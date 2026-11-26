@@ -131,6 +131,7 @@ public actor OfflineDownloads {
         var item: OfflineDownloadItem
         let fileID: UUID
         var checksum: Data?
+        var resumedAfterTermination: Bool?
     }
 
     private struct Index: Codable {
@@ -208,7 +209,14 @@ public actor OfflineDownloads {
 
     public func enqueue(_ item: OfflineDownloadItem) throws { try enqueue([item]) }
 
-    public func enqueue(_ items: [OfflineDownloadItem]) throws {
+    public func enqueue(_ items: [OfflineDownloadItem], catalog: SeriesDetail? = nil) throws {
+        if let catalog, let first = items.first {
+            let available = Set(catalog.episodes.filter(\.isAvailable).map(\.id))
+            guard items.allSatisfy({ item in
+                item.key.scope == first.key.scope && item.key.seriesID == catalog.series.id
+                    && available.contains(item.key.episodeID)
+            }) else { throw OfflineDownloadError.invalidItem }
+        }
         var keys = Set(records.map(\.item.key))
         var updated = records
         for var item in items {
@@ -226,8 +234,8 @@ public actor OfflineDownloads {
             }
             updated.append(Record(item: item, fileID: UUID()))
         }
-        guard updated.count != records.count else { return }
-        try commit(updated)
+        if updated.count != records.count { try commit(updated) }
+        if let catalog, let scope = items.first?.key.scope { disk.saveCatalog(catalog, scope: scope) }
         startNext()
     }
 
@@ -287,6 +295,7 @@ public actor OfflineDownloads {
         var record = updated.remove(at: index)
         // A corrupt movie may still be present after earlier cleanup was refused.
         try disk.deleteFile(disk.movie(record.fileID))
+        record.resumedAfterTermination = nil
         record.item.resetTransfer(to: .queued)
         inheritActiveCooldown(&record.item)
         updated.append(record)
@@ -306,6 +315,7 @@ public actor OfflineDownloads {
             retried[index].item.resetTransfer(to: .queued)
             inheritActiveCooldown(&retried[index].item)
             retried[index].checksum = nil
+            retried[index].resumedAfterTermination = nil
         }
         let retriedKeys = Set(retried.map(\.item.key))
         try commit(records.filter { !retriedKeys.contains($0.item.key) } + retried)
@@ -348,6 +358,11 @@ public actor OfflineDownloads {
             if (try? disk.save(restored)) != nil { updated = restored }
         }
 
+        let retainedCatalogs = Set(updated.map { disk.catalogURL(scope: $0.item.key.scope, seriesID: $0.item.key.seriesID) })
+        for record in removed {
+            let file = disk.catalogURL(scope: record.item.key.scope, seriesID: record.item.key.seriesID)
+            if !retainedCatalogs.contains(file) { disk.remove(file) }
+        }
         records = updated
         publish()
         if let key = job?.key, requested.contains(key), index(for: key) == nil { job?.task.cancel() }
@@ -365,6 +380,37 @@ public actor OfflineDownloads {
         updated[index].item.duration = duration
         updated[index].item.lastWatchedAt = now()
         try commit(updated)
+    }
+
+    /// Only expose a catalogue snapshot if this owner still has a completed
+    /// episode. Older indexes have no snapshot and can still open their saved rows.
+    func savedDetail(scope: String, seriesID: String, continuing record: WatchRecord? = nil, allowPartial: Bool = false) -> SeriesDetail? {
+        guard scope != Self.importedScope else { return nil }
+        let saved = records.map(\.item).filter {
+            $0.key.scope == scope && $0.key.seriesID == seriesID && $0.state == .completed
+        }.sorted { ($0.episodeNumber, $0.key.episodeID) < ($1.episodeNumber, $1.key.episodeID) }
+        guard let first = saved.first else { return nil }
+        let catalog = disk.readCatalog(scope: scope, seriesID: seriesID)
+        let detail = catalog ?? SeriesDetail(series: record?.series ?? .init(id: seriesID, title: first.seriesTitle),
+            episodes: saved.map { .init(id: $0.key.episodeID, number: $0.episodeNumber, title: $0.episodeTitle) })
+        if let record {
+            guard detail.episodes.contains(where: { $0.id == record.episode.id }),
+                  let target = PlaybackContinuation.preferred(seriesID: seriesID, episodes: detail.episodes, record: record),
+                  saved.contains(where: { $0.key.episodeID == target.episode.id }) else { return nil }
+            // A pre-snapshot index can only describe downloaded episodes. Online
+            // lookup should retain the full season when available.
+            if catalog == nil {
+                guard allowPartial,
+                      let i = detail.episodes.firstIndex(where: { $0.id == record.episode.id }) else { return nil }
+                // A legacy snapshot cannot fill gaps with guessed episode IDs.
+                // Limit automatic navigation to consecutive downloaded episodes.
+                var first = i, last = i
+                while first > 0 && detail.episodes[first - 1].number == detail.episodes[first].number - 1 { first -= 1 }
+                while last + 1 < detail.episodes.count && detail.episodes[last + 1].number == detail.episodes[last].number + 1 { last += 1 }
+                return .init(series: detail.series, episodes: Array(detail.episodes[first...last]))
+            }
+        }
+        return detail
     }
 
     public func localURL(for key: OfflineDownloadKey) throws -> URL? {
@@ -642,6 +688,7 @@ public actor OfflineDownloads {
         let completed: URL
         let staging: URL
         let manifest: URL
+        let catalogs: URL
 
         init(directory: URL) throws {
             guard directory.isFileURL else { throw OfflineDownloadError.storageUnavailable }
@@ -649,9 +696,11 @@ public actor OfflineDownloads {
             completed = root.appendingPathComponent("completed", isDirectory: true)
             staging = root.appendingPathComponent("staging", isDirectory: true)
             manifest = root.appendingPathComponent("index.json")
+            catalogs = root.appendingPathComponent("catalogs", isDirectory: true)
             try createDirectory(root)
             try createDirectory(completed)
             try createDirectory(staging)
+            try createDirectory(catalogs)
             #if os(iOS)
             var excluded = root
             var values = URLResourceValues()
@@ -684,7 +733,12 @@ public actor OfflineDownloads {
                 let record = recovered[i]
                 guard Self.valid(record.item) else { throw OfflineDownloadError.invalidIndex }
                 if record.item.state == .downloading {
-                    recovered[i].item.resetTransfer(to: .failed, failure: "下載已中斷，請重新下載。")
+                    if record.resumedAfterTermination == true {
+                        recovered[i].item.resetTransfer(to: .failed, failure: "下載再次中斷，請重新下載。")
+                    } else {
+                        recovered[i].resumedAfterTermination = true
+                        recovered[i].item.resetTransfer(to: .queued)
+                    }
                 } else if record.item.state == .completed {
                     let valid: Bool
                     do {
@@ -701,8 +755,31 @@ public actor OfflineDownloads {
             if recovered != index.records { try save(recovered) }
             let retained = Set(recovered.filter { $0.item.state == .completed }.map { movie($0.fileID).lastPathComponent })
             for file in completedFiles where Self.isMovie(file) && !retained.contains(file.lastPathComponent) { remove(file) }
+            let catalogsInUse = Set(recovered.map { catalogURL(scope: $0.item.key.scope, seriesID: $0.item.key.seriesID).lastPathComponent })
+            for url in (try? contents(catalogs)) ?? [] where !catalogsInUse.contains(url.lastPathComponent) { remove(url) }
             cleanStaging()
             return recovered
+        }
+
+        func catalogURL(scope: String, seriesID: String) -> URL {
+            let digest = SHA256.hash(data: Data((scope + "\0" + seriesID).utf8)).map { String(format: "%02x", $0) }.joined()
+            return catalogs.appendingPathComponent(digest + ".json")
+        }
+
+        func saveCatalog(_ detail: SeriesDetail, scope: String) {
+            let snapshot = SeriesDetail(series: detail.series, episodes: detail.episodes)
+            guard (try? EpisodeSelection(seriesID: detail.series.id, episodes: detail.episodes)) != nil,
+                  let bytes = try? JSONEncoder().encode(snapshot), bytes.count <= Self.maximumIndexBytes else { return }
+            try? bytes.write(to: catalogURL(scope: scope, seriesID: detail.series.id),
+                             options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        }
+
+        func readCatalog(scope: String, seriesID: String) -> SeriesDetail? {
+            let url = catalogURL(scope: scope, seriesID: seriesID)
+            guard let size = try? fileSize(url), size <= Self.maximumIndexBytes,
+                  let bytes = try? Data(contentsOf: url), let detail = try? JSONDecoder().decode(SeriesDetail.self, from: bytes),
+                  detail.series.id == seriesID, (try? EpisodeSelection(seriesID: seriesID, episodes: detail.episodes)) != nil else { return nil }
+            return detail
         }
 
         func save(_ records: [Record]) throws {

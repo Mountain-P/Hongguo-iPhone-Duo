@@ -6,6 +6,8 @@ import FoundationNetworking
 /// Standalone catalogue and playback. All network traffic goes directly to the source platform.
 /// A listed episode is eligible for a playback request; the playback response can still deny access.
 public struct NativeCatalogService: CatalogService {
+    public private(set) var offlinePlayback: OfflinePlaybackAccess? = nil
+    let openingScope = UUID()
     private let website: DirectWebService
     private let transport: any HTTPTransport
     private let cache = NativeCatalogCache()
@@ -13,7 +15,8 @@ public struct NativeCatalogService: CatalogService {
     private let prepare: @Sendable (_ episodeID: String, _ contentType: String, _ fresh: Bool, _ quality: NativePlaybackQuality) async throws -> PlaybackSource
 
     public init(category: DirectWebService.Category = .realDrama, transport: any HTTPTransport = URLSessionTransport(),
-                quality: NativePlaybackQuality = .automatic) {
+                quality: NativePlaybackQuality = .automatic, offlinePlayback: OfflinePlaybackAccess? = nil) {
+        self.offlinePlayback = offlinePlayback
         self.website = DirectWebService(category: category, transport: transport)
         self.transport = transport
         self.playbackQuality = quality
@@ -138,6 +141,7 @@ public struct NativeCatalogService: CatalogService {
         try validateID(seriesID)
         try validateID(episodeID)
         try Task.checkCancellation()
+        if let saved = await offlinePlayback?.source(seriesID: seriesID, episodeID: episodeID) { return saved }
         let entry: NativeCatalogEntry
         if let cached = await cache.entry(for: seriesID) { entry = cached }
         else { entry = try await loadDetail(id: seriesID) }

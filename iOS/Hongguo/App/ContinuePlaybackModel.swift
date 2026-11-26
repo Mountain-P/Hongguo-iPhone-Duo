@@ -184,7 +184,20 @@ final class ContinuePlaybackModel: ObservableObject {
             // Do not retain the model across an uncooperative transport suspension.
             defer { self?.finish(request: request) }
             do {
-                let detail = try await loader(intent.service, intent.series.id)
+                let detail: SeriesDetail
+                if intent.selection == .preferred, let record = intent.latestRecord(), record.series.id == intent.series.id,
+                   let saved = await intent.service.offlinePlayback?.detail(for: record) {
+                    detail = saved
+                } else {
+                    do { detail = try await loader(intent.service, intent.series.id) }
+                    catch {
+                        try Task.checkCancellation()
+                        guard intent.selection == .preferred, PlaybackRecovery.shouldRetry(error, attempt: 0),
+                              let saved = await intent.service.offlinePlayback?.fallbackDetail(seriesID: intent.series.id,
+                                  continuing: intent.latestRecord()) else { throw error }
+                        detail = saved
+                    }
+                }
                 try Task.checkCancellation()
                 try self?.accept(detail: detail, intent: intent, request: request)
             } catch is CancellationError { self?.discardCancelled(request: request) }

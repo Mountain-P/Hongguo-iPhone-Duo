@@ -3,6 +3,8 @@ import Foundation
 /// Keeps catalogue/account identity independent from the media transport.
 /// The relay owns source acquisition and returns ordinary authenticated MP4 ranges.
 public struct HomeRelayService: CatalogService {
+    public private(set) var offlinePlayback: OfflinePlaybackAccess? = nil
+    let openingScope = UUID()
     private let relay: BridgeService
     private let direct: any CatalogService
     public let usesServerLibrary: Bool
@@ -11,7 +13,8 @@ public struct HomeRelayService: CatalogService {
     public init(configuration: ServerConfiguration, usesServerLibrary: Bool = false,
                 allowsDirectFallback: Bool = true,
                 direct: any CatalogService = NativeCatalogService(),
-                transport: any HTTPTransport = URLSessionTransport()) {
+                transport: any HTTPTransport = URLSessionTransport(), offlinePlayback: OfflinePlaybackAccess? = nil) {
+        self.offlinePlayback = offlinePlayback
         relay = BridgeService(configuration: configuration, transport: transport, includesSeriesContext: true)
         self.direct = direct
         self.usesServerLibrary = usesServerLibrary
@@ -33,12 +36,27 @@ public struct HomeRelayService: CatalogService {
         try await (usesServerLibrary ? relay as any CatalogService : direct).detail(id: id)
     }
     public func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
-        do { return try await relay.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh) }
-        catch {
+        try Task.checkCancellation()
+        if let offlinePlayback {
+            let started = ProcessInfo.processInfo.systemUptime
+            if let saved = await offlinePlayback.source(seriesID: seriesID, episodeID: episodeID) {
+                try Task.checkCancellation()
+                await PlaybackMeasurement.lookupReporter?(.init(route: .offline, result: .received, httpStatus: nil,
+                    seconds: ProcessInfo.processInfo.systemUptime - started))
+                return saved
+            }
+        }
+        do {
+            return try await PlaybackMeasurement.measureLookup(via: .relay) {
+                try await relay.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh)
+            }
+        } catch {
             try Task.checkCancellation()
             guard allowsDirectFallback, Self.canFallback(error) else { throw error }
             // Relay credentials never enter the direct provider or its request headers.
-            return try await direct.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh)
+            return try await PlaybackMeasurement.measureLookup(via: .direct) {
+                try await direct.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh)
+            }
         }
     }
 

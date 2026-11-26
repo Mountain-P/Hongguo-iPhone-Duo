@@ -90,13 +90,12 @@ public struct LongPauseSourceRecovery: Sendable {
     public enum PlayDecision: Equatable { case ordinary, refresh, showExpired(Int) }
     private var pausedAt: Double?
     private var expiredStatus: Int?
-    private var resumedUntil: Double?
+    private var resumedAt: Double?
 
     public init() {}
 
     public mutating func pause(at time: Double) {
         if pausedAt == nil { pausedAt = time }
-        resumedUntil = nil
     }
 
     public mutating func explicitPlay(at time: Double) -> PlayDecision {
@@ -104,12 +103,23 @@ public struct LongPauseSourceRecovery: Sendable {
         let longPause = time - pausedAt >= 30
         self.pausedAt = nil
         defer { expiredStatus = nil }
-        if let expiredStatus { return longPause ? .refresh : .showExpired(expiredStatus) }
-        resumedUntil = longPause ? time + 30 : nil
+        if let expiredStatus {
+            let refresh = longPause || resumedAt != nil
+            resumedAt = nil
+            return refresh ? .refresh : .showExpired(expiredStatus)
+        }
+        if longPause { resumedAt = time }
         return .ordinary
     }
 
-    public mutating func failure(_ error: (any Error)?, at time: Double) -> Decision {
+    /// A cached prefix can outlast any wall-clock grace period. Only a validated
+    /// foreground network request started after resume proves this URL is still usable.
+    public mutating func failure(_ error: (any Error)?, at time: Double,
+                                 lastValidatedRequestStartedAt: Double? = nil) -> Decision {
+        if let resumedAt, let lastValidatedRequestStartedAt,
+           lastValidatedRequestStartedAt >= resumedAt, lastValidatedRequestStartedAt <= time {
+            self.resumedAt = nil
+        }
         var cause = error
         var obsolete: Int?
         for _ in 0..<8 {
@@ -130,8 +140,8 @@ public struct LongPauseSourceRecovery: Sendable {
             expiredStatus = obsolete
             return .waitForPlay
         }
-        if let resumedUntil, time <= resumedUntil {
-            self.resumedUntil = nil
+        if resumedAt != nil {
+            resumedAt = nil
             return .refresh
         }
         return .ordinary

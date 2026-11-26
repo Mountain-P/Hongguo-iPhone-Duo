@@ -300,6 +300,7 @@ public actor NativeMediaStream: Hashable {
     public nonisolated let variant: NativeMediaVariant
     public nonisolated var assetURL: URL { URL(string: "hongguo-native://\(id.uuidString.lowercased())/video.mp4")! }
     private let fetcher: any NativeRangeFetching
+    private nonisolated let transferHealth: NativeTransferHealth
     private let plan: NativeMP4StreamPlan
     private let prefix: Data
     private let diskCache: NativeChunkDiskCache?
@@ -345,6 +346,7 @@ public actor NativeMediaStream: Hashable {
     init(totalLength: Int, fetcher: any NativeRangeFetching, plan: NativeMP4StreamPlan, validators: NativeRangeValidators, prefix: Data, preparationByteCount: Int? = nil,
          variant: NativeMediaVariant, diskCache: NativeChunkDiskCache? = nil, onRouteFailure: (@Sendable () -> Void)? = nil) {
         self.id = UUID(); self.totalLength = totalLength; self.fetcher = fetcher; self.plan = plan; self.validators = validators; self.prefix = prefix
+        self.transferHealth = (fetcher as? NativeRangeHTTP)?.health ?? NativeTransferHealth()
         self.preparationByteCount = preparationByteCount ?? prefix.count
         self.mediaDuration = NativeMovieDuration.seconds(in: prefix)
         self.variant = variant
@@ -363,7 +365,7 @@ public actor NativeMediaStream: Hashable {
     public func trimCachedChunks() { cache.removeAll(); cacheBytes = 0 }
 
     public nonisolated var transferSnapshot: PlaybackTransferSnapshot {
-        (fetcher as? NativeRangeHTTP)?.health.snapshot ?? .init()
+        transferHealth.snapshot
     }
 
     public nonisolated func noteBufferStarvation() {
@@ -519,17 +521,24 @@ public actor NativeMediaStream: Hashable {
         return flight.waiters.values.contains(where: \.retriesTransientReads)
     }
 
+    private func fetchTimed(_ range: Range<Int>) async throws -> (NativeRangeResponse, Double) {
+        let start = ProcessInfo.processInfo.systemUptime
+        return (try await fetcher.fetch(range: range), start)
+    }
+
     /// A single shared chunk flight retains its AVFoundation readers through a brief outage.
     /// Only the retry path creates a timer. The budget includes the first request and all
     /// subsequent delays and transfers; a slow successful first transfer is unaffected.
-    private func fetchForWaiters(index: Int, range: Range<Int>, id: UUID) async throws -> NativeRangeResponse {
+    private func fetchForWaiters(index: Int, range: Range<Int>, id: UUID) async throws -> (NativeRangeResponse, Double) {
         let deadline = ContinuousClock.now + .seconds(9)
-        do { return try await fetcher.fetch(range: range) }
+        do { return try await fetchTimed(range) }
         catch {
             try Task.checkCancellation()
             guard hasPlaybackWaiter(index: index, id: id), ContinuousClock.now < deadline,
                   PlaybackRecovery.shouldRetry(error, attempt: 0) else { throw error }
-            return try await withThrowingTaskGroup(of: NativeRangeResponse.self) { group in
+            transferHealth.setForegroundRetry(id, active: true)
+            defer { transferHealth.setForegroundRetry(id, active: false) }
+            return try await withThrowingTaskGroup(of: (NativeRangeResponse, Double).self) { group in
                 group.addTask { [self] in
                     var lastError = error
                     for delay in [Duration.milliseconds(500), .seconds(1), .seconds(2), .seconds(3)] {
@@ -538,7 +547,7 @@ public actor NativeMediaStream: Hashable {
                         guard await hasPlaybackWaiter(index: index, id: id) else { throw lastError }
                         do {
                             return try await PlaybackTransferContext.$isBackground.withValue(false) {
-                                try await self.fetcher.fetch(range: range)
+                                try await self.fetchTimed(range)
                             }
                         } catch {
                             try Task.checkCancellation()
@@ -579,20 +588,25 @@ public actor NativeMediaStream: Hashable {
                 else { committedDiskIndices.remove(index); recentDiskIndices.removeAll { $0 == index } }
             }
             let hitDisk = raw != nil
+            var requestStart: Double?
             if raw == nil {
-                let response = try await fetchForWaiters(index: index, range: range, id: id)
+                let (response, start) = try await fetchForWaiters(index: index, range: range, id: id)
                 try Task.checkCancellation()
                 guard flights[index]?.id == id else { return }
                 try NativeProgressiveMedia.validate(response, requested: range, total: totalLength, validators: validators)
                 if validators.etag == nil { validators.etag = response.validators.etag }
                 if validators.lastModified == nil { validators.lastModified = response.validators.lastModified }
                 raw = response.data
+                requestStart = start
             }
             guard let raw, raw.count == range.count else { throw NativeProgressiveError.invalidRange }
             flights[index]?.raw = raw
             if flights[index]?.wantsClearBytes == true { _ = try cacheClearChunk(raw, index: index, range: range) }
             try Task.checkCancellation()
             guard flights[index]?.id == id else { return }
+            if let requestStart, hasPlaybackWaiter(index: index, id: id) {
+                transferHealth.validatedForegroundRequest(startedAt: requestStart)
+            }
             if let current = flights[index], current.waiters.values.contains(where: \.demand) {
                 // Playback never waits for the optional disk write. Keep only speculative
                 // consumers waiting for commit, since read-ahead must stop on write failure.

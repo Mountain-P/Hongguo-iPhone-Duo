@@ -7,6 +7,62 @@ public struct PlaybackMeasurement: Sendable {
     public enum Route: String, Codable, Sendable { case direct, relay, offline, bridge }
     public enum Stage: String, Codable, Sendable { case source, media, firstFrame, playing }
 
+    /// Source lookups contain only fixed categories, numeric status, route and timing.
+    public struct Lookup: Codable, Equatable, Sendable {
+        public enum Result: String, Codable, Sendable {
+            case received, empty, network, timedOut, denied, http, unavailable, other
+        }
+        public let route: Route
+        public let result: Result
+        public let httpStatus: Int?
+        public let seconds: Double
+    }
+
+    public typealias LookupReporter = @Sendable (Lookup) async -> Void
+    @TaskLocal public static var lookupReporter: LookupReporter?
+
+    public static func measureLookup(via route: Route, operation: () async throws -> PlaybackSource) async throws -> PlaybackSource {
+        guard let report = lookupReporter else { return try await operation() }
+        let start = ProcessInfo.processInfo.systemUptime
+        do {
+            let source = try await operation()
+            try Task.checkCancellation()
+            await report(Lookup(route: source.url.isFileURL ? .offline : route, result: .received,
+                                httpStatus: nil, seconds: ProcessInfo.processInfo.systemUptime - start))
+            return source
+        } catch {
+            if !Task.isCancelled && !(error is CancellationError) {
+                let (result, status) = classifyLookup(error)
+                await report(Lookup(route: route, result: result, httpStatus: status,
+                                    seconds: ProcessInfo.processInfo.systemUptime - start))
+            }
+            throw error
+        }
+    }
+
+    private static func classifyLookup(_ error: any Error) -> (Lookup.Result, Int?) {
+        switch error {
+        case CatalogError.httpStatus(let code), NativeMediaError.httpStatus(let code): return (.http, code)
+        case CatalogError.unauthorized: return (.denied, 401)
+        case CatalogError.protectedPlayback: return (.denied, nil)
+        case CatalogError.network, NativeMediaError.network: return (.network, nil)
+        case CatalogError.unavailablePlayback: return (.unavailable, nil)
+        case let error as URLError: return (error.code == .timedOut ? .timedOut : .network, nil)
+        case let error as NativeSourceError:
+            if error.code.hasPrefix("HTTP_"), let status = Int(error.code.dropFirst(5)), (100...599).contains(status) {
+                return (.http, status)
+            }
+            switch error.code {
+            case "EMPTY_RESPONSE": return (.empty, nil)
+            case "ETIMEDOUT", "REGISTRATION_TIMEOUT": return (.timedOut, nil)
+            case "BUSINESS_REJECTED": return (.denied, nil)
+            case "REGISTRATION_NETWORK_ERROR": return (.network, nil)
+            default: return (.other, nil)
+            }
+        default: return (.other, nil)
+        }
+    }
+
     public struct Summary: Codable, Equatable, Sendable, Identifiable {
         public let id: UUID
         public let context: Context
@@ -21,6 +77,8 @@ public struct PlaybackMeasurement: Sendable {
         public let recoveryCount: Int
         public let route: Route?
         public let lastFailureStage: Stage?
+        public let lastFailureRoute: Route?
+        public let lookups: [Lookup]?
     }
 
     private let id: UUID
@@ -29,8 +87,10 @@ public struct PlaybackMeasurement: Sendable {
     private var last: Double
     private var ready: Double?
     private var route: Route?
+    private var lookups: [Lookup] = []
     private var stage: Stage = .source
     private var lastFailureStage: Stage?
+    private var lastFailureRoute: Route?
     private var firstFrame: Double?
     private var waiting = false
     private var recovering = false
@@ -52,6 +112,13 @@ public struct PlaybackMeasurement: Sendable {
     public mutating func beginLookup(route: Route) {
         self.route = route
         stage = .source
+    }
+
+    public mutating func recordLookup(_ value: Lookup) {
+        guard !ended else { return }
+        lookups.append(value)
+        if lookups.count > 8 { lookups.removeFirst() }
+        if stage == .source { route = value.route }
     }
 
     public mutating func receivedSource(route: Route) {
@@ -94,6 +161,7 @@ public struct PlaybackMeasurement: Sendable {
     public mutating func recordFailure(recovered: Bool, at time: Double) {
         guard advance(to: time) else { return }
         lastFailureStage = stage
+        lastFailureRoute = route
         failureCount += 1
         if recovered {
             recoveryCount += 1
@@ -119,7 +187,8 @@ public struct PlaybackMeasurement: Sendable {
         return Summary(id: id, context: context, outcome: outcome, recordedAt: recordedAt,
             durationSeconds: time - start, readySeconds: ready, firstFrameSeconds: firstFrame,
             rebufferCount: rebufferCount, rebufferSeconds: rebufferSeconds,
-            failureCount: failureCount, recoveryCount: recoveryCount, route: route, lastFailureStage: lastFailureStage)
+            failureCount: failureCount, recoveryCount: recoveryCount, route: route, lastFailureStage: lastFailureStage,
+            lastFailureRoute: lastFailureRoute, lookups: lookups.isEmpty ? nil : lookups)
     }
 
     private mutating func advance(to time: Double) -> Bool {

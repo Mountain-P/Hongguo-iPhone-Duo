@@ -115,6 +115,20 @@ struct PlaybackRecoveryTests {
         #expect(policy.explicitPlay(at: 106) == .showExpired(410))
         policy.pause(at: 110)
         #expect(policy.explicitPlay(at: 141) == .ordinary)
-        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 180) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 180, lastValidatedRequestStartedAt: 141.1) == .ordinary)
+    }
+
+    @Test func bufferedPlaybackAfterLongPausePreservesOneRefreshUntilAnOnlineRequestSucceeds() {
+        var policy = LongPauseSourceRecovery()
+        policy.pause(at: 0)
+        #expect(policy.explicitPlay(at: 60) == .ordinary)
+        policy.pause(at: 72)
+        #expect(policy.explicitPlay(at: 73) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(410), at: 120, lastValidatedRequestStartedAt: 59) == .refresh)
+        #expect(policy.failure(NativeMediaError.httpStatus(410), at: 121) == .ordinary)
+        policy.pause(at: 200)
+        #expect(policy.explicitPlay(at: 260) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 320, lastValidatedRequestStartedAt: 261) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 321) == .ordinary)
     }
 }

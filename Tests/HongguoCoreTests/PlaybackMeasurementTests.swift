@@ -33,18 +33,21 @@ struct PlaybackMeasurementTests {
         measure.receivedSource(route: .relay)
         measure.recordReady(at: 5)
         measure.recordFailure(recovered: false, at: 6)
+        measure.beginLookup(route: .direct)
         let finished = measure.finish(outcome: .failed, at: 7)
         let result = try #require(finished)
         #expect(result.lastFailureStage == .firstFrame)
-        #expect(result.route == .relay)
+        #expect(result.route == .direct && result.lastFailureRoute == .relay)
         #expect(result.failureCount == 3 && result.firstFrameSeconds == 3)
         let encoded = try JSONEncoder().encode(result)
         var legacy = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         legacy.removeValue(forKey: "route")
         legacy.removeValue(forKey: "lastFailureStage")
+        legacy.removeValue(forKey: "lastFailureRoute")
+        legacy.removeValue(forKey: "lookups")
         let old = try JSONDecoder().decode(PlaybackMeasurement.Summary.self,
                                            from: JSONSerialization.data(withJSONObject: legacy))
-        #expect(old.route == nil && old.lastFailureStage == nil && old.failureCount == 3)
+        #expect(old.route == nil && old.lastFailureStage == nil && old.lastFailureRoute == nil && old.lookups == nil && old.failureCount == 3)
     }
 
     @Test func automaticRecoveryKeepsTheOriginalFirstFrameClock() throws {

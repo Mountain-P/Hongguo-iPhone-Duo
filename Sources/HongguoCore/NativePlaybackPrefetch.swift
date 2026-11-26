@@ -20,20 +20,36 @@ public actor NativePlaybackPrefetch {
         public let source: PlaybackSource
         public let relayPrefix: RelayPlaybackOpening?
     }
-    private var prepared: (series: String, episode: String, opening: Opening, expires: Double)?
+    private var prepared: (series: String, episode: String, scope: UUID?, opening: Opening, expires: Double)?
 
     public func takePrepared(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil) async -> PlaybackSource? {
         await takeOpening(seriesID: seriesID, episodeID: episodeID, preference: preference)?.source
     }
 
-    public func takeOpening(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil) async -> Opening? {
+    public func takeOpening(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil,
+                            service: (any CatalogService)? = nil) async -> Opening? {
+        guard let opening = await matchingOpening(seriesID: seriesID, episodeID: episodeID, preference: preference,
+                                                   scope: service.flatMap(Self.scope), consume: true) else { return nil }
+        if let local = await service?.offlinePlayback?.source(seriesID: seriesID, episodeID: episodeID) {
+            return Opening(source: local, relayPrefix: nil)
+        }
+        return opening
+    }
+
+    private static func scope(_ service: any CatalogService) -> UUID? {
+        (service as? NativeCatalogService)?.openingScope ?? (service as? HomeRelayService)?.openingScope
+    }
+
+    private func matchingOpening(seriesID: String, episodeID: String, preference: NativePlaybackQuality?,
+                                 scope: UUID?, consume: Bool) async -> Opening? {
         guard let value = prepared, value.series == seriesID, value.episode == episodeID,
-              value.expires > ProcessInfo.processInfo.systemUptime else { return nil }
+              scope == nil || scope == value.scope, value.expires > ProcessInfo.processInfo.systemUptime else { return nil }
         if let stream = value.opening.source.nativeStream {
+            let owner = generation
             guard preference.map({ $0 == stream.variant.preference }) ?? true, await stream.isReusable,
-                  prepared?.opening.source.nativeStream?.id == stream.id else { return nil }
+                  owner == generation, prepared != nil else { return nil }
         } else if value.opening.relayPrefix == nil { return nil }
-        prepared = nil
+        if consume { prepared = nil }
         return value.opening
     }
 
@@ -45,22 +61,31 @@ public actor NativePlaybackPrefetch {
                         allowed: Bool = true, warmOpening: Bool = false, playbackRate: Float = 1) async throws -> Outcome {
         // A stale caller must not cancel the operation owned by a newer caller.
         try Task.checkCancellation()
-        cancel()
-        guard allowed else { return .skipped }
+        guard allowed else { cancel(); return .skipped }
         try validateID(seriesID); try validateID(episodeID)
-        try Task.checkCancellation()
+        let scope = Self.scope(service)
+        if warmOpening, let scope, prepared?.scope == scope {
+            let owner = generation
+            let existing = await matchingOpening(seriesID: seriesID, episodeID: episodeID,
+                preference: (service as? NativeCatalogService)?.playbackQuality, scope: scope, consume: false)
+            try Task.checkCancellation()
+            guard owner == generation else { throw CancellationError() }
+            if existing != nil { return .prepared }
+        }
+        cancel()
         let request = generation
         let task = Task(priority: .utility) {
             try await NativePrefetchContext.$maximumBytes.withValue(Self.maximumPreparationBytes) {
                 let source = try await service.playback(seriesID: seriesID, episodeID: episodeID, fresh: false)
                 try Task.checkCancellation()
+                if source.url.isFileURL, service.offlinePlayback != nil { return }
                 guard let stream = source.nativeStream else {
                     guard warmOpening, let relay = service as? HomeRelayService, relay.servesMedia(at: source.url) else {
                         throw PlaybackPrefetchError.unsupported
                     }
                     let prefix = try await RelayPlaybackOpening.fetch(source, rate: playbackRate)
                     try Task.checkCancellation()
-                    self.remember(source, relayPrefix: prefix, seriesID: seriesID, episodeID: episodeID, generation: request)
+                    self.remember(source, relayPrefix: prefix, seriesID: seriesID, episodeID: episodeID, scope: scope, generation: request)
                     return
                 }
                 if warmOpening {
@@ -79,7 +104,7 @@ public actor NativePlaybackPrefetch {
                         }
                     }
                     try Task.checkCancellation()
-                    self.remember(source, seriesID: seriesID, episodeID: episodeID, generation: request)
+                    self.remember(source, seriesID: seriesID, episodeID: episodeID, scope: scope, generation: request)
                 }
             }
         }
@@ -96,9 +121,9 @@ public actor NativePlaybackPrefetch {
         }
     }
 
-    private func remember(_ source: PlaybackSource, relayPrefix: RelayPlaybackOpening? = nil, seriesID: String, episodeID: String, generation request: UUID) {
+    private func remember(_ source: PlaybackSource, relayPrefix: RelayPlaybackOpening? = nil, seriesID: String, episodeID: String, scope: UUID?, generation request: UUID) {
         guard request == generation else { return }
-        prepared = (seriesID, episodeID, Opening(source: source, relayPrefix: relayPrefix), ProcessInfo.processInfo.systemUptime + 45)
+        prepared = (seriesID, episodeID, scope, Opening(source: source, relayPrefix: relayPrefix), ProcessInfo.processInfo.systemUptime + 45)
     }
 
     public func cancel() {

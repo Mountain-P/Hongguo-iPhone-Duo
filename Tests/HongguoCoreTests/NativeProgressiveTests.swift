@@ -64,10 +64,12 @@ struct NativeProgressiveTests {
         async let other = stream.read(range: overlapping, retriesTransientReads: true)
         let cancelled = Task { try await stream.read(range: crossing, retriesTransientReads: true) }
         let joinDeadline = ContinuousClock.now + .seconds(3)
-        while await stream.pendingReaderCount < 3 {
+        while await stream.pendingReaderCount < 3 || !stream.transferSnapshot.isRetryingForegroundRead {
             guard ContinuousClock.now < joinDeadline else { throw URLError(.timedOut) }
             try await Task.sleep(for: .milliseconds(5))
         }
+        #expect(stream.transferSnapshot.isRetryingForegroundRead)
+        #expect(stream.transferSnapshot.lastValidatedForegroundRequestStartedAt == nil)
         cancelled.cancel()
         await #expect(throws: CancellationError.self) { try await cancelled.value }
         await bytes.setFailure(nil)
@@ -75,6 +77,10 @@ struct NativeProgressiveTests {
         let overlap = try await other
         #expect(output == fixture.data.subdata(in: crossing))
         #expect(overlap == fixture.data.subdata(in: overlapping))
+        #expect(!stream.transferSnapshot.isRetryingForegroundRead)
+        let onlineStart = try #require(stream.transferSnapshot.lastValidatedForegroundRequestStartedAt)
+        _ = try await stream.read(range: overlapping, retriesTransientReads: true)
+        #expect(stream.transferSnapshot.lastValidatedForegroundRequestStartedAt == onlineStart)
         let fetched = await bytes.ranges.dropFirst(before)
         #expect(Array(fetched) == Array(repeating: chunk..<(2 * chunk), count: 2))
     }

@@ -11,6 +11,14 @@ private struct PrefetchFixtureService: CatalogService {
     func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource { try await prepare(episodeID) }
 }
 
+private actor FailingPrefetchRelay: HTTPTransport {
+    var calls = 0
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        calls += 1
+        throw CatalogError.network
+    }
+}
+
 private actor PrefetchFixtureBytes: NativeRangeFetching {
     let bytes: Data
     var ranges: [Range<Int>] = []
@@ -146,6 +154,27 @@ struct PlaybackPrefetchTests {
         #expect(try await active.value == .prepared)
         #expect(await gate.calls == ["2"])
     }
+    @Test func resumeReusesPreparedOpeningOnlyWithinSameServiceAndTransfersItOnce() async throws {
+        let source = try await playbackSource()
+        let fallback = PrefetchFixtureService { _ in source }
+        let transport = FailingPrefetchRelay()
+        let config = try ServerConfiguration(baseURL: "https://relay.example.com")
+        let relay = HomeRelayService(configuration: config, direct: fallback, transport: transport)
+        let differentRelay = HomeRelayService(configuration: config, direct: fallback, transport: transport)
+        let prefetch = NativePlaybackPrefetch()
+        for _ in 0..<2 {
+            #expect(try await prefetch.prepare(seriesID: "1", episodeID: "2", service: relay,
+                                              warmOpening: true, playbackRate: 2) == .prepared)
+        }
+        #expect(await transport.calls == 1)
+        #expect(await prefetch.takeOpening(seriesID: "1", episodeID: "2", service: differentRelay) == nil)
+        #expect(try await prefetch.prepare(seriesID: "1", episodeID: "2", service: differentRelay,
+                                          warmOpening: true, playbackRate: 2) == .prepared)
+        #expect(await transport.calls == 2)
+        #expect(await prefetch.takeOpening(seriesID: "1", episodeID: "2", service: differentRelay) != nil)
+        #expect(await prefetch.takeOpening(seriesID: "1", episodeID: "2", service: differentRelay) == nil)
+    }
+
     @Test func formalOpeningIsFetchedAndHandedOffOnceWithoutAnotherSourceLookup() async throws {
         let fixture = streamFixture(payload: Data(repeating: 0x31, count: 3 * 1024 * 1024), samples: 1)
         let bytes = PrefetchFixtureBytes(fixture.data)

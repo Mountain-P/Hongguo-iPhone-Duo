@@ -68,8 +68,13 @@ struct PlaybackDiagnosticsView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             Text([context(record.context), record.route.map(routeLabel)].compactMap { $0 }.joined(separator: " · "))
                                 .font(.subheadline)
+                            ForEach(Array((record.lookups ?? []).enumerated()), id: \.offset) { _, lookup in
+                                Text("\(routeLabel(lookup.route)) · \(lookupResult(lookup)) · \(seconds(lookup.seconds))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             if let stage = record.lastFailureStage {
-                                Text("最近一次失敗 · " + stageLabel(stage)).font(.caption)
+                                Text(["最近一次失敗", record.lastFailureRoute.map(routeLabel), stageLabel(stage)]
+                                    .compactMap { $0 }.joined(separator: " · ")).font(.caption)
                             }
                             Text("首幀 \(seconds(record.firstFrameSeconds)) · 等待 \(seconds(record.rebufferSeconds)) · \(outcome(record.outcome))")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -103,6 +108,19 @@ struct PlaybackDiagnosticsView: View {
     private func routeLabel(_ route: PlaybackMeasurement.Route) -> String {
         switch route { case .direct: "手機直連"; case .relay: "家中中繼"; case .offline: "離線"; case .bridge: "自訂服務" }
     }
+    private func lookupResult(_ lookup: PlaybackMeasurement.Lookup) -> String {
+        if let status = lookup.httpStatus { return "HTTP \(status)" }
+        switch lookup.result {
+        case .received: return "已取得片源"
+        case .empty: return "未回傳片源"
+        case .network: return "連線中斷"
+        case .timedOut: return "取源逾時"
+        case .denied: return "來源拒絕存取"
+        case .unavailable: return "無可用片源"
+        case .http, .other: return "取源失敗"
+        }
+    }
+
     private func stageLabel(_ stage: PlaybackMeasurement.Stage) -> String {
         switch stage {
         case .source: "取得當集來源"

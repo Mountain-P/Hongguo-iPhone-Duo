@@ -44,7 +44,7 @@ struct DetailView: View {
     private var hasCurrentSnapshot: Bool { detail != nil && lastLoadedKey == loadKey }
     private var current: Series { hasCurrentSnapshot ? detail?.series ?? series : series }
     private var discovery: SeriesDiscoveryMetadata? { hasCurrentSnapshot ? detail?.discovery : nil }
-    private var loadKey: String { "\(series.id):\(model.revision.uuidString)" }
+    private var loadKey: String { "\(series.id):\(model.revision.uuidString):\(model.downloads.scope)" }
     private var related: [Series] {
         var seen: Set<String> = [series.id]
         return (discovery?.related ?? []).filter { seen.insert($0.id).inserted }
@@ -376,7 +376,15 @@ struct DetailView: View {
                 let service = try model.playbackService()
                 let result: SeriesDetail
                 if let bridge = service as? BridgeService { result = try await bridge.verifiedDetail(id: series.id) }
-                else { result = try await service.detail(id: series.id) }
+                else {
+                    do { result = try await service.detail(id: series.id) }
+                    catch {
+                        try Task.checkCancellation()
+                        guard !keepSnapshot, PlaybackRecovery.shouldRetry(error, attempt: 0),
+                              let saved = await service.offlinePlayback?.fallbackDetail(seriesID: series.id) else { throw error }
+                        result = saved
+                    }
+                }
                 try Task.checkCancellation()
                 guard request == loadID, key == loadKey else { return }
                 loadedService = service; detail = result; lastLoadedKey = key

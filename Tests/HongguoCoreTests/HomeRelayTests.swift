@@ -18,16 +18,49 @@ private actor RelayHTTP: HTTPTransport {
     }
 }
 private actor DirectRelayFixture: CatalogService {
+    let fails: Bool
+    init(fails: Bool = false) { self.fails = fails }
     var calls: [String] = []
     func home(page: Int) async throws -> SeriesPage { .init(items: [], page: page, hasMore: false) }
     func search(query: String, page: Int) async throws -> SeriesPage { .init(items: [], page: page, hasMore: false) }
     func detail(id: String) async throws -> SeriesDetail { throw CatalogError.unavailablePlayback }
     func playback(seriesID: String, episodeID: String, fresh: Bool) async throws -> PlaybackSource {
         calls.append("\(seriesID)/\(episodeID)/\(fresh)")
+        if fails { throw NativeSourceError(code: "EMPTY_RESPONSE") }
         return .init(url: URL(string: "https://media.example.com/direct.mp4")!)
     }
 }
+private actor LookupLog {
+    var attempts: [PlaybackMeasurement.Lookup] = []
+    func append(_ event: PlaybackMeasurement.Lookup) { attempts.append(event) }
+}
+
 struct HomeRelayTests {
+    @Test(arguments: [true, false])
+    func diagnosticsRecordEachRouteForTheSameLookup(fails: Bool) async throws {
+        let log = LookupLog()
+        let service = HomeRelayService(configuration: try .init(baseURL: "https://relay.example.com", token: "secret"),
+                                       direct: DirectRelayFixture(fails: fails), transport: RelayHTTP(status: 503))
+        do {
+            _ = try await PlaybackMeasurement.$lookupReporter.withValue({ await log.append($0) }) {
+                try await service.playback(seriesID: "100", episodeID: "200", fresh: true)
+            }
+            #expect(!fails)
+        } catch { #expect(fails && (error as? NativeSourceError)?.code == "EMPTY_RESPONSE") }
+        let events = await log.attempts
+        #expect(events.map(\.route) == [.relay, .direct])
+        #expect(events.map(\.result) == [.http, fails ? .empty : .received])
+        #expect(events.map(\.httpStatus) == [503, nil])
+        var measure = PlaybackMeasurement(context: .episode, startedAt: 0, route: .relay)
+        for event in events { measure.recordLookup(event) }
+        if fails { measure.recordFailure(recovered: false, at: 1) }
+        let summary = measure.finish(outcome: fails ? .failed : .completed, at: 2)
+        let record = try #require(summary)
+        #expect(record.lookups == events && record.route == .direct)
+        let json = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        #expect(!json.contains("example.com") && !json.contains("secret"))
+    }
+
     @Test func relaySendsEpisodeContextAndOnlyItsOwnToken() async throws {
         let http = RelayHTTP(), direct = DirectRelayFixture()
         let service = HomeRelayService(configuration: try .init(baseURL: "https://relay.example.com", token: "relay-secret"),

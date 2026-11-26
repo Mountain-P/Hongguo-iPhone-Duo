@@ -351,10 +351,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         recoveryToken = token; recoveryService = candidate; recoveryPrepared = false
         recoveryIsTerminal = reason == .terminal
         let priorVariant = nativeVariant
+        let lookup = measuredLookup(seriesID: seriesID, episodeID: episode.id, generation: requestGeneration)
         recoveryPreparation = Task { @MainActor [weak self] in
             do {
                 let source = try await PlaybackTransferContext.$raceAlternates.withValue(true) {
-                    try await candidate.playback(seriesID: seriesID, episodeID: episode.id, fresh: true)
+                    try await lookup(candidate, true)
                 }
                 try Task.checkCancellation()
                 guard let self else { throw CancellationError() }
@@ -427,10 +428,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         let requestGeneration = generation
         let seriesID = series.id
         let candidateService = native.selectingPlaybackQuality(preference)
+        let lookup = measuredLookup(seriesID: seriesID, episodeID: episode.id, generation: requestGeneration)
         isSwitchingQuality = true
         qualityTask = Task { @MainActor [weak self] in
             do {
-                let source = try await candidateService.playback(seriesID: seriesID, episodeID: episode.id, fresh: false)
+                let source = try await lookup(candidateService, false)
                 try Task.checkCancellation()
                 guard let self, self.qualityGeneration == token, self.generation == requestGeneration,
                       self.currentEpisode?.id == episode.id, self.sceneActive else { return }
@@ -725,7 +727,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         // notification. Only a fresh user Play may reactivate it and clear the
         // stale interruption; returning to the foreground never starts playback.
         guard activateAudioForUserPlayback() else { return }
-        switch longPauseRecovery.explicitPlay(at: Date.timeIntervalSinceReferenceDate) {
+        switch longPauseRecovery.explicitPlay(at: ProcessInfo.processInfo.systemUptime) {
         case .refresh:
             if let episode = currentEpisode { refreshAfterLongPause(episode) }
             return
@@ -794,7 +796,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         if hasStarted, !isPreview, errorMessage == nil, !reachedEnd,
            service is HomeRelayService || service is NativeCatalogService {
             if playbackSpeed.wantsPlayback { lastPausedPosition = resumePosition }
-            longPauseRecovery.pause(at: Date.timeIntervalSinceReferenceDate)
+            longPauseRecovery.pause(at: ProcessInfo.processInfo.systemUptime)
         }
         cancelRecoveryPreparation()
         PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner, constrained: false)
@@ -897,6 +899,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         let service = self.service
         let seriesID = series.id
         let nextPrefetcher = self.nextPrefetcher
+        let lookup = measuredLookup(seriesID: seriesID, episodeID: episode.id, generation: requestGeneration)
         loadTask = Task { [weak self] in
             do {
                 let source: PlaybackSource
@@ -905,11 +908,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                     source = try await withTaskCancellationHandler { try await preparedTask.value } onCancel: { preparedTask.cancel() }
                 } else if let preparedSource { source = preparedSource }
                 else if !fresh, let opening = await nextPrefetcher.takeOpening(seriesID: seriesID, episodeID: episode.id,
-                    preference: (service as? NativeCatalogService)?.playbackQuality) {
+                    preference: (service as? NativeCatalogService)?.playbackQuality, service: service) {
                     source = opening.source
                     relayPrefix = opening.relayPrefix
                     self?.traceHealth("prefetched opening adopted")
-                } else { source = try await service.playback(seriesID: seriesID, episodeID: episode.id, fresh: fresh) }
+                } else { source = try await lookup(service, fresh) }
                 try Task.checkCancellation()
                 guard let self, self.generation == requestGeneration else { return }
                 self.configure(source: source, relayPrefix: relayPrefix, generation: requestGeneration)
@@ -944,6 +947,25 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private func cancelStartupWatchdog() {
         startupWatchdog?.cancel()
         startupWatchdog = nil
+    }
+
+    private func measuredLookup(seriesID: String, episodeID: String, generation: UUID)
+      -> @Sendable (any CatalogService, Bool) async throws -> PlaybackSource {
+        let id = diagnosticsID, route = diagnosticRoute
+        let report: PlaybackMeasurement.LookupReporter = { @MainActor [weak self] attempt in
+            guard let self, self.generation == generation, let id, self.diagnosticsID == id else { return }
+            PlaybackDiagnostics.shared.recordLookup(id: id, attempt: attempt)
+        }
+        return { service, fresh in
+            try await PlaybackMeasurement.$lookupReporter.withValue(report) {
+                if service is HomeRelayService {
+                    return try await service.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh)
+                }
+                return try await PlaybackMeasurement.measureLookup(via: route) {
+                    try await service.playback(seriesID: seriesID, episodeID: episodeID, fresh: fresh)
+                }
+            }
+        }
     }
 
     private var diagnosticRoute: PlaybackMeasurement.Route {
@@ -1093,7 +1115,9 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
         if error is CancellationError { return }
         if hasStarted, !isLoading {
-            switch longPauseRecovery.failure(error, at: Date.timeIntervalSinceReferenceDate) {
+            let lastNetworkRead = progressiveLoader?.transferSnapshot.lastValidatedForegroundRequestStartedAt
+                ?? loader?.lastValidatedForegroundRequestStartedAt
+            switch longPauseRecovery.failure(error, at: ProcessInfo.processInfo.systemUptime, lastValidatedRequestStartedAt: lastNetworkRead) {
             case .waitForPlay: return
             case .refresh:
                 refreshAfterLongPause(episode)

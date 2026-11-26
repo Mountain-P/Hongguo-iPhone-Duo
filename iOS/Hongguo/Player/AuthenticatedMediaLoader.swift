@@ -16,6 +16,7 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         var totalLength: Int64?
         var etag: String?
         var retries = 0
+        var networkStart: Double?
 
         init(_ request: AVAssetResourceLoadingRequest, offset: Int64, length: Int, allToEnd: Bool) {
             self.request = request
@@ -36,6 +37,8 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
     private var stopped = false
     private let statusLock = NSLock()
     private var terminalStatus: Int?
+    private var lastValidatedRequest: Double?
+    var lastValidatedForegroundRequestStartedAt: Double? { statusLock.withLock { lastValidatedRequest } }
     var lastTerminalStatus: Int? { statusLock.withLock { terminalStatus } }
 
     private lazy var session: URLSession = {
@@ -133,6 +136,7 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         request.setValue(range, forHTTPHeaderField: "Range")
         request.setValue(entry.etag, forHTTPHeaderField: "If-Range")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        entry.networkStart = ProcessInfo.processInfo.systemUptime
         let task = session.dataTask(with: request)
         pending[task.taskIdentifier] = entry
         tasks[ObjectIdentifier(entry.request)] = task
@@ -212,6 +216,10 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         let remaining = target - entry.delivered
         guard remaining > 0 else { finish(dataTask); return }
         let count = min(data.count, Int(min(remaining, Int64(Int.max))))
+        if count > 0, let start = entry.networkStart {
+            statusLock.withLock { lastValidatedRequest = max(lastValidatedRequest ?? start, start) }
+            entry.networkStart = nil
+        }
         entry.request.dataRequest?.respond(with: data.prefix(count))
         entry.delivered += Int64(count)
         if entry.delivered >= target { finish(dataTask) }

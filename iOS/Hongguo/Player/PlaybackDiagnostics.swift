@@ -66,6 +66,7 @@ final class PlaybackDiagnostics: NSObject, ObservableObject {
     }
 
     func beginLookup(id: UUID, route: PlaybackMeasurement.Route) { active[id]?.beginLookup(route: route) }
+    func recordLookup(id: UUID, attempt: PlaybackMeasurement.Lookup) { active[id]?.recordLookup(attempt) }
     func receivedSource(id: UUID, route: PlaybackMeasurement.Route) { active[id]?.receivedSource(route: route) }
     func recordReady(id: UUID) { active[id]?.recordReady(at: ProcessInfo.processInfo.systemUptime) }
     func recordFirstFrame(id: UUID) { active[id]?.recordFirstFrame(at: ProcessInfo.processInfo.systemUptime) }
@@ -101,7 +102,10 @@ final class PlaybackDiagnostics: NSObject, ObservableObject {
     func refreshResources() { sampleResources() }
 
     private func persist() {
-        if let data = try? JSONEncoder().encode(records) { defaults.set(data, forKey: Self.key) }
+        while let data = try? JSONEncoder().encode(records) {
+            if data.count <= 128 * 1024 { defaults.set(data, forKey: Self.key); return }
+            records.removeFirst()
+        }
     }
 
     private func enableSampling(id: UUID) {
