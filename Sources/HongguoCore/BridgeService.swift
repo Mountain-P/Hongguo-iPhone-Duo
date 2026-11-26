@@ -135,7 +135,11 @@ public struct BridgeService: CatalogService {
         try validateID(seriesID); try validateID(episodeID)
         var query: [URLQueryItem] = fresh ? [.init(name: "fresh", value: "1")] : []
         if includesSeriesContext { query.append(.init(name: "series_id", value: seriesID)) }
-        let data = try await get("api/episodes/\(episodeID)/play", query: query)
+        let data = try await get("api/episodes/\(episodeID)/play", query: query) { status, body in
+            guard self.includesSeriesContext, status == 409, body.count <= 4096,
+                  let reply = try? dictionary(body), reply["code"] as? String == "EPISODE_MISMATCH" else { return nil }
+            return .episodeMismatch
+        }
         let path = string(data["path"])
         let url = try playbackURL(path)
         let contentType = string(data["contentType"])
@@ -169,14 +173,15 @@ public struct BridgeService: CatalogService {
         configuration.token.isEmpty ? [:] : ["Authorization": "Bearer \(configuration.token)"]
     }
 
-    private func get(_ path: String, query: [URLQueryItem] = []) async throws -> [String: Any] {
+    private func get(_ path: String, query: [URLQueryItem] = [],
+                     mapError: (@Sendable (Int, Data) -> CatalogError?)? = nil) async throws -> [String: Any] {
         var components = URLComponents(url: configuration.baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         components.queryItems = query.isEmpty ? nil : query
         var request = URLRequest(url: components.url!)
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         for (key, value) in authorizationHeaders { request.setValue(value, forHTTPHeaderField: key) }
-        return try dictionary(await load(request, using: transport))
+        return try dictionary(await load(request, using: transport, mapError: mapError))
     }
 
     private func parsePage(_ data: [String: Any], page: Int) throws -> SeriesPage {

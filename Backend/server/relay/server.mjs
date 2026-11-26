@@ -4,55 +4,75 @@ import { byteRange } from '../http.mjs';
 import { ExistingLibrary, validID, failure, safeCode } from './library.mjs';
 import { RelayCache } from './cache.mjs';
 
-export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provider, maxBytes, onEvent = () => {} }) {
+export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provider, maxBytes, now = Date.now, onEvent = () => {} }) {
   if (typeof token !== 'string' || token.length < 32 || /\s/.test(token)) throw failure('TOKEN_REQUIRED');
   const library = new ExistingLibrary(jobsFile, mediaRoot);
   await library.refresh();
   const cache = new RelayCache(cacheRoot, { maxBytes, prepare: (id, fresh, context) => provider.stream(id, fresh, context), onEvent });
   await cache.init();
-  const localStreams = new Map(), details = new Map();
-  async function indexSavedStreams() {
-    for (const episode of library.episodes.values()) {
-      try {
-        const stream = await library.stream(episode.id, episode.seriesID);
-        localStreams.set(stream.id, { stream, expires: Date.now() + 60 * 60_000 });
-      } catch { /* One damaged file does not hide the remaining library. */ }
-    }
-  }
-  await indexSavedStreams();
-  let active = 0, lastRefresh = Date.now(), checkRunning = false;
+  const details = new Map(), pendingDetails = new Map();
+  let refreshInFlight, nextRefresh = now() + 30_000, active = 0, checkRunning = false;
   let lastCheck = { state: 'not-run' };
   const metrics = { plays: 0, libraryHits: 0, cacheHits: 0, sourceHits: 0, bytesSent: 0, failures: 0 };
-  async function refresh() {
-    if (Date.now() - lastRefresh < 30_000) return;
-    await library.refresh(); lastRefresh = Date.now();
-    for (const [id, item] of localStreams) if (item.expires < Date.now()) localStreams.delete(id);
-    await indexSavedStreams();
+  function refreshLibrary(force = false) {
+    if (refreshInFlight) return refreshInFlight;
+    if (!force && now() < nextRefresh) return;
+    refreshInFlight = library.refresh().then(() => true, error => {
+      onEvent({ event: 'library_refresh_failed', code: safeCode(error) });
+      return false;
+    }).finally(() => {
+      nextRefresh = now() + 30_000;
+      refreshInFlight = undefined;
+    });
+    return refreshInFlight;
+  }
+  async function sourceDetail(seriesID, signal, episodeID) {
+    signal.throwIfAborted();
+    const known = details.get(seriesID);
+    if (known && known.expires > now() && (!episodeID || known.missCheckedUntil > now()
+        || known.value.episodes.some(episode => episode.id === episodeID))) return known.value;
+    let pending = pendingDetails.get(seriesID);
+    if (!pending) {
+      if (pendingDetails.size >= 100) throw failure('RELAY_BUSY', 503);
+      // Each waiter owns its cancellation. One disconnected client must not
+      // cancel the catalog update that another play request has already joined.
+      pending = Promise.resolve().then(() => provider.detail(seriesID, { signal: AbortSignal.timeout(20_000) }))
+        .then(value => {
+          const entry = { value, expires: now() + 300_000, missCheckedUntil: 0 };
+          details.delete(seriesID);
+          details.set(seriesID, entry);
+          while (details.size > 100) details.delete(details.keys().next().value);
+          return entry;
+        }).finally(() => pendingDetails.delete(seriesID));
+      pendingDetails.set(seriesID, pending);
+    }
+    const updated = await pending;
+    signal.throwIfAborted();
+    // A genuine mismatch should not trigger a new catalog request on every tap.
+    if (episodeID && !updated.value.episodes.some(episode => episode.id === episodeID)) {
+      updated.missCheckedUntil = now() + 5_000;
+    }
+    return updated.value;
   }
   async function detail(id, signal) {
-    if (library.series.has(id)) return library.series.get(id);
-    const known = details.get(id);
-    if (known && known.expires > Date.now()) return known.value;
-    const value = await provider.detail(id, { signal });
-    details.set(id, { value, expires: Date.now() + 300_000 });
-    while (details.size > 100) details.delete(details.keys().next().value);
-    return value;
+    return library.series.get(id) || sourceDetail(id, signal);
   }
   async function resolve(episodeID, seriesID, fresh, signal) {
     const saved = await library.stream(episodeID, seriesID);
-    if (saved) {
-      localStreams.set(saved.id, { stream: saved, expires: Date.now() + 60 * 60_000 });
-      return saved;
+    if (saved) return saved;
+    const savedSeries = library.savedSeries.get(episodeID);
+    const owner = seriesID || savedSeries;
+    // A completed cache entry for a known saved episode needs no network.
+    // Refresh upstream metadata before opening a new source for a damaged copy.
+    if (savedSeries && owner === savedSeries) {
+      const fallback = await cache.cachedEpisode(episodeID);
+      if (fallback) return fallback;
     }
-    // Resolve authoritative episode metadata before acquiring a new source.
-    if (seriesID) {
-      let show = details.get(seriesID)?.value;
-      if (!show) {
-        show = await provider.detail(seriesID, { signal });
-        details.set(seriesID, { value: show, expires: Date.now() + 300_000 });
-      }
-      if (!show.episodes.some(e => e.id === episodeID)) throw failure('EPISODE_MISMATCH', 409);
+    if (owner) {
+      const show = await sourceDetail(owner, signal, episodeID);
+      if (!show.episodes.some(episode => episode.id === episodeID)) throw failure('EPISODE_MISMATCH', 409);
     }
+    signal.throwIfAborted();
     return cache.resolve(episodeID, fresh);
   }
   function prefetchAfter(stream, seriesID, episodeID) {
@@ -71,7 +91,7 @@ export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provi
     checkRunning = true;
     const started = Date.now();
     try {
-      await library.refresh();
+      if (await refreshLibrary(true) === false) throw failure('LIBRARY_REFRESH_FAILED');
       const selected = episodeID || library.episodes.keys().next().value;
       if (!selected) throw failure('NO_PROBE_MEDIA');
       let stream;
@@ -101,7 +121,9 @@ export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provi
     try {
       const url = new URL(req.url, 'http://relay.invalid');
       if (!['GET', 'HEAD'].includes(req.method)) return json(405, { error: 'Method not allowed' });
-      await refresh();
+      const refresh = refreshLibrary();
+      // Playback and media ranges always use the last published snapshot.
+      if (!url.pathname.startsWith('/api/media/') && !url.pathname.startsWith('/api/episodes/')) await refresh;
       if (url.pathname === '/health') return json(200, { service: 'hongguotv', version: '0.17.0', apiVersion: 1,
         capabilities: ['home-relay-v1', 'existing-library', 'persistent-cache', 'range', 'prefetch'],
         upstream: lastCheck.state, lastCheck, library: { series: library.series.size, episodes: library.episodes.size }, cache: cache.status() });
@@ -125,7 +147,7 @@ export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provi
       }
       const media = /^\/api\/media\/([a-f0-9]{32,64})\.mp4$/.exec(url.pathname);
       if (!media) return json(404, { error: '接口不存在' });
-      const stream = localStreams.get(media[1])?.stream || cache.get(media[1]);
+      const stream = cache.get(media[1]) || await library.media(media[1]);
       if (!stream) return json(410, { error: '播放連結已過期，請重新取源' });
       if (active >= 8) return json(503, { error: '中繼忙碌，請稍後再試' });
       active++;
@@ -159,7 +181,7 @@ export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provi
       onEvent({ event: 'request_failed', code });
       if (res.headersSent) res.destroy();
       else json([400, 401, 403, 404, 409, 410, 429, 503, 507].includes(error.status) ? error.status : 502,
-                { error: '中繼暫時無法準備影片，請重試', code });
+                { error: code === 'EPISODE_MISMATCH' ? '這一集不在這部劇的選集清單中，請重新選集。' : '中繼暫時無法準備影片，請重試', code });
     }
   });
   server.requestTimeout = 45_000; server.headersTimeout = 15_000;

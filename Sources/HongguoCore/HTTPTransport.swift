@@ -51,11 +51,13 @@ func sameOrigin(_ left: URL, _ right: URL) -> Bool {
         && left.host?.lowercased() == right.host?.lowercased() && port(left) == port(right)
 }
 
-func load(_ request: URLRequest, using transport: any HTTPTransport) async throws -> Data {
+func load(_ request: URLRequest, using transport: any HTTPTransport,
+          mapError: (@Sendable (Int, Data) -> CatalogError?)? = nil) async throws -> Data {
     let (data, response) = try await transport.data(for: request)
     try Task.checkCancellation()
     guard (200...299).contains(response.statusCode) else {
         if response.statusCode == 401 { throw CatalogError.unauthorized }
+        if let mapped = mapError?(response.statusCode, data) { throw mapped }
         throw CatalogError.httpStatus(response.statusCode)
     }
     guard data.count <= 16 * 1024 * 1024 else { throw CatalogError.responseTooLarge }

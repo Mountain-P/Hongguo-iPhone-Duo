@@ -61,6 +61,7 @@ public protocol CatalogService: Sendable {
 public enum CatalogError: Error, LocalizedError, Equatable, Sendable {
     case invalidConfiguration
     case invalidID
+    case episodeMismatch
     case invalidPage
     case invalidQuery
     case unauthorized
@@ -77,6 +78,7 @@ public enum CatalogError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case .invalidConfiguration: "請輸入有效的 HTTPS 服務網址（區域網路可使用 HTTP），且不要包含帳號、密碼或查詢參數。"
         case .invalidID: "劇集或分集編號無效。"
+        case .episodeMismatch: "這一集不在這部劇的選集清單中，請重新選集。"
         case .invalidPage: "分頁編號無效。"
         case .invalidQuery: "請輸入 1 至 80 字的搜尋詞。"
         case .unauthorized: "服務存取口令不正確，請在設定中更新。"

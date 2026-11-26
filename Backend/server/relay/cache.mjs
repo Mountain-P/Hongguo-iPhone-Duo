@@ -12,7 +12,7 @@ export class RelayCache {
   constructor(root, { maxBytes = 2 * 1024 ** 3, prepare, onEvent = () => {} } = {}) {
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 1024 * 1024) throw failure('INVALID_CACHE_LIMIT');
     this.root = root; this.maxBytes = maxBytes; this.prepare = prepare; this.onEvent = onEvent;
-    this.completed = new Map(); this.active = new Map(); this.pending = new Map(); this.byID = new Map();
+    this.completed = new Map(); this.active = new Map(); this.pending = new Map(); this.byID = new Map(); this.removals = new Map();
     this.warming = new Set(); this.work = new Map(); this.preparing = 0; this.bytes = 0; this.reserved = 0;
   }
   async init() {
@@ -38,14 +38,46 @@ export class RelayCache {
     }
     await this.makeRoom(0);
   }
+  removeRecord(record) {
+    const episodeID = record.episodeID;
+    if (this.completed.get(episodeID) !== record) return this.removals.get(episodeID);
+    this.completed.delete(episodeID); this.byID.delete(record.id); this.bytes -= record.total;
+    // Release this version once and finish removing its manifest before another
+    // resolve for the same episode can write a replacement.
+    const removal = Promise.all([
+      fs.unlink(path.join(this.root, record.id + '.mp4')).catch(() => {}),
+      fs.unlink(path.join(this.root, episodeID + '.json')).catch(() => {})
+    ]).finally(() => this.removals.delete(episodeID));
+    this.removals.set(episodeID, removal);
+    return removal;
+  }
   async makeRoom(reserve) {
     while (this.bytes + this.reserved + reserve > this.maxBytes) {
       const victim = [...this.completed.values()].filter(v => !v.pinnedUntil || v.pinnedUntil < Date.now()).sort((a, b) => a.used - b.used)[0];
       if (!victim) throw failure('CACHE_FULL', 507);
-      await fs.unlink(path.join(this.root, victim.id + '.mp4')).catch(() => {});
-      await fs.unlink(path.join(this.root, victim.episodeID + '.json')).catch(() => {});
-      this.completed.delete(victim.episodeID); this.byID.delete(victim.id); this.bytes -= victim.total;
+      await this.removeRecord(victim);
     }
+  }
+  async cachedEpisode(episodeID) {
+    const removing = this.removals.get(episodeID);
+    if (removing) await removing;
+    const record = this.completed.get(episodeID);
+    if (!record) return null;
+    try {
+      // The read checks the open file's version before serving any bytes.
+      const prefix = await record.stream.chunk(0, 7);
+      if (prefix.toString('ascii', 4, 8) !== 'ftyp') throw failure('INVALID_MEDIA');
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR', 'ELOOP', 'MEDIA_CHANGED', 'INVALID_MEDIA', 'SHORT_MEDIA'].includes(error.code)) throw error;
+      await this.removeRecord(record);
+      return null;
+    }
+    if (this.completed.get(episodeID) !== record) {
+      await this.removals.get(episodeID);
+      return null;
+    }
+    record.used = Date.now(); record.pinnedUntil = record.used + 30 * 60_000;
+    return record.stream;
   }
   async resolve(episodeID, fresh = false) {
     if (!validID(episodeID)) throw failure('INVALID_ID', 400);
@@ -57,8 +89,8 @@ export class RelayCache {
     for (const [id, stream] of this.byID) {
       if (stream.failed && !this.work.has(id)) this.byID.delete(id);
     }
-    const cached = this.completed.get(episodeID);
-    if (cached) { cached.used = Date.now(); cached.pinnedUntil = Date.now() + 30 * 60_000; return cached.stream; }
+    const cached = await this.cachedEpisode(episodeID);
+    if (cached) return cached;
     if (this.pending.has(episodeID)) return this.pending.get(episodeID);
     const active = this.active.get(episodeID);
     // A healthy immutable stream is shared even for a refresh. Once a read fails,

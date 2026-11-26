@@ -62,6 +62,30 @@ struct HomeRelayTests {
         } catch { #expect(error is CatalogError) }
         #expect(await direct.calls.isEmpty)
     }
+    @Test func episodeMismatchIsLocalizedOnlyForRelayPlaybackAndStaysTerminal() async throws {
+        let configuration = try ServerConfiguration(baseURL: "https://relay.example.com")
+        let body = #"{"code":"EPISODE_MISMATCH","error":"upstream text"}"#
+        let http = RelayHTTP(status: 409, body: body)
+        let direct = DirectRelayFixture()
+        let relay = HomeRelayService(configuration: configuration, usesServerLibrary: true, direct: direct, transport: http)
+        await #expect(throws: CatalogError.episodeMismatch) { try await relay.playback(seriesID: "100", episodeID: "234", fresh: true) }
+        #expect(CatalogError.episodeMismatch.errorDescription?.contains("重新選集") == true)
+        #expect(!PlaybackRecovery.shouldRetry(CatalogError.episodeMismatch, attempt: 0))
+        #expect(!OfflineSourceRecovery.shouldWait(CatalogError.episodeMismatch))
+        #expect(await direct.calls.isEmpty)
+
+        await #expect(throws: CatalogError.httpStatus(409)) { try await relay.detail(id: "100") }
+        let custom = BridgeService(configuration: configuration, transport: http)
+        await #expect(throws: CatalogError.httpStatus(409)) { try await custom.playback(seriesID: "100", episodeID: "234", fresh: false) }
+        for other in [RelayHTTP(status: 409, body: #"{"code":"MEDIA_CHANGED"}"#), RelayHTTP(status: 409, body: "<html>"),
+                      RelayHTTP(status: 409, body: body + String(repeating: " ", count: 4096))] {
+            let service = HomeRelayService(configuration: configuration, direct: direct, transport: other)
+            await #expect(throws: CatalogError.httpStatus(409)) { try await service.playback(seriesID: "100", episodeID: "234", fresh: false) }
+        }
+        let forbidden = HomeRelayService(configuration: configuration, direct: direct, transport: RelayHTTP(status: 403, body: body))
+        await #expect(throws: CatalogError.httpStatus(403)) { try await forbidden.playback(seriesID: "100", episodeID: "234", fresh: false) }
+        #expect(await direct.calls.isEmpty)
+    }
     @Test func rejectsDifferentOriginAndDisablingFallbackIsRespected() async throws {
         for body in [#"{"path":"https://evil.example.com/video.mp4"}"#, #"{"path":"//evil.example.com/video.mp4"}"#] {
             let direct = DirectRelayFixture()
