@@ -11,15 +11,21 @@ private actor ProgressiveBytes: NativeRangeFetching {
     var delayDuration = Duration.milliseconds(50)
     var cancellations = 0
     var failure: (any Error)?
-    init(_ bytes: Data) { self.bytes = bytes }
+    private let beforeFetch: (@Sendable () async throws -> Void)?
+    init(_ bytes: Data, beforeFetch: (@Sendable () async throws -> Void)? = nil) {
+        self.bytes = bytes; self.beforeFetch = beforeFetch
+    }
     func setChanged() { changeAfter = ranges.count }
     func setDelay(_ duration: Duration = .milliseconds(50)) { delay = true; delayDuration = duration }
     func setFailure(_ error: (any Error)?) { failure = error }
     func fetch(range: Range<Int>) async throws -> NativeRangeResponse {
         ranges.append(range)
-        if delay {
-            do { try await Task.sleep(for: delayDuration) }
-            catch { cancellations += 1; throw error }
+        do {
+            try await beforeFetch?()
+            if delay { try await Task.sleep(for: delayDuration) }
+        } catch is CancellationError {
+            cancellations += 1
+            throw CancellationError()
         }
         try Task.checkCancellation()
         if let failure { throw failure }
@@ -511,19 +517,34 @@ private final class ProgressiveClock: @unchecked Sendable {
 
 }
 
+/// A single waiting task, released by either a test event or task-group cancellation.
+private struct RecoveryRaceGate: Sendable {
+    private let signal = AsyncStream<Void>.makeStream()
+    func open() { signal.continuation.yield(()); signal.continuation.finish() }
+    func wait() async throws {
+        var events = signal.stream.makeAsyncIterator()
+        guard await events.next() != nil else { throw CancellationError() }
+        try Task.checkCancellation()
+    }
+}
+
 struct NativeRecoveryRaceTests {
     private func source() -> NativeMediaSource {
-        .init(url: URL(string: "https://unit.fqnovelvod.com/video.mp4")!, contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
+        .init(url: URL(string: "https://race-backup.fqnovelvod.com/video.mp4")!, contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p")
     }
     @Test func recoveryRacesBoundedIndependentStreamsAndCancelsTheSlowLoser() async throws {
-        let firstBytes = ProgressiveBytes(streamFixture(payload: Data(repeating: 0x11, count: 400_000), samples: 1).data)
+        let primaryStarted = RecoveryRaceGate(), holdPrimary = RecoveryRaceGate()
+        let firstBytes = ProgressiveBytes(streamFixture(payload: Data(repeating: 0x11, count: 400_000), samples: 1).data) {
+            primaryStarted.open()
+            try await holdPrimary.wait()
+        }
         let fastFixture = streamFixture(payload: Data(repeating: 0x22, count: 400_000), samples: 1)
         let fastBytes = ProgressiveBytes(fastFixture.data)
-        await firstBytes.setDelay(.seconds(5))
         let backup = source()
-        let primary = NativeMediaSource(url: URL(string: "https://slow.qznovelvod.com/file.mp4")!,
+        let primary = NativeMediaSource(url: URL(string: "https://race-delayed.qznovelvod.com/file.mp4")!,
             contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
-        let media = NativeProgressiveMedia(makeFetcher: { $0.url == primary.url ? firstBytes : fastBytes })
+        let media = NativeProgressiveMedia(waitForAlternate: { try await primaryStarted.wait() },
+                                          makeFetcher: { $0.url == primary.url ? firstBytes : fastBytes })
         let stream = try await PlaybackTransferContext.$raceAlternates.withValue(true) {
             try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
         }
@@ -542,18 +563,25 @@ struct NativeRecoveryRaceTests {
     }
 
     @Test func recoveryRaceDoesNotRetryAnExplicitProviderDenial() async throws {
-        let bytes = ProgressiveBytes(streamFixture(payload: Data([1,2,3]), samples: 1).data)
+        let alternateWaiting = RecoveryRaceGate(), releaseAlternate = RecoveryRaceGate()
+        let fixture = streamFixture(payload: Data([1,2,3]), samples: 1)
+        let bytes = ProgressiveBytes(fixture.data) { try await alternateWaiting.wait() }
+        let backupBytes = ProgressiveBytes(fixture.data)
         await bytes.setFailure(CatalogError.httpStatus(403))
         let backup = source()
-        let primary = NativeMediaSource(url: URL(string: "https://denied.qznovelvod.com/file.mp4")!,
+        let primary = NativeMediaSource(url: URL(string: "https://race-denial.qznovelvod.com/file.mp4")!,
             contentKey: nil, userAgent: "Fixture", codec: "h264", quality: "1080p", alternateSources: [backup])
-        let media = NativeProgressiveMedia(makeFetcher: { _ in bytes })
+        let media = NativeProgressiveMedia(waitForAlternate: {
+            alternateWaiting.open()
+            try await releaseAlternate.wait()
+        }, makeFetcher: { $0.url == primary.url ? bytes : backupBytes })
         await #expect(throws: CatalogError.httpStatus(403)) {
             try await PlaybackTransferContext.$raceAlternates.withValue(true) {
                 try await media.preparePlayback(source: primary, episodeID: "123", fresh: true)
             }
         }
         #expect(await bytes.ranges.count == 1)
+        #expect(await backupBytes.ranges.isEmpty)
     }
 
 }

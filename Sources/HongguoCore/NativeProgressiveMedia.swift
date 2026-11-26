@@ -56,16 +56,17 @@ public actor NativeProgressiveMedia {
     private let failedRoutes = FailedPlaybackRoutes()
     private var access: UInt64 = 0
     private let now: @Sendable () -> Date
+    private let waitForAlternate: @Sendable () async throws -> Void
     private let makeFetcher: @Sendable (NativeMediaSource) throws -> any NativeRangeFetching
 
     public init() {
-        now = Date.init
-        makeFetcher = { try NativeRangeHTTP(source: $0) }
+        self.init(makeFetcher: { try NativeRangeHTTP(source: $0) })
     }
 
     init(now: @escaping @Sendable () -> Date = Date.init,
+         waitForAlternate: @escaping @Sendable () async throws -> Void = { try await Task.sleep(for: .milliseconds(250)) },
          makeFetcher: @escaping @Sendable (NativeMediaSource) throws -> any NativeRangeFetching) {
-        self.now = now; self.makeFetcher = makeFetcher
+        self.now = now; self.waitForAlternate = waitForAlternate; self.makeFetcher = makeFetcher
     }
 
     public func prepare(source: NativeMediaSource, episodeID: String, fresh: Bool = false) async throws -> NativeMediaStream {
@@ -105,7 +106,7 @@ public actor NativeProgressiveMedia {
                 return try await withThrowingTaskGroup(of: NativeMediaStream.self) { group in
                     for (index, candidate) in pair.enumerated() {
                         group.addTask {
-                            if index > 0 { try await Task.sleep(for: .milliseconds(250)) }
+                            if index > 0 { try await self.waitForAlternate() }
                             return try await self.prepare(source: candidate, episodeID: episodeID, fresh: true, deadline: deadline)
                         }
                     }
