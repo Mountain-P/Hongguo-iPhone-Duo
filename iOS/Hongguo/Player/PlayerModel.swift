@@ -1225,10 +1225,15 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             nextPrefetchToken = token
             let service = service, seriesID = series.id, prefetcher = nextPrefetcher, rate = effectiveSpeed
             let currentID = currentEpisode.id
+            traceHealth("next opening preparation started")
             nextPrefetchTask = Task(priority: .utility) { [weak self] in
                 do {
                     try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service,
                                                  warmOpening: true, playbackRate: rate)
+                    let expires = await prefetcher.openingExpiration(seriesID: seriesID, episodeID: episodeID)
+                    guard let self, !Task.isCancelled, self.nextPrefetchToken == token else { return }
+                    self.nextPrefetchState.prepared(episodeID: currentID, nextEpisodeID: episodeID, expiresAt: expires)
+                    self.traceHealth("next opening prepared")
                 } catch {
                     guard let self, !Task.isCancelled, self.nextPrefetchToken == token else { return }
                     self.nextPrefetchState.failed(episodeID: currentID, nextEpisodeID: episodeID, error: error)

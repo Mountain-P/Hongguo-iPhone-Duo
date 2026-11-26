@@ -22,6 +22,11 @@ public actor NativePlaybackPrefetch {
     }
     private var prepared: (series: String, episode: String, scope: UUID?, opening: Opening, expires: Double)?
 
+    public func openingExpiration(seriesID: String, episodeID: String) -> Double? {
+        guard let prepared, prepared.series == seriesID, prepared.episode == episodeID else { return nil }
+        return prepared.expires
+    }
+
     public func takePrepared(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil) async -> PlaybackSource? {
         await takeOpening(seriesID: seriesID, episodeID: episodeID, preference: preference)?.source
     }

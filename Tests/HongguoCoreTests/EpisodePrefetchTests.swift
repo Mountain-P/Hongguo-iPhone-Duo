@@ -8,6 +8,27 @@ struct EpisodePrefetchTests {
         .init(elapsed: elapsed, duration: 100, rate: rate, bufferedAhead: buffer, allowed: allowed)
     }
 
+    @Test func aRetriedOpeningExpiresDuringPlaybackAndAnAlreadyWarmOpeningKeepsItsOriginalDeadline() {
+        var state = EpisodePrefetchState()
+        let tail = context(80, rate: 2, buffer: 20)
+        func tick(_ now: Double) -> EpisodePrefetchState.Decision {
+            state.update(episodeID: "1", nextEpisodeID: "2", context: tail, now: now)
+        }
+        #expect(tick(0) == .prepare("2"))
+        state.failed(episodeID: "1", nextEpisodeID: "2", error: CatalogError.httpStatus(503), now: 0)
+        #expect(tick(1) == .prepare("2"))
+        state.prepared(episodeID: "1", nextEpisodeID: "2", expiresAt: 46)
+        #expect(tick(40) == .none)
+        #expect(state.suspend() == .cancel)
+        #expect(tick(45) == .prepare("2"))
+        state.prepared(episodeID: "1", nextEpisodeID: "2", expiresAt: 46)
+        #expect(tick(45.9) == .none)
+        #expect(tick(46) == .prepare("2"))
+        #expect(tick(47) == .none)
+        state.prepared(episodeID: "1", nextEpisodeID: "2", expiresAt: nil)
+        #expect(tick(600) == .none)
+    }
+
     @Test func preparesOnceNearTheEndAndPauseOrPolicyRevocationCancelsItsWindow() {
         var state = EpisodePrefetchState()
         #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(50)) == .none)

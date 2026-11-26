@@ -20,6 +20,7 @@ public struct EpisodePrefetchState: Sendable {
     private var currentEpisode: String?
     private var nextEpisode: String?
     private var requested = false
+    private var openingExpiresAt: Double?
     private var failureCount = 0
     private var retryAt: Double?
     private var stopped = false
@@ -44,9 +45,21 @@ public struct EpisodePrefetchState: Sendable {
             let cancelled = suspend()
             return replacedRequest ? .cancel : cancelled
         }
+        if let openingExpiresAt, now >= openingExpiresAt {
+            self.openingExpiresAt = nil
+            requested = false
+        }
         guard !requested, !stopped, retryAt.map({ now >= $0 }) ?? true else { return .none }
         requested = true
         return .prepare(nextEpisodeID)
+    }
+
+    /// Use the opening's actual lease, including after a pause reuses an older prefix.
+    public mutating func prepared(episodeID: String, nextEpisodeID: String, expiresAt: Double?) {
+        guard requested, currentEpisode == episodeID, nextEpisode == nextEpisodeID else { return }
+        openingExpiresAt = expiresAt
+        retryAt = nil
+        failureCount = 0
     }
 
     public mutating func failed(episodeID: String, nextEpisodeID: String, error: any Error,
@@ -65,6 +78,7 @@ public struct EpisodePrefetchState: Sendable {
     public mutating func suspend() -> Decision {
         let cancelled = requested
         requested = false
+        openingExpiresAt = nil
         return cancelled ? .cancel : .none
     }
 
