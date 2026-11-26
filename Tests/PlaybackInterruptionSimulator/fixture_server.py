@@ -24,6 +24,7 @@ class ClipReader(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         server = self.server
+        request_started = time.time()
         first = self.path == '/201.mp4'
         def offline():
             try:
@@ -31,6 +32,7 @@ class ClipReader(BaseHTTPRequestHandler):
             except (OSError,ValueError):
                 return False
         if offline():
+            if first: server.interrupted.set()
             self.send_error(503)
             return
         path = server.directory / self.path[1:]
@@ -61,9 +63,12 @@ class ClipReader(BaseHTTPRequestHandler):
                         self.connection.shutdown(socket.SHUT_RDWR)
                         return
                     self.wfile.write(block)
-                    if first and server.interrupted.is_set() and not offline():
-                        server.resumed.set()
                     start += len(block)
                     if not server.marker.exists(): time.sleep(len(block)/550_000)
+            if first and server.interrupted.is_set() and not server.resumed.is_set():
+                until = float(server.marker.read_text())
+                if request_started >= until:
+                    server.marker.with_name('outage-first-episode-read').write_text(str(time.time()))
+                    server.resumed.set()
         except OSError:
             pass

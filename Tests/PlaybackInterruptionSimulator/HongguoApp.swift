@@ -18,16 +18,29 @@ struct HongguoApp: App {
 
     var body: some Scene {
         WindowGroup {
-            Color.black
-                .fullScreenCover(item: $route) { route in
-                    PlayerScreen(series: route.detail.series, episodes: route.detail.episodes,
-                                 initialEpisodeID: route.detail.episodes[0].id, resumeSeconds: 0, service: route.service,
-                                 onProgress: { _, _, _ in }, retainedModel: route.model).environmentObject(app)
+            if HistoryOfflineQA.offline {
+                ZStack { NavigationStack { LibraryView().environmentObject(app).environmentObject(app.downloads) } }
+                    .task {
+                        do { try await HistoryOfflineQA.observe() }
+                        catch { HistoryOfflineQA.log("FAIL " + error.localizedDescription) }
+                    }
+            } else if CommandLine.arguments.contains("qa-history-seed") {
+                Color.black.task {
+                    do { try await HistoryOfflineQA.seed(app: app) }
+                    catch { HistoryOfflineQA.log("FAIL " + error.localizedDescription) }
                 }
-                .task {
-                    do { try await measure() }
-                    catch { log("FAIL domain=\((error as NSError).domain) code=\((error as NSError).code) \(error.localizedDescription)") }
-                }
+            } else {
+                Color.black
+                    .fullScreenCover(item: $route) { route in
+                        PlayerScreen(series: route.detail.series, episodes: route.detail.episodes,
+                                     initialEpisodeID: route.detail.episodes[0].id, resumeSeconds: 0, service: route.service,
+                                     onProgress: { _, _, _ in }, retainedModel: route.model).environmentObject(app)
+                    }
+                    .task {
+                        do { try await measure() }
+                        catch { log("FAIL domain=\((error as NSError).domain) code=\((error as NSError).code) \(error.localizedDescription)") }
+                    }
+            }
         }
     }
 
@@ -61,6 +74,7 @@ struct HongguoApp: App {
         let episodes = catalog.episodes.filter { $0.number == first || $0.number == first + 1 }.sorted { $0.number < $1.number }
         guard episodes.count == 2, Set(episodes.map(\.id)).count == 2 else { log("FAIL missing episodes"); return }
         let selected = SeriesDetail(series: catalog.series, episodes: episodes)
+        if direct && !fixture { RangeInterruption.select(episodeID: episodes[0].id) }
         var ended: Set<String> = []
         let model = PlayerModel(series: selected.series, episodes: episodes, initialEpisodeID: episodes[0].id,
                                 resumeSeconds: 0, service: service, onProgress: { episode, position, duration in
@@ -74,12 +88,15 @@ struct HongguoApp: App {
         defer { model.stop() }
 
         let gate = URL.documentsDirectory.appendingPathComponent("outage-until")
+        let receipt = URL.documentsDirectory.appendingPathComponent("outage-first-episode-read")
         let begin = ProcessInfo.processInfo.systemUptime
         var lastItem: AVPlayerItem?
         var output: AVPlayerItemVideoOutput?
         var frames: [Int: Int] = [:]
         var seen = Set<Int>()
         var faultPosition: Double?
+        var initialBufferEnd = 0.0
+        var witnessFrames = 0, previousWitness = -1.0
         var restored = false
         var nextStart: Double?
         var lastProgress: (Double,Double)?
@@ -104,7 +121,14 @@ struct HongguoApp: App {
                 model.togglePlayback()
                 log("INITIAL_PLAY")
             }
-            if let error = model.errorMessage { log("FAIL ep=\(model.currentEpisode?.number ?? 0) \(error)"); return }
+            if let error = model.errorMessage {
+                if let record = PlaybackDiagnostics.shared.records.last {
+                    let attempts = (record.lookups ?? []).map { "\($0.route.rawValue)=\($0.result.rawValue)" }
+                    log("DIAGNOSTIC stage=\(record.lastFailureStage?.rawValue ?? "unknown") lookups=\(attempts.joined(separator: ","))")
+                }
+                log("FAIL ep=\(model.currentEpisode?.number ?? 0) \(error)")
+                return
+            }
             guard let episode = model.currentEpisode else { continue }
             let number = episode.number
             if nextStart == nil, ended.contains(episodes[0].id) || number == first + 1 { nextStart = now }
@@ -135,12 +159,25 @@ struct HongguoApp: App {
                 if lastProgress == nil || pos > lastProgress!.0 { lastProgress = (pos,now) }
                 if number == first, pos >= 2, faultPosition == nil {
                     faultPosition = pos
+                    // Only contiguous, already playable ranges can conceal an outage here.
+                    initialBufferEnd = pos
+                    for range in item.loadedTimeRanges.map(\.timeRangeValue).sorted(by: { $0.start.seconds < $1.start.seconds }) {
+                        if range.start.seconds > initialBufferEnd + 0.05 { break }
+                        let end = CMTimeRangeGetEnd(range).seconds
+                        if end.isFinite { initialBufferEnd = max(initialBufferEnd, end) }
+                    }
                     try String(Date().timeIntervalSince1970 + outage).write(to: gate, atomically: true, encoding: .utf8)
-                    log(String(format:"CUT ep=%d position=%.2f outage=%.0fs", number,pos,outage))
+                    log(String(format:"CUT ep=%d position=%.2f contiguousBufferEnd=%.2f outage=%.0fs", number,pos,initialBufferEnd,outage))
                 }
                 if number == first, let faultPosition, !restored, let raw = try? String(contentsOf: gate, encoding: .utf8),
-                   let until = Double(raw), Date().timeIntervalSince1970 >= until, pos >= faultPosition + 1 {
-                    restored = true; log(String(format:"RECOVERED_FRAME ep=%d position=%.2f actualRate=%.1f",number,pos,model.player.rate))
+                   let until = Double(raw), let read = try? String(contentsOf: receipt, encoding: .utf8),
+                   let readAt = Double(read), readAt >= until, readAt <= Date().timeIntervalSince1970,
+                   pos > max(faultPosition + 1, initialBufferEnd + 0.5), pos > previousWitness + 0.02 {
+                    witnessFrames += 1; previousWitness = pos
+                    if witnessFrames == 3 {
+                        restored = true
+                        log(String(format:"RECOVERED_FRAME ep=%d position=%.2f actualRate=%.1f confirmedFrames=%d beyondBuffer=%.2fs",number,pos,model.player.rate,witnessFrames,pos-initialBufferEnd))
+                    }
                 }
             }
             if ended.count == 2 {
