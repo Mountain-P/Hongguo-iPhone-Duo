@@ -5,6 +5,15 @@ import { fileStream, validID, failure, safeCode } from './library.mjs';
 
 const CHUNK = 512 * 1024;
 const MAX_FILE = 256 * 1024 * 1024;
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function transientRead(error) {
+  const status = error.status ?? error.response?.status;
+  if (status) return [408, 429, 500, 502, 503, 504].includes(status);
+  return ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN',
+        'ENETUNREACH', 'EHOSTUNREACH', 'ERR_NETWORK', 'ERR_CANCELED'].includes(error.code)
+    || error.name === 'TimeoutError';
+}
 
 /// Each preparation has a unique immutable media URL. No cache bytes are shared
 /// across re-resolved renditions, even if their episode ID and byte length match.
@@ -26,6 +35,7 @@ export class RelayCache {
         const stream = await fileStream(path.join(this.root, data.id + '.mp4'), 'cache');
         if (stream.total !== data.total) continue;
         stream.id = data.id;
+        if (!validID(data.seriesID)) delete data.seriesID;
         this.completed.set(data.episodeID, { ...data, stream }); this.bytes += stream.total;
         this.byID.set(stream.id, stream);
       } catch { /* An incomplete cache record is not playable. */ }
@@ -44,12 +54,33 @@ export class RelayCache {
     this.completed.delete(episodeID); this.byID.delete(record.id); this.bytes -= record.total;
     // Release this version once and finish removing its manifest before another
     // resolve for the same episode can write a replacement.
-    const removal = Promise.all([
+    const removal = Promise.resolve(record.binding).catch(() => {}).then(() => Promise.all([
       fs.unlink(path.join(this.root, record.id + '.mp4')).catch(() => {}),
       fs.unlink(path.join(this.root, episodeID + '.json')).catch(() => {})
-    ]).finally(() => this.removals.delete(episodeID));
+    ])).finally(() => this.removals.delete(episodeID));
     this.removals.set(episodeID, removal);
     return removal;
+  }
+  async writeRecord({ episodeID, id, total, used, seriesID }) {
+    const record = { formatVersion: 1, episodeID, id, total, used, seriesID };
+    const temp = path.join(this.root, episodeID + '.' + id + '.tmp');
+    await fs.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
+    await fs.rename(temp, path.join(this.root, episodeID + '.json'));
+  }
+  // Call only after the catalog or saved library verified this episode's owner.
+  // Older manifests without a series are upgraded on their first verified play.
+  async bindSeries(episodeID, stream, seriesID) {
+    if (!seriesID) return stream;
+    const record = this.completed.get(episodeID);
+    const owner = record?.seriesID || stream.seriesID;
+    if (owner && owner !== seriesID) throw failure('EPISODE_MISMATCH', 409);
+    stream.seriesID = seriesID;
+    if (record?.id === stream.id && !record.seriesID) {
+      record.binding ??= this.writeRecord({ ...record, seriesID }).then(() => { record.seriesID = seriesID; })
+        .finally(() => { delete record.binding; });
+      await record.binding;
+    }
+    return stream;
   }
   async makeRoom(reserve) {
     while (this.bytes + this.reserved + reserve > this.maxBytes) {
@@ -79,28 +110,36 @@ export class RelayCache {
     record.used = Date.now(); record.pinnedUntil = record.used + 30 * 60_000;
     return record.stream;
   }
-  async resolve(episodeID, fresh = false) {
+  async resolve(episodeID, fresh = false, verifiedSeriesID) {
     if (!validID(episodeID)) throw failure('INVALID_ID', 400);
     for (const [key, stream] of this.active) {
       if ((stream.failed || stream.expires < Date.now()) && !this.work.has(stream.id)) {
-        await stream.discard(); this.active.delete(key); this.byID.delete(stream.id);
+        await stream.discard();
+        if (this.active.get(key) === stream) this.active.delete(key);
+        this.byID.delete(stream.id);
       }
     }
     for (const [id, stream] of this.byID) {
+      if (stream.retired && (stream.failed || stream.expires < Date.now())) await stream.discard();
       if (stream.failed && !this.work.has(id)) this.byID.delete(id);
     }
     const cached = await this.cachedEpisode(episodeID);
-    if (cached) return cached;
-    if (this.pending.has(episodeID)) return this.pending.get(episodeID);
+    if (cached) return this.bindSeries(episodeID, cached, verifiedSeriesID);
+    if (this.pending.has(episodeID)) return this.bindSeries(episodeID, await this.pending.get(episodeID), verifiedSeriesID);
     const active = this.active.get(episodeID);
-    // A healthy immutable stream is shared even for a refresh. Once a read fails,
-    // the next request resolves a new version; two warmers cannot publish one episode.
-    if (active && !active.failed && (active.expires > Date.now() || this.work.has(active.id))) return active;
+    // While a bounded repair is running, refresh callers share its version.
+    if (active && !active.failed && (active.expires > Date.now() || this.work.has(active.id))) {
+      if (!fresh || !active.warmDeferred) return this.bindSeries(episodeID, active, verifiedSeriesID);
+      // Keep the old URL readable for other viewers until its lease expires.
+      // Only its replacement may publish a completed manifest for this episode.
+      active.retired = true;
+      this.active.delete(episodeID);
+    }
     if (this.preparing >= 2 || this.active.size >= 12) throw failure('RELAY_BUSY', 503);
     this.preparing++;
     const promise = this.create(episodeID, fresh).finally(() => { this.preparing--; this.pending.delete(episodeID); });
     this.pending.set(episodeID, promise);
-    return promise;
+    return this.bindSeries(episodeID, await promise, verifiedSeriesID);
   }
   async create(episodeID, fresh) {
     const upstream = await this.prepare(episodeID, fresh, { signal: AbortSignal.timeout(30_000) });
@@ -139,7 +178,8 @@ export class RelayCache {
           for (let attempt = 0; ; attempt++) {
             try { data = await upstream.chunk(start, end, { signal: AbortSignal.timeout(20_000) }); break; }
             catch (error) {
-              if (attempt >= 1 || [401, 403, 409].includes(error.status) || error.code === 'MEDIA_CHANGED') throw error;
+              if (!transientRead(error)) throw error;
+              if (attempt >= 1) throw failure('SOURCE_TEMPORARY', 503);
             }
           }
           if (data.length !== end - start + 1) throw failure('SHORT_MEDIA');
@@ -153,14 +193,20 @@ export class RelayCache {
             }
           } finally { await handle.close(); }
           ready.add(index);
-        })().catch(error => { stream.failed = true; throw error; }).finally(() => inflight.delete(index));
+        })().catch(error => {
+          if (error.code !== 'SOURCE_TEMPORARY') stream.failed = true;
+          throw error;
+        }).finally(() => inflight.delete(index));
         inflight.set(index, task); return task;
       },
       async chunk(start, end, { signal } = {}) {
         signal?.throwIfAborted();
+        let needsFetch = false;
         for (let index = Math.floor(start / CHUNK); index <= Math.floor(end / CHUNK); index++) {
+          if (!ready.has(index)) needsFetch = true;
           await stream.block(index); signal?.throwIfAborted();
         }
+        if (needsFetch && stream.warmDeferred && !stream.retired) cache.warm(stream);
         // Each read opens the current path; rename occurs only after every block is ready.
         let handle;
         try { handle = await fs.open(localFile, 'r'); }
@@ -172,8 +218,7 @@ export class RelayCache {
           return data;
         } finally { await handle.close(); }
       },
-      async warm() {
-        const deadline = Date.now() + 5 * 60_000;
+      async warm(deadline) {
         for (let index = 0; index < Math.ceil(stream.total / CHUNK); index++) {
           if (Date.now() > deadline) throw failure('PREFETCH_TIMEOUT');
           await stream.block(index);
@@ -181,14 +226,17 @@ export class RelayCache {
         await fileStream(partial, 'cache');
         const destination = path.join(cache.root, id + '.mp4');
         await fs.rename(partial, destination); localFile = destination; complete = true;
-        const record = { formatVersion: 1, episodeID, id, total: stream.total, used: Date.now() };
-        const temp = path.join(cache.root, episodeID + '.' + id + '.tmp');
-        await fs.writeFile(temp, JSON.stringify(record), { mode: 0o600 });
-        await fs.rename(temp, path.join(cache.root, episodeID + '.json'));
-        stream.origin = 'cache';
         // Completed playback needs no source URL, key, or per-sample decrypt tables.
         // Existing readers may finish their immutable stream; new readers use disk only.
         const diskStream = await fileStream(destination, 'cache'); diskStream.id = id;
+        const record = { episodeID, id, total: stream.total, used: Date.now() };
+        // A previously unscoped caller can be joined by a verified play during
+        // publication. A series is bound once, so at most one rewrite is needed.
+        do {
+          record.seriesID = stream.seriesID;
+          await cache.writeRecord(record);
+        } while (record.seriesID !== stream.seriesID);
+        stream.origin = 'cache';
         cache.byID.set(id, diskStream);
         cache.completed.set(episodeID, { ...record, stream: diskStream, pinnedUntil: Date.now() + 30 * 60_000 });
         if (cache.active.get(episodeID) === stream) cache.active.delete(episodeID);
@@ -204,13 +252,28 @@ export class RelayCache {
     return stream;
   }
   warm(stream) {
-    if (!stream.warm || stream.origin !== 'source') return Promise.resolve();
     if (this.work.has(stream.id)) return this.work.get(stream.id);
+    if (!stream.warm || stream.origin !== 'source' || stream.retired || stream.failed) return Promise.resolve();
+    stream.warmDeferred = false;
     const job = (async () => {
       while (this.warming.size >= 2) await new Promise(resolve => setTimeout(resolve, 100));
       this.warming.add(stream.id);
-      await stream.warm();
+      const deadline = Date.now() + 5 * 60_000;
+      const backoff = [500, 1500];
+      for (let attempt = 0; ; attempt++) {
+        const delay = backoff[attempt - 1];
+        if (delay) await pause(delay);
+        try { await stream.warm(deadline); return; }
+        catch (error) {
+          if (error.code !== 'SOURCE_TEMPORARY' || attempt >= backoff.length) throw error;
+        }
+      }
     })().catch(async error => {
+      if (!stream.failed && ['SOURCE_TEMPORARY', 'PREFETCH_TIMEOUT'].includes(error.code)) {
+        stream.warmDeferred = true;
+        this.onEvent({ event: 'cache_deferred', code: safeCode(error) });
+        return;
+      }
       stream.failed = true;
       this.onEvent({ event: 'cache_failed', code: safeCode(error) });
       // Retain its identity until the client requests a new source; never mix bytes.

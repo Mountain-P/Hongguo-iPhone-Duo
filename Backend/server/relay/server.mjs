@@ -62,22 +62,24 @@ export async function createRelay({ token, jobsFile, mediaRoot, cacheRoot, provi
     if (saved) return saved;
     const savedSeries = library.savedSeries.get(episodeID);
     const owner = seriesID || savedSeries;
-    // A completed cache entry for a known saved episode needs no network.
-    // Refresh upstream metadata before opening a new source for a damaged copy.
-    if (savedSeries && owner === savedSeries) {
+    // Serve only a locally verified series/episode pair without the catalog.
+    // An old, unbound manifest still goes through sourceDetail once.
+    const cachedOwner = cache.completed.get(episodeID)?.seriesID;
+    if (owner && cachedOwner && owner !== cachedOwner) throw failure('EPISODE_MISMATCH', 409);
+    if (owner && (owner === savedSeries || owner === cachedOwner)) {
       const fallback = await cache.cachedEpisode(episodeID);
-      if (fallback) return fallback;
+      if (fallback) return cache.bindSeries(episodeID, fallback, owner);
     }
     if (owner) {
       const show = await sourceDetail(owner, signal, episodeID);
       if (!show.episodes.some(episode => episode.id === episodeID)) throw failure('EPISODE_MISMATCH', 409);
     }
     signal.throwIfAborted();
-    return cache.resolve(episodeID, fresh);
+    return cache.resolve(episodeID, fresh, owner);
   }
   function prefetchAfter(stream, seriesID, episodeID) {
     cache.warm(stream).then(async () => {
-      if (stream.failed || !seriesID || cache.warming.size >= 1) return;
+      if (stream.failed || stream.origin === 'source' || !seriesID || cache.warming.size >= 1) return;
       const show = library.series.get(seriesID) || details.get(seriesID)?.value;
       const at = show?.episodes.findIndex(e => e.id === episodeID) ?? -1;
       const next = at >= 0 ? show.episodes[at + 1] : null;

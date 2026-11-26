@@ -80,6 +80,113 @@ test('partial source failures never become completed cache and retry gets a diff
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
+test('an upstream prefetch outage keeps verified ranges live and a foreground read repairs the same version', () =>
+  setup(async ({ get, relay, provider }) => {
+    const data = bytes(), size = 512 * 1024;
+    let offline = true, attempts = 0, opens = 0;
+    provider.stream = async () => {
+      opens++;
+      return { total: data.length, chunk(start, end) {
+        if (start && offline) { attempts++; throw Object.assign(Error('transient'), { status: 503 }); }
+        return data.subarray(start, end + 1);
+      } };
+    };
+    const play = await (await get('/api/episodes/201/play?series_id=101')).json();
+    const stream = relay.cache.get(play.mediaVersion);
+    await relay.cache.warm(stream);
+    assert.equal(attempts, 6);
+    assert.equal(relay.cache.completed.size, 0);
+    assert.equal(relay.cache.status().reservedBytes, data.length);
+    async function read(start) {
+      const response = await get(play.path, { headers: { Range: `bytes=${start}-${start + 127}` } });
+      assert.equal(response.status, 206);
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), data.subarray(start, start + 128));
+    }
+    await read(0);
+    assert.equal(attempts, 6);
+    offline = false;
+    await read(size);
+    await relay.cache.warm(stream);
+    assert.equal(relay.cache.completed.get('201').id, play.mediaVersion);
+    assert.equal(relay.cache.status().reservedBytes, 0);
+    assert.equal(opens, 1);
+  }));
+
+test('dynamic saved media reopens during a catalog outage and after restart; legacy unbound records must verify first', () =>
+  setup(async ({ get, relay, options, provider, advance, calls }) => {
+    let offline = false, catalogReads = 0;
+    provider.detail = async id => {
+      catalogReads++;
+      if (offline) throw Object.assign(Error('offline'), { status: 503 });
+      return { id, episodes: [{ id: '201', number: 1 }] };
+    };
+    const route = '/api/episodes/201/play?series_id=101';
+    const play = await (await get(route)).json();
+    await relay.cache.warm(relay.cache.get(play.mediaVersion));
+    advance(301000); offline = true;
+    assert.equal((await (await get(route)).json()).mediaVersion, play.mediaVersion);
+    const manifest = path.join(options.cacheRoot, '201.json');
+    const record = JSON.parse(await fs.readFile(manifest, 'utf8'));
+    assert.equal(record.seriesID, '101');
+    async function restarted(body) {
+      const next = await createRelay(options);
+      await new Promise(resolve => next.server.listen(0, '127.0.0.1', resolve));
+      const request = endpoint => fetch('http://127.0.0.1:' + next.server.address().port + endpoint,
+        { headers: { Authorization: 'Bearer ' + token } });
+      try { await body(request); }
+      finally { next.server.closeAllConnections(); await new Promise(resolve => next.server.close(resolve)); }
+    }
+    await restarted(async request => {
+      assert.equal((await (await request(route)).json()).mediaVersion, play.mediaVersion);
+      assert.equal((await request('/api/episodes/201/play?series_id=999')).status, 409);
+      assert.equal(catalogReads, 1);
+    });
+    delete record.seriesID;
+    await fs.writeFile(manifest, JSON.stringify(record));
+    await restarted(async request => {
+      assert.equal((await request(route)).status, 503);
+      offline = false;
+      const plays = await Promise.all([request(route), request(route)]);
+      for (const response of plays) assert.equal((await response.json()).mediaVersion, play.mediaVersion);
+    });
+    offline = true;
+    await restarted(async request => {
+      const result = await (await request(route)).json();
+      assert.equal(result.origin, 'cache'); assert.equal(result.mediaVersion, play.mediaVersion);
+    });
+    assert.equal(catalogReads, 3); assert.equal(calls(), 1);
+  }));
+
+test('a fresh rendition after exhausted retries cannot overwrite or leak the retired version', () =>
+  setup(async ({ get, relay, provider }) => {
+    let attempts = 0, oldStatus = 503;
+    provider.stream = async () => {
+      const version = ++attempts, data = bytes(800000, version);
+      return { total: data.length, chunk(start, end) {
+        if (version === 1 && start) throw Object.assign(Error('source failure'), { status: oldStatus });
+        return data.subarray(start, end + 1);
+      } };
+    };
+    const route = '/api/episodes/201/play?series_id=101';
+    const first = await (await get(route)).json();
+    await relay.cache.warm(relay.cache.get(first.mediaVersion));
+    const [a,b] = await Promise.all([get(route+'&fresh=1'),get(route+'&fresh=1')].map(async req => (await req).json()));
+    assert.equal(a.mediaVersion, b.mediaVersion); assert.notEqual(first.mediaVersion, a.mediaVersion);
+    await relay.cache.warm(relay.cache.get(a.mediaVersion));
+    for (const [media, value] of [[first, 1], [a, 2]]) {
+      const response = await get(media.path, { headers: { Range: 'bytes=80-95' } });
+      assert.equal(response.status, 206);
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.alloc(16, value));
+    }
+    oldStatus = 409;
+    assert.equal((await get(first.path, { headers: { Range: 'bytes=600000-600015' } })).status, 409);
+    await relay.cache.resolve('201');
+    assert.equal((await get(first.path)).status, 410);
+    assert.equal(relay.cache.status().reservedBytes, 0);
+    assert.equal(relay.cache.completed.get('201').id, a.mediaVersion);
+    assert.equal(attempts, 2);
+  }));
+
 test('library excludes traversal and symlinks outside its media root', () => setup(async ({ root, options }) => {
   await fs.writeFile(path.join(root, 'outside.mp4'), bytes());
   await fs.symlink(path.join(root, 'outside.mp4'), path.join(root, 'videos/link.mp4'));
