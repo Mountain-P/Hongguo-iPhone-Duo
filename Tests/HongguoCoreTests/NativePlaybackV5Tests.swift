@@ -4,6 +4,44 @@ import Testing
 @testable import HongguoCore
 
 struct NativePlaybackV5Tests {
+    @Test func autoRenditionSelectionInBundledRuntimeKeepsEachEpisodeAndFiltersByteVC2() async throws {
+        let result = try await NativeJSRuntime().evaluateForTesting(#"""
+        (() => {
+          const select = require('app-source').parseAppPlayModel;
+          const row = (file, codec, width, backup) => ({
+            main_url:'https://unit.fqnovelvod.com/' + file, codec_type:codec,
+            width, height:Math.round(width*16/9), encrypt:false,
+            ...(backup ? {backup_url:'https://unit.fqnovelvod.com/' + backup} : {})
+          });
+          const choose = (vid, list) => {
+            const out = select({video_id:'fixture-'+vid,video_duration:60,video_list:list},
+              vid,{quality:'auto',playbackQuality:'automatic'},true);
+            return {vid:out.vid,url:out.url,codec:out.codec,quality:out.quality,width:out.width,
+              userAgent:out.userAgent,preference:'automatic',alternateURLs:out.alternateURLs,
+              codecs:out.variants.map(x=>x.codec)};
+          };
+          return [
+            choose('200',{avc:row('low.mp4','h264',720),hevc:row('ep200.mp4','hevc',1080),
+                          incompatible:row('bad200.mp4','bytevc2',1440)}),
+            choose('201',{hevc:row('hevc201.mp4','hevc',1080),avc:row('ep201.mp4','avc1',1080,'ep201-b.mp4'),
+                          incompatible:row('bad201.mp4','bytevc2',1080)})
+          ];
+        })()
+        """#)
+        let rows = try #require(JSONSerialization.jsonObject(with: Data(result.utf8)) as? [[String: Any]])
+        #expect(rows.compactMap { $0["vid"] as? String } == ["200", "201"])
+        let sources = try rows.map {
+            let raw = String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self)
+            return try NativeJSRuntime.parseSource(raw, preference: .automatic, offlineDirect: false)
+        }
+        #expect(sources.map { $0.url.lastPathComponent } == ["ep200.mp4", "ep201.mp4"])
+        #expect(sources.map(\.codec) == ["hevc", "avc1"])
+        #expect(sources.map(\.width) == [1080, 1080])
+        #expect(rows.compactMap { $0["codecs"] as? [String] } == [["hevc"], ["avc1", "avc1", "hevc"]])
+        #expect(sources[0].alternateSources.isEmpty)
+        #expect(sources[1].alternateSources.map { $0.url.lastPathComponent } == ["ep201-b.mp4"])
+    }
+
     @Test func currentMedusaMatchesIndependentFullWireVector() async throws {
         let fixtureURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()

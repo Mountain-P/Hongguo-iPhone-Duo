@@ -636,14 +636,22 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
     const offlineDirect = options.offlineDirect === true;
     const eligibleRows = offlineDirect ? compatibleRows.filter(row => row.codecRank < 2 && isExplicitlyClear(row.item)) : compatibleRows;
     if (offlineDirect && !eligibleRows.length) throw offlineSourceUnavailable();
-    const rows = eligibleRows.filter(row => (!dataSaver || row.codecRank < 2)
+    // Auto playback prefers the highest resolution the client can decode.
+    // Keep ByteVC2-only models visible to the existing negotiation path; never
+    // include ByteVC2 among alternatives for a directly playable rendition.
+    const autoPlayback = requestedQuality === 'auto' && !dataSaver && !offlineDirect;
+    const playableRows = autoPlayback ? eligibleRows.filter(row => row.codecRank < 2) : [];
+    const candidates = playableRows.length > 0 ? playableRows : eligibleRows;
+    const rows = candidates.filter(row => (!dataSaver || row.codecRank < 2)
         && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
         if (dataSaver) {
             const aKnown = a.width > 0 && a.height > 0, bKnown = b.width > 0 && b.height > 0;
             if (aKnown !== bKnown) return Number(bKnown) - Number(aKnown);
             return (aKnown ? a.pixels - b.pixels : 0) || a.codecRank - b.codecRank;
         }
-        if (requestedQuality === 'auto') return a.codecRank - b.codecRank || b.pixels - a.pixels;
+        if (requestedQuality === 'auto') return autoPlayback && playableRows.length > 0
+            ? b.pixels - a.pixels || a.codecRank - b.codecRank
+            : a.codecRank - b.codecRank || b.pixels - a.pixels;
         const aMeets = meetsDownloadQuality(a, requestedQuality), bMeets = meetsDownloadQuality(b, requestedQuality);
         if (aMeets !== bMeets) return Number(bMeets) - Number(aMeets);
         const aPixels = Math.min(a.width, a.height), bPixels = Math.min(b.width, b.height);
@@ -723,4 +731,4 @@ function parseAppPlayModel(info, vid, options, inline, requireEncryptionMetadata
         });
 }
 
-module.exports = { fetchAppPlayUrl, signedSearchRequest, signedMetadataRequest, signedAccountRequest, signedAccountLibraryRequest, signedNativePhoneRequest, internationalGorgon, parseSearchInteger, preserveLargeJsonIntegers, requestJson, SEARCH_API, SEARCH_UA };
+module.exports = { fetchAppPlayUrl, parseAppPlayModel, signedSearchRequest, signedMetadataRequest, signedAccountRequest, signedAccountLibraryRequest, signedNativePhoneRequest, internationalGorgon, parseSearchInteger, preserveLargeJsonIntegers, requestJson, SEARCH_API, SEARCH_UA };
