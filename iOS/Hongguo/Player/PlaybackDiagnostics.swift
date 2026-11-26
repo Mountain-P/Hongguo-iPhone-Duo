@@ -53,18 +53,20 @@ final class PlaybackDiagnostics: NSObject, ObservableObject {
         MXMetricManager.shared.add(self)
     }
 
-    func begin(context: Context) -> UUID {
+    func begin(context: Context, route: PlaybackMeasurement.Route) -> UUID {
         let now = ProcessInfo.processInfo.systemUptime
         // Only the foreground player and its handoff can own a measurement.
         if active.count >= 2 {
             for id in Array(active.keys) { finish(id: id, outcome: .cancelled) }
         }
         let id = UUID()
-        active[id] = PlaybackMeasurement(id: id, context: context, startedAt: now)
+        active[id] = PlaybackMeasurement(id: id, context: context, startedAt: now, route: route)
         enableSampling(id: id)
         return id
     }
 
+    func beginLookup(id: UUID, route: PlaybackMeasurement.Route) { active[id]?.beginLookup(route: route) }
+    func receivedSource(id: UUID, route: PlaybackMeasurement.Route) { active[id]?.receivedSource(route: route) }
     func recordReady(id: UUID) { active[id]?.recordReady(at: ProcessInfo.processInfo.systemUptime) }
     func recordFirstFrame(id: UUID) { active[id]?.recordFirstFrame(at: ProcessInfo.processInfo.systemUptime) }
     func recordTransport(id: UUID, waiting: Bool, playing: Bool) {

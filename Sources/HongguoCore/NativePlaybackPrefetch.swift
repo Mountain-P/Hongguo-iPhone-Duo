@@ -16,16 +16,25 @@ public actor NativePlaybackPrefetch {
     public static let maximumPreparationBytes = 1024 * 1024
     private var operation: Task<Void, any Error>?
     private var generation = UUID()
-    private var prepared: (series: String, episode: String, source: PlaybackSource, expires: Double)?
+    public struct Opening: Sendable {
+        public let source: PlaybackSource
+        public let relayPrefix: RelayPlaybackOpening?
+    }
+    private var prepared: (series: String, episode: String, opening: Opening, expires: Double)?
 
     public func takePrepared(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil) async -> PlaybackSource? {
+        await takeOpening(seriesID: seriesID, episodeID: episodeID, preference: preference)?.source
+    }
+
+    public func takeOpening(seriesID: String, episodeID: String, preference: NativePlaybackQuality? = nil) async -> Opening? {
         guard let value = prepared, value.series == seriesID, value.episode == episodeID,
-              value.expires > ProcessInfo.processInfo.systemUptime,
-              let stream = value.source.nativeStream,
-              preference.map({ $0 == stream.variant.preference }) ?? true, await stream.isReusable,
-              prepared?.source.nativeStream?.id == stream.id else { return nil }
+              value.expires > ProcessInfo.processInfo.systemUptime else { return nil }
+        if let stream = value.opening.source.nativeStream {
+            guard preference.map({ $0 == stream.variant.preference }) ?? true, await stream.isReusable,
+                  prepared?.opening.source.nativeStream?.id == stream.id else { return nil }
+        } else if value.opening.relayPrefix == nil { return nil }
         prepared = nil
-        return value.source
+        return value.opening
     }
 
     public init() {}
@@ -45,7 +54,15 @@ public actor NativePlaybackPrefetch {
             try await NativePrefetchContext.$maximumBytes.withValue(Self.maximumPreparationBytes) {
                 let source = try await service.playback(seriesID: seriesID, episodeID: episodeID, fresh: false)
                 try Task.checkCancellation()
-                guard let stream = source.nativeStream else { throw PlaybackPrefetchError.unsupported }
+                guard let stream = source.nativeStream else {
+                    guard warmOpening, let relay = service as? HomeRelayService, relay.servesMedia(at: source.url) else {
+                        throw PlaybackPrefetchError.unsupported
+                    }
+                    let prefix = try await RelayPlaybackOpening.fetch(source, rate: playbackRate)
+                    try Task.checkCancellation()
+                    self.remember(source, relayPrefix: prefix, seriesID: seriesID, episodeID: episodeID, generation: request)
+                    return
+                }
                 if warmOpening {
                     let count = PlaybackReadAheadBudget.bytes(totalLength: stream.totalLength, duration: stream.mediaDuration,
                         rate: playbackRate, wallSeconds: 12, minimum: 2 * 1024 * 1024, maximum: 8 * 1024 * 1024)
@@ -79,9 +96,9 @@ public actor NativePlaybackPrefetch {
         }
     }
 
-    private func remember(_ source: PlaybackSource, seriesID: String, episodeID: String, generation request: UUID) {
+    private func remember(_ source: PlaybackSource, relayPrefix: RelayPlaybackOpening? = nil, seriesID: String, episodeID: String, generation request: UUID) {
         guard request == generation else { return }
-        prepared = (seriesID, episodeID, source, ProcessInfo.processInfo.systemUptime + 30)
+        prepared = (seriesID, episodeID, Opening(source: source, relayPrefix: relayPrefix), ProcessInfo.processInfo.systemUptime + 45)
     }
 
     public func cancel() {

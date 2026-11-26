@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import HongguoCore
 import UniformTypeIdentifiers
 
 /// Adds media request headers through AVFoundation's public resource-loader API.
@@ -26,12 +27,17 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
 
     private let sourceURL: URL
     private let headers: [String: String]
+    private let opening: RelayPlaybackOpening?
     private let resumesInterruptedRanges: Bool
     private let queue = DispatchQueue(label: "tw.mountainp.hongguo.media")
     private var pending: [Int: Pending] = [:]
     private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
     private var retrying: [ObjectIdentifier: Pending] = [:]
     private var stopped = false
+    private let statusLock = NSLock()
+    private var terminalStatus: Int?
+    var lastTerminalStatus: Int? { statusLock.withLock { terminalStatus } }
+
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -44,7 +50,8 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         return URLSession(configuration: configuration, delegate: self, delegateQueue: operations)
     }()
 
-    init(url: URL, headers: [String: String], resumesInterruptedRanges: Bool = false) {
+    init(url: URL, headers: [String: String], resumesInterruptedRanges: Bool = false, opening: RelayPlaybackOpening? = nil) {
+        self.opening = opening
         self.sourceURL = url
         self.headers = headers
         self.resumesInterruptedRanges = resumesInterruptedRanges
@@ -84,22 +91,52 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
             loadingRequest.finishLoading()
             return true
         }
-        let length = Int(remaining)
-        let allToEnd = dataRequest?.requestsAllDataToEndOfResource ?? false
-        guard let range = MediaByteRange.requestHeader(offset: offset, length: length, allToEnd: allToEnd) else {
-            loadingRequest.finishLoading(with: Self.failure("影片資料範圍無效。"))
-            return true
+        let entry = Pending(loadingRequest, offset: offset, length: Int(remaining),
+                            allToEnd: dataRequest?.requestsAllDataToEndOfResource ?? false)
+        if let opening {
+            guard offset < opening.totalLength else {
+                loadingRequest.finishLoading(with: Self.failure("影片資料範圍無效。"))
+                return true
+            }
+            entry.totalLength = opening.totalLength
+            entry.etag = opening.etag
+            let target = entry.allToEnd ? opening.totalLength - offset : min(remaining, opening.totalLength - offset)
+            entry.targetLength = target
+            if let info = loadingRequest.contentInformationRequest {
+                info.contentLength = opening.totalLength
+                info.contentType = UTType.mpeg4Movie.identifier
+                info.isByteRangeAccessSupported = true
+            }
+            if dataRequest == nil { loadingRequest.finishLoading(); return true }
+            // Offset is absolute. A crossing request first consumes its cached bytes
+            // and then fetches only the suffix, pinned to this representation.
+            if offset < Int64(opening.bytes.count) {
+                let count = min(target, Int64(opening.bytes.count) - offset)
+                dataRequest?.respond(with: opening.bytes.subdata(in: Int(offset)..<Int(offset + count)))
+                entry.delivered = count
+                if count == target { loadingRequest.finishLoading(); return true }
+            }
         }
+        startRequest(entry)
+        return true
+    }
 
+    private func startRequest(_ entry: Pending) {
+        let remaining = (entry.targetLength ?? entry.requestedLength) - entry.delivered
+        guard remaining > 0, remaining <= Int64(Int.max),
+              let range = MediaByteRange.requestHeader(offset: entry.offset + entry.delivered,
+                  length: Int(remaining), allToEnd: entry.allToEnd) else {
+            entry.request.finishLoading(with: Self.failure("影片資料範圍無效。")); return
+        }
         var request = URLRequest(url: sourceURL)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         request.setValue(range, forHTTPHeaderField: "Range")
+        request.setValue(entry.etag, forHTTPHeaderField: "If-Range")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         let task = session.dataTask(with: request)
-        pending[task.taskIdentifier] = Pending(loadingRequest, offset: offset, length: length, allToEnd: allToEnd)
-        tasks[ObjectIdentifier(loadingRequest)] = task
+        pending[task.taskIdentifier] = entry
+        tasks[ObjectIdentifier(entry.request)] = task
         task.resume()
-        return true
     }
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
@@ -121,7 +158,16 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
             if [408, 429, 500, 502, 503, 504].contains(http.statusCode), retry(dataTask, entry: entry) {
                 completionHandler(.cancel); return
             }
-            finish(dataTask, error: Self.failure(http.statusCode == 401 ? "影片授權已失效，請檢查服務口令。" : "影片服務暫時無法提供資料。"))
+            if [401, 403, 404, 410].contains(http.statusCode) {
+                statusLock.withLock {
+                    // AVFoundation sometimes replaces the loader error with a generic item error.
+                    if terminalStatus != 401 && terminalStatus != 403 { terminalStatus = http.statusCode }
+                }
+            }
+            let error = NSError(domain: PlaybackRecovery.assetErrorDomain, code: http.statusCode,
+                                userInfo: [NSLocalizedDescriptionKey: http.statusCode == 401
+                                    ? "影片授權已失效，請檢查服務口令。" : "影片服務暫時無法提供資料。"])
+            finish(dataTask, error: error)
             completionHandler(.cancel)
             return
         }
@@ -180,7 +226,9 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
                  .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable].contains($0.code)
             } == true
             if transient, retry(dataTask, entry: entry) { return }
-            finish(dataTask, error: Self.failure("影片連線中斷，請重試。"))
+            let failure = transient && resumesInterruptedRanges ? NSError(domain: PlaybackRecovery.assetErrorDomain,
+                code: PlaybackRecovery.transientAssetErrorCode, userInfo: [NSLocalizedDescriptionKey: "影片連線中斷，請重試。"]) : Self.failure("影片連線中斷，請重試。")
+            finish(dataTask, error: failure)
         } else {
             finish(dataTask)
         }
@@ -203,6 +251,7 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         }
         var redirected = request
         redirected.setValue(task.originalRequest?.value(forHTTPHeaderField: "Range"), forHTTPHeaderField: "Range")
+        redirected.setValue(task.originalRequest?.value(forHTTPHeaderField: "If-Range"), forHTTPHeaderField: "If-Range")
         redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if MediaByteRange.sameOrigin(sourceURL, destination) {
             for (name, value) in headers { redirected.setValue(value, forHTTPHeaderField: name) }
@@ -224,20 +273,7 @@ final class AuthenticatedMediaLoader: NSObject, AVAssetResourceLoaderDelegate, U
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, !self.stopped, self.retrying[key] === entry else { return }
             self.retrying.removeValue(forKey: key)
-            let remaining = (entry.targetLength ?? entry.requestedLength) - entry.delivered
-            guard remaining > 0, remaining <= Int64(Int.max),
-                  let range = MediaByteRange.requestHeader(offset: entry.offset + entry.delivered,
-                    length: Int(remaining), allToEnd: entry.allToEnd) else {
-                entry.request.finishLoading(with: Self.failure("影片資料範圍無效。")); return
-            }
-            var request = URLRequest(url: self.sourceURL)
-            for (name, value) in self.headers { request.setValue(value, forHTTPHeaderField: name) }
-            request.setValue(range, forHTTPHeaderField: "Range")
-            request.setValue(entry.etag, forHTTPHeaderField: "If-Range")
-            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            let resumed = self.session.dataTask(with: request)
-            self.pending[resumed.taskIdentifier] = entry; self.tasks[key] = resumed
-            resumed.resume()
+            self.startRequest(entry)
         }
         return true
     }

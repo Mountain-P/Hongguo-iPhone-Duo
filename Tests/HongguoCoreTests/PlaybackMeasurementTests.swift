@@ -21,6 +21,32 @@ struct PlaybackMeasurementTests {
         #expect(result.durationSeconds == 15)
     }
 
+    @Test func diagnosticsPreserveFailureStageThroughRecoveryAndReadLegacyHistory() throws {
+        var measure = PlaybackMeasurement(context: .episode, startedAt: 0, route: .relay)
+        measure.recordFailure(recovered: true, at: 1)
+        measure.beginLookup(route: .relay)
+        measure.receivedSource(route: .direct)
+        measure.recordReady(at: 2)
+        measure.recordFirstFrame(at: 3)
+        measure.recordFailure(recovered: true, at: 4)
+        measure.beginLookup(route: .relay)
+        measure.receivedSource(route: .relay)
+        measure.recordReady(at: 5)
+        measure.recordFailure(recovered: false, at: 6)
+        let finished = measure.finish(outcome: .failed, at: 7)
+        let result = try #require(finished)
+        #expect(result.lastFailureStage == .firstFrame)
+        #expect(result.route == .relay)
+        #expect(result.failureCount == 3 && result.firstFrameSeconds == 3)
+        let encoded = try JSONEncoder().encode(result)
+        var legacy = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "route")
+        legacy.removeValue(forKey: "lastFailureStage")
+        let old = try JSONDecoder().decode(PlaybackMeasurement.Summary.self,
+                                           from: JSONSerialization.data(withJSONObject: legacy))
+        #expect(old.route == nil && old.lastFailureStage == nil && old.failureCount == 3)
+    }
+
     @Test func automaticRecoveryKeepsTheOriginalFirstFrameClock() throws {
         var value = PlaybackMeasurement(context: .preview, startedAt: 1)
         value.recordFailure(recovered: true, at: 2)

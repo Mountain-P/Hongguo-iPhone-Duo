@@ -85,4 +85,36 @@ struct PlaybackRecoveryTests {
             #expect(!PlaybackRecovery.shouldRetry(wrapped, attempt: 0))
         }
     }
+
+    @Test func expiredSourceDuringLongPauseWaitsForOneExplicitPlay() {
+        var policy = LongPauseSourceRecovery()
+        policy.pause(at: 1)
+        #expect(policy.failure(CatalogError.httpStatus(410), at: 4) == .waitForPlay)
+        policy.pause(at: 23)
+        #expect(policy.failure(CatalogError.httpStatus(410), at: 33) == .waitForPlay)
+        #expect(policy.explicitPlay(at: 45) == .refresh)
+        #expect(policy.explicitPlay(at: 46) == .ordinary)
+        #expect(policy.failure(CatalogError.httpStatus(410), at: 48) == .ordinary)
+    }
+
+    @Test func validSourcesAndDenialsNeverTriggerLongPauseRefresh() {
+        var policy = LongPauseSourceRecovery()
+        policy.pause(at: 1)
+        #expect(policy.explicitPlay(at: 41) == .ordinary)
+        #expect(policy.failure(CatalogError.unauthorized, at: 42) == .ordinary)
+        let denied = NSError(domain: PlaybackRecovery.assetErrorDomain, code: 403)
+        let wrapped = NSError(domain: PlaybackRecovery.assetErrorDomain, code: 410, userInfo: [NSUnderlyingErrorKey: denied])
+        #expect(policy.failure(wrapped, at: 42) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 43) == .refresh)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 44) == .ordinary)
+        policy.pause(at: 100)
+        #expect(policy.explicitPlay(at: 101) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 102) == .ordinary)
+        policy.pause(at: 104)
+        #expect(policy.failure(CatalogError.httpStatus(410), at: 105) == .waitForPlay)
+        #expect(policy.explicitPlay(at: 106) == .showExpired(410))
+        policy.pause(at: 110)
+        #expect(policy.explicitPlay(at: 141) == .ordinary)
+        #expect(policy.failure(NativeMediaError.httpStatus(404), at: 180) == .ordinary)
+    }
 }

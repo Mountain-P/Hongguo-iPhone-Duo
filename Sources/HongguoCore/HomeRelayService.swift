@@ -18,6 +18,10 @@ public struct HomeRelayService: CatalogService {
         self.allowsDirectFallback = allowsDirectFallback
     }
 
+    public func servesMedia(at url: URL) -> Bool {
+        sameOrigin(relay.configuration.baseURL, url)
+    }
+
     public func verifyConnection() async throws -> Int { try await relay.verifyRelayConnection() }
     public func home(page: Int) async throws -> SeriesPage {
         try await (usesServerLibrary ? relay as any CatalogService : direct).home(page: page)

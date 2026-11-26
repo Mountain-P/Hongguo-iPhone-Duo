@@ -121,7 +121,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         updateLoaderReadAheadEligibility()
         autoNext = preferences.load().resolved(isPreview: false).autoNext
         pendingFormalActivation = true
-        diagnosticsID = PlaybackDiagnostics.shared.begin(context: .episode)
+        diagnosticsID = PlaybackDiagnostics.shared.begin(context: .episode, route: diagnosticRoute)
         if let diagnosticsID { PlaybackDiagnostics.shared.recordReady(id: diagnosticsID) }
         return true
     }
@@ -527,6 +527,8 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private var didStart = false
     private var sceneActive = true
     private var retryCount = 0
+    private var longPauseRecovery = LongPauseSourceRecovery()
+    private var lastPausedPosition: Double = 0
     private var pendingResume: Double = 0
     private var preservesResumePosition = false
     private var lastSavedAt = Date.distantPast
@@ -561,6 +563,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     private let nextPrefetcher = NativePlaybackPrefetch()
     private var nextPrefetchState = EpisodePrefetchState()
     private var nextPrefetchTask: Task<Void, Never>?
+    private var nextPrefetchToken = UUID()
     private var prefetchNetworkAllowed = false
     private var bufferPolicy = PlaybackBufferPolicy()
     private var loaderReadAheadEnabled = false
@@ -677,6 +680,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         isSeeking = seekCoordinator.isSeeking
         pendingSeekTarget = seekCoordinator.pendingTarget
         elapsed = target
+        lastPausedPosition = target
         reachedEnd = false
         updatePlaybackHealth()
         if let request { performSeek(request) }
@@ -721,6 +725,15 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         // notification. Only a fresh user Play may reactivate it and clear the
         // stale interruption; returning to the foreground never starts playback.
         guard activateAudioForUserPlayback() else { return }
+        switch longPauseRecovery.explicitPlay(at: Date.timeIntervalSinceReferenceDate) {
+        case .refresh:
+            if let episode = currentEpisode { refreshAfterLongPause(episode) }
+            return
+        case .showExpired(let status):
+            handleFailure(generation: generation, error: CatalogError.httpStatus(status))
+            return
+        case .ordinary: break
+        }
         if PlaybackReplay.shouldRestart(position: elapsed, duration: duration, reachedEnd: reachedEnd) {
             restartFromBeginning()
         } else { resumePlayback() }
@@ -751,7 +764,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         seekCoordinator.reset()
         player.currentItem?.cancelPendingSeeks()
         if diagnosticsID == nil {
-            diagnosticsID = PlaybackDiagnostics.shared.begin(context: .replay)
+            diagnosticsID = PlaybackDiagnostics.shared.begin(context: .replay, route: diagnosticRoute)
         }
         playbackSpeed.requestPlayback()
         reachedEnd = false
@@ -778,6 +791,11 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
     }
 
     func pauseAndSave() {
+        if hasStarted, !isPreview, errorMessage == nil, !reachedEnd,
+           service is HomeRelayService || service is NativeCatalogService {
+            if playbackSpeed.wantsPlayback { lastPausedPosition = resumePosition }
+            longPauseRecovery.pause(at: Date.timeIntervalSinceReferenceDate)
+        }
         cancelRecoveryPreparation()
         PlaybackNetworkPriority.shared.update(owner: networkPriorityOwner, constrained: false)
         clearAudioPlaybackNotice()
@@ -810,6 +828,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         clearAudioPlaybackNotice()
         cancelQualitySwitch()
         clearQualityNotice()
+        nextPrefetchState.reset()
         setLoaderReadAheadEnabled(false)
         pendingFormalActivation = false
         episodeTransitionFrame = nil
@@ -837,12 +856,16 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                            preparedTask: Task<PlaybackSource, any Error>? = nil) {
         cancelRecoveryPreparation()
         continuityPolicy = PlaybackContinuityPolicy()
+        longPauseRecovery = LongPauseSourceRecovery()
         clearAudioPlaybackNotice()
         cancelQualitySwitch()
         cancelNextEpisodePrefetch()
+        nextPrefetchState.reset()
         if !continuingDiagnostics || diagnosticsID == nil {
             finishDiagnostics(outcome: .cancelled)
-            diagnosticsID = PlaybackDiagnostics.shared.begin(context: isPreview ? .preview : .episode)
+            diagnosticsID = PlaybackDiagnostics.shared.begin(context: isPreview ? .preview : .episode, route: diagnosticRoute)
+        } else if let id = diagnosticsID {
+            PlaybackDiagnostics.shared.beginLookup(id: id, route: diagnosticRoute)
         }
         // Capture before clearing the old item, including rapid B -> C while B is loading.
         if let frame = captureTransitionFrame() {
@@ -877,17 +900,19 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         loadTask = Task { [weak self] in
             do {
                 let source: PlaybackSource
+                var relayPrefix: RelayPlaybackOpening?
                 if let preparedTask {
                     source = try await withTaskCancellationHandler { try await preparedTask.value } onCancel: { preparedTask.cancel() }
                 } else if let preparedSource { source = preparedSource }
-                else if !fresh, let opening = await nextPrefetcher.takePrepared(seriesID: seriesID, episodeID: episode.id,
+                else if !fresh, let opening = await nextPrefetcher.takeOpening(seriesID: seriesID, episodeID: episode.id,
                     preference: (service as? NativeCatalogService)?.playbackQuality) {
-                    source = opening
+                    source = opening.source
+                    relayPrefix = opening.relayPrefix
                     self?.traceHealth("prefetched opening adopted")
                 } else { source = try await service.playback(seriesID: seriesID, episodeID: episode.id, fresh: fresh) }
                 try Task.checkCancellation()
                 guard let self, self.generation == requestGeneration else { return }
-                self.configure(source: source, generation: requestGeneration)
+                self.configure(source: source, relayPrefix: relayPrefix, generation: requestGeneration)
             } catch is CancellationError {
                 // Superseded requests have already changed generation or been
                 // cancelled. A source may also interrupt the current request.
@@ -921,17 +946,33 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         startupWatchdog = nil
     }
 
-    private func configure(source: PlaybackSource, generation requestGeneration: UUID) {
+    private var diagnosticRoute: PlaybackMeasurement.Route {
+        if service is HomeRelayService { return .relay }
+        if service is NativeCatalogService { return .direct }
+        if service is OfflinePlaybackService { return .offline }
+        return .bridge
+    }
+
+    private func configure(source: PlaybackSource, relayPrefix: RelayPlaybackOpening?, generation requestGeneration: UUID) {
         nativeVariant = source.nativeStream?.variant
         let asset: AVURLAsset
+        let relayMedia = (service as? HomeRelayService)?.servesMedia(at: source.url) == true
+        if let id = diagnosticsID {
+            let actualRoute: PlaybackMeasurement.Route
+            if source.nativeStream != nil { actualRoute = .direct }
+            else if source.url.isFileURL { actualRoute = .offline }
+            else { actualRoute = diagnosticRoute }
+            PlaybackDiagnostics.shared.receivedSource(id: id, route: actualRoute)
+        }
         if let stream = source.nativeStream {
             let resourceLoader = NativeMediaAssetLoader(stream: stream)
             progressiveLoader = resourceLoader
             asset = resourceLoader.makeAsset()
-        } else if source.headers.isEmpty {
+        } else if source.headers.isEmpty && !relayMedia {
             asset = AVURLAsset(url: source.url)
         } else {
-            let resourceLoader = AuthenticatedMediaLoader(url: source.url, headers: source.headers, resumesInterruptedRanges: service is HomeRelayService)
+            let resourceLoader = AuthenticatedMediaLoader(url: source.url, headers: source.headers,
+                resumesInterruptedRanges: relayMedia, opening: relayPrefix)
             loader = resourceLoader
             asset = resourceLoader.makeAsset()
         }
@@ -963,7 +1004,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
                 guard let self, self.generation == requestGeneration, self.player.currentItem === item else { return }
                 switch item.status {
                 case .readyToPlay: self.ready(generation: requestGeneration)
-                case .failed: self.handleFailure(generation: requestGeneration, error: self.mediaFailure(item.error))
+                case .failed: self.handleFailure(generation: requestGeneration, error: await self.mediaFailure(item.error))
                 default: break
                 }
             }
@@ -990,7 +1031,7 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
             let failure = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.handleFailure(generation: requestGeneration, error: self.mediaFailure(failure))
+                self.handleFailure(generation: requestGeneration, error: await self.mediaFailure(failure))
             }
         }
         player.replaceCurrentItem(with: item)
@@ -1039,9 +1080,27 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         }
     }
 
+    private func refreshAfterLongPause(_ episode: Episode) {
+        let position = pendingSeekTarget ?? max(lastPausedPosition, resumePosition)
+        if let id = diagnosticsID { PlaybackDiagnostics.shared.recordFailure(id: id, recovered: true) }
+        traceHealth("refresh expired source after long pause")
+        retryCount = 1
+        beginLoad(episode, position: position, fresh: true, autoplay: true,
+                  continuingDiagnostics: true, preservingPosition: true)
+    }
+
     private func handleFailure(generation requestGeneration: UUID, error: (any Error)? = nil) {
         guard generation == requestGeneration, let episode = currentEpisode else { return }
         if error is CancellationError { return }
+        if hasStarted, !isLoading {
+            switch longPauseRecovery.failure(error, at: Date.timeIntervalSinceReferenceDate) {
+            case .waitForPlay: return
+            case .refresh:
+                refreshAfterLongPause(episode)
+                return
+            case .ordinary: break
+            }
+        }
         cancelStartupWatchdog()
         let willRetry: Bool
         if hasStarted && !isLoading {
@@ -1138,27 +1197,35 @@ final class PlayerModel: ObservableObject, PlaybackRouteResource {
         case .cancel: cancelNextEpisodePrefetch()
         case .prepare(let episodeID):
             nextPrefetchTask?.cancel()
+            let token = UUID()
+            nextPrefetchToken = token
             let service = service, seriesID = series.id, prefetcher = nextPrefetcher, rate = effectiveSpeed
-            nextPrefetchTask = Task(priority: .utility) {
+            let currentID = currentEpisode.id
+            nextPrefetchTask = Task(priority: .utility) { [weak self] in
                 do {
-                    try Task.checkCancellation()
-                    if let relay = service as? HomeRelayService {
-                        _ = try await relay.playback(seriesID: seriesID, episodeID: episodeID, fresh: false)
-                    } else {
-                        _ = try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service, warmOpening: true, playbackRate: rate)
-                    }
-                } catch { /* Optional work cannot become a visible playback error. */ }
+                    try await prefetcher.prepare(seriesID: seriesID, episodeID: episodeID, service: service,
+                                                 warmOpening: true, playbackRate: rate)
+                } catch {
+                    guard let self, !Task.isCancelled, self.nextPrefetchToken == token else { return }
+                    self.nextPrefetchState.failed(episodeID: currentID, nextEpisodeID: episodeID, error: error)
+                    self.traceHealth("next opening preparation failed")
+                }
             }
         }
     }
 
     private func cancelNextEpisodePrefetch() {
-        nextPrefetchState.reset()
+        nextPrefetchState.suspend()
+        nextPrefetchToken = UUID()
         nextPrefetchTask?.cancel()
         nextPrefetchTask = nil
     }
 
-    private func mediaFailure(_ error: (any Error)?) -> (any Error)? {
+    private func mediaFailure(_ error: (any Error)?) async -> (any Error)? {
+        if let status = loader?.lastTerminalStatus {
+            return status == 401 ? CatalogError.unauthorized : CatalogError.httpStatus(status)
+        }
+        if let confirmed = await progressiveLoader?.unrecoverableTerminalError() { return confirmed }
         var current = error as NSError?
         for _ in 0..<8 {
             guard let value = current else { break }

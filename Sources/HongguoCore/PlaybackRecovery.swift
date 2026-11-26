@@ -83,3 +83,57 @@ public enum PlaybackRecovery {
         "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504"
     ]
 }
+
+/// Only a user-initiated resume can refresh a confirmed obsolete media URL after a long pause.
+public struct LongPauseSourceRecovery: Sendable {
+    public enum Decision { case ordinary, waitForPlay, refresh }
+    public enum PlayDecision: Equatable { case ordinary, refresh, showExpired(Int) }
+    private var pausedAt: Double?
+    private var expiredStatus: Int?
+    private var resumedUntil: Double?
+
+    public init() {}
+
+    public mutating func pause(at time: Double) {
+        if pausedAt == nil { pausedAt = time }
+        resumedUntil = nil
+    }
+
+    public mutating func explicitPlay(at time: Double) -> PlayDecision {
+        guard let pausedAt else { return .ordinary }
+        let longPause = time - pausedAt >= 30
+        self.pausedAt = nil
+        defer { expiredStatus = nil }
+        if let expiredStatus { return longPause ? .refresh : .showExpired(expiredStatus) }
+        resumedUntil = longPause ? time + 30 : nil
+        return .ordinary
+    }
+
+    public mutating func failure(_ error: (any Error)?, at time: Double) -> Decision {
+        var cause = error
+        var obsolete: Int?
+        for _ in 0..<8 {
+            guard let value = cause else { break }
+            if case CatalogError.unauthorized = value { return .ordinary }
+            let ns = value as NSError
+            let status: Int?
+            if case CatalogError.httpStatus(let code) = value { status = code }
+            else if case NativeMediaError.httpStatus(let code) = value { status = code }
+            else if ns.domain == PlaybackRecovery.assetErrorDomain { status = ns.code }
+            else { status = nil }
+            if status == 401 || status == 403 { return .ordinary }
+            if status == 404 || status == 410 { obsolete = status }
+            cause = ns.userInfo[NSUnderlyingErrorKey] as? any Error
+        }
+        guard let obsolete else { return .ordinary }
+        if pausedAt != nil {
+            expiredStatus = obsolete
+            return .waitForPlay
+        }
+        if let resumedUntil, time <= resumedUntil {
+            self.resumedUntil = nil
+            return .refresh
+        }
+        return .ordinary
+    }
+}

@@ -66,4 +66,38 @@ struct EpisodePrefetchTests {
         #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(42, rate: 2, buffer: 30)) == .cancel)
     }
 
+    @Test func oneTransientFailureRetriesAfterBackoffOnlyWhileTheSameTailIsHealthy() {
+        var state = EpisodePrefetchState()
+        let eligible = context(80, rate: 2, buffer: 20)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: eligible, now: 0) == .prepare("2"))
+        state.failed(episodeID: "1", nextEpisodeID: "2", error: CatalogError.network, now: 0)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: eligible, now: 0.99) == .none)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(80, rate: 2, buffer: 1), now: 1) == .none)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: eligible, now: 2) == .prepare("2"))
+        for tick in 3...29 {
+            #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: eligible, now: Double(tick)) == .none)
+        }
+    }
+
+    @Test func repeatedFailuresStopAndACompletedOldRequestCannotAffectTheNewCandidate() {
+        var state = EpisodePrefetchState()
+        for second in [0.0, 1.0, 4.0] {
+            #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90), now: second) == .prepare("2"))
+            state.failed(episodeID: "1", nextEpisodeID: "2", error: CatalogError.httpStatus(503), now: second)
+        }
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90), now: 20) == .none)
+        #expect(state.update(episodeID: "2", nextEpisodeID: "3", context: context(90), now: 21) == .prepare("3"))
+        state.failed(episodeID: "1", nextEpisodeID: "2", error: CatalogError.unauthorized, now: 21)
+        #expect(state.update(episodeID: "2", nextEpisodeID: "3", context: context(90), now: 22) == .none)
+    }
+
+    @Test func terminalErrorsDoNotRetryWhenNetworkOrPauseChangesEligibility() {
+        var state = EpisodePrefetchState()
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90), now: 0) == .prepare("2"))
+        state.failed(episodeID: "1", nextEpisodeID: "2", error: CatalogError.unauthorized, now: 0)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90, allowed: false), now: 1) == .none)
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90), now: 10) == .none)
+        _ = state.reset()
+        #expect(state.update(episodeID: "1", nextEpisodeID: "2", context: context(90), now: 11) == .prepare("2"))
+    }
 }

@@ -66,7 +66,11 @@ struct PlaybackDiagnosticsView: View {
                 Section("最近五次") {
                     ForEach(diagnostics.records.suffix(5).reversed()) { record in
                         VStack(alignment: .leading, spacing: 5) {
-                            Text(context(record.context)).font(.subheadline)
+                            Text([context(record.context), record.route.map(routeLabel)].compactMap { $0 }.joined(separator: " · "))
+                                .font(.subheadline)
+                            if let stage = record.lastFailureStage {
+                                Text("最近一次失敗 · " + stageLabel(stage)).font(.caption)
+                            }
                             Text("首幀 \(seconds(record.firstFrameSeconds)) · 等待 \(seconds(record.rebufferSeconds)) · \(outcome(record.outcome))")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
@@ -94,6 +98,17 @@ struct PlaybackDiagnosticsView: View {
         case .serious: "偏高"
         case .critical: "過熱"
         @unknown default: "未知"
+        }
+    }
+    private func routeLabel(_ route: PlaybackMeasurement.Route) -> String {
+        switch route { case .direct: "手機直連"; case .relay: "家中中繼"; case .offline: "離線"; case .bridge: "自訂服務" }
+    }
+    private func stageLabel(_ stage: PlaybackMeasurement.Stage) -> String {
+        switch stage {
+        case .source: "取得當集來源"
+        case .media: "載入影片資料"
+        case .firstFrame: "等待第一個畫面"
+        case .playing: "播放途中"
         }
     }
     private func outcome(_ value: PlaybackMeasurement.Outcome) -> String {

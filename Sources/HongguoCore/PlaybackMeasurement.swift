@@ -4,6 +4,9 @@ import Foundation
 public struct PlaybackMeasurement: Sendable {
     public enum Context: String, Codable, Sendable { case episode, preview, replay }
     public enum Outcome: String, Codable, Sendable { case completed, cancelled, failed }
+    public enum Route: String, Codable, Sendable { case direct, relay, offline, bridge }
+    public enum Stage: String, Codable, Sendable { case source, media, firstFrame, playing }
+
     public struct Summary: Codable, Equatable, Sendable, Identifiable {
         public let id: UUID
         public let context: Context
@@ -16,6 +19,8 @@ public struct PlaybackMeasurement: Sendable {
         public let rebufferSeconds: Double
         public let failureCount: Int
         public let recoveryCount: Int
+        public let route: Route?
+        public let lastFailureStage: Stage?
     }
 
     private let id: UUID
@@ -23,6 +28,9 @@ public struct PlaybackMeasurement: Sendable {
     private let start: Double
     private var last: Double
     private var ready: Double?
+    private var route: Route?
+    private var stage: Stage = .source
+    private var lastFailureStage: Stage?
     private var firstFrame: Double?
     private var waiting = false
     private var recovering = false
@@ -34,19 +42,34 @@ public struct PlaybackMeasurement: Sendable {
     private var recoveryCount = 0
     private var ended = false
 
-    public init(id: UUID = UUID(), context: Context, startedAt: Double) {
-        self.id = id; self.context = context
+    public init(id: UUID = UUID(), context: Context, startedAt: Double, route: Route? = nil) {
+        self.id = id; self.context = context; self.route = route
+        if context == .replay { stage = .playing }
         start = startedAt.isFinite ? max(0, startedAt) : 0
         last = start
     }
 
+    public mutating func beginLookup(route: Route) {
+        self.route = route
+        stage = .source
+    }
+
+    public mutating func receivedSource(route: Route) {
+        self.route = route
+        stage = .media
+    }
+
     public mutating func recordReady(at time: Double) {
-        guard advance(to: time), ready == nil else { return }
+        guard advance(to: time) else { return }
+        if stage == .media { stage = .firstFrame }
+        guard ready == nil else { return }
         ready = time - start
     }
 
     public mutating func recordFirstFrame(at time: Double) {
-        guard context != .replay, advance(to: time), firstFrame == nil else { return }
+        guard context != .replay, advance(to: time) else { return }
+        stage = .playing
+        guard firstFrame == nil else { return }
         firstFrame = time - start
         if waiting { waitingSince = time }
     }
@@ -70,6 +93,7 @@ public struct PlaybackMeasurement: Sendable {
 
     public mutating func recordFailure(recovered: Bool, at time: Double) {
         guard advance(to: time) else { return }
+        lastFailureStage = stage
         failureCount += 1
         if recovered {
             recoveryCount += 1
@@ -95,7 +119,7 @@ public struct PlaybackMeasurement: Sendable {
         return Summary(id: id, context: context, outcome: outcome, recordedAt: recordedAt,
             durationSeconds: time - start, readySeconds: ready, firstFrameSeconds: firstFrame,
             rebufferCount: rebufferCount, rebufferSeconds: rebufferSeconds,
-            failureCount: failureCount, recoveryCount: recoveryCount)
+            failureCount: failureCount, recoveryCount: recoveryCount, route: route, lastFailureStage: lastFailureStage)
     }
 
     private mutating func advance(to time: Double) -> Bool {
