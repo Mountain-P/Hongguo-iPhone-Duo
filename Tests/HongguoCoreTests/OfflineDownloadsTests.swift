@@ -5,6 +5,91 @@ import Testing
 @testable import HongguoCore
 
 struct OfflineDownloadsTests {
+    @Test func seriesCardResumesLastViewedEpisodeThenAdvancesToTheNextAvailableDownload() async throws {
+        let directory = temporaryLibrary()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = try OfflineDownloads(directory: directory, provider: writeFixture)
+        let episodes = [episode(4), episode(2), episode(1)]
+        try await queue.enqueue(episodes)
+        try await wait { await queue.snapshot().allSatisfy { $0.state == .completed } }
+        func selection(_ library: OfflineDownloads) async -> Int? {
+            OfflineDownloadItem.nextToWatch(in: await library.snapshot())?.episodeNumber
+        }
+        #expect(await selection(queue) == 1)
+        try await queue.recordProgress(for: episode(1).key, position: 8, duration: 30)
+        try await queue.recordProgress(for: episode(2).key, position: 12, duration: 30)
+        #expect(await selection(queue) == 2)
+        let reopened = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await selection(reopened) == 2)
+        try await reopened.recordProgress(for: episode(2).key, position: 30, duration: 30)
+        #expect(await selection(reopened) == 4)
+        try await reopened.recordProgress(for: episode(4).key, position: 30, duration: 30)
+        #expect(await selection(reopened) == 1)
+
+        // The previous index had no watch dates. Its unfinished episode still resumes.
+        let manifest = directory.appendingPathComponent("index.json")
+        var index = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: manifest)) as? [String: Any])
+        var records = try #require(index["records"] as? [[String: Any]])
+        for i in records.indices {
+            var item = try #require(records[i]["item"] as? [String: Any])
+            item.removeValue(forKey: "lastWatchedAt")
+            records[i]["item"] = item
+        }
+        index["records"] = records
+        try JSONSerialization.data(withJSONObject: index).write(to: manifest)
+        let legacy = try OfflineDownloads(directory: directory, provider: writeFixture)
+        #expect(await selection(legacy) == 1)
+        try await legacy.recordProgress(for: episode(1).key, position: 30, duration: 30)
+        #expect(await selection(legacy) == 1)
+        #expect(OfflineDownloadItem.nextToWatch(in: [episode(3)]) == nil)
+    }
+
+    @Test(arguments: [OfflineDownloadState.completed, .cancelled, .failed])
+    func byteUpdatesAreCoalescedAndTerminalStatesReachObservers(_ terminal: OfflineDownloadState) async throws {
+        let directory = temporaryLibrary()
+        let transfer = ControlledOfflineTransfer(file: Data(repeating: 1, count: 128))
+        defer {
+            Task { await transfer.releaseAll() }
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let queue = try OfflineDownloads(directory: directory) { item, destination, maximum, progress in
+            try await transfer.download(item, destination, maximum, progress)
+        }
+        let item = episode(1)
+        try await queue.enqueue(item)
+        try await wait { await transfer.count == 1 }
+        let updates = await queue.updates()
+        let observer = Task {
+            var observed: [OfflineDownloadItem] = []
+            for await items in updates {
+                guard let current = items.first else { continue }
+                observed.append(current)
+                if current.state == terminal { break }
+            }
+            return observed
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        for bytes in 4...32 {
+            await transfer.report(Int64(bytes), total: 128)
+            try await Task.sleep(for: .milliseconds(3))
+        }
+        #expect(await queue.snapshot().first?.receivedBytes == 32)
+        // A quiet transfer must still deliver its last accumulated value.
+        try await Task.sleep(for: .milliseconds(320))
+        await transfer.report(33, total: 128)
+        switch terminal {
+        case .cancelled: try await queue.cancel(item.key)
+        case .failed: await transfer.report(Int64.max, total: nil)
+        default: await transfer.release(0)
+        }
+        let observed = await observer.value
+        #expect(observed.last?.state == terminal)
+        #expect(observed.contains { $0.state == .downloading && $0.receivedBytes == 32 })
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        #expect(observed.filter { $0.state == .downloading }.count <= Int(elapsed * 4) + 2)
+        await transfer.releaseAll()
+    }
+
     @Test func batchRetryPreservesCompletedAndActiveWorkAndOnlyRequeuesRequestedFailuresOnce() async throws {
         let directory = temporaryLibrary()
         let transfer = ControlledOfflineTransfer()
@@ -527,6 +612,11 @@ private enum OfflineTransferTestError: Error { case timedOut }
 
 private actor ControlledOfflineTransfer {
     static let complete = fixture
+    let file: Data
+    private var callback: OfflineDownloads.Progress?
+    init(file: Data = fixture) { self.file = file }
+    func report(_ bytes: Int64, total: Int64?) async { await callback?(bytes, total) }
+
     private struct Call {
         let key: OfflineDownloadKey
         let staging: URL
@@ -539,9 +629,10 @@ private actor ControlledOfflineTransfer {
     func key(at index: Int) -> OfflineDownloadKey { calls[index].key }
 
     func download(_ item: OfflineDownloadItem, _ destination: URL, _ maximum: Int64,
-                  _ progress: OfflineDownloads.Progress) async throws {
-        try Data(fixture.prefix(3)).write(to: destination)
-        await progress(3, 6)
+                  _ progress: @escaping OfflineDownloads.Progress) async throws {
+        callback = progress
+        try Data(file.prefix(3)).write(to: destination)
+        await progress(3, Int64(file.count))
         if !autoRelease {
             await withCheckedContinuation { completion in
                 let index = calls.count
@@ -550,8 +641,8 @@ private actor ControlledOfflineTransfer {
             }
         }
         // Even cancelled work finishes writing and reports progress, exercising the job token.
-        try Self.complete.write(to: destination)
-        await progress(6, 6)
+        try file.write(to: destination)
+        await progress(Int64(file.count), Int64(file.count))
     }
 
     func release(_ index: Int) { waiting.removeValue(forKey: index)?.resume() }

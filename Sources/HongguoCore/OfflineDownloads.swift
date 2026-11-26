@@ -32,6 +32,9 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
     private var offlineUnsupported: Bool?
     public fileprivate(set) var position: Double = 0
     public fileprivate(set) var duration: Double = 0
+    public fileprivate(set) var lastWatchedAt: Date?
+    public var isFinishedOffline: Bool { duration > 0 && position >= duration - 0.25 }
+    public var canResumeOffline: Bool { position > 0 && duration > 0 && !isFinishedOffline }
     public var id: OfflineDownloadKey { key }
     public var isOfflineUnsupported: Bool {
         // Older builds saved clear-only failures as unsupported. The episode can now be retried.
@@ -49,6 +52,28 @@ public struct OfflineDownloadItem: Identifiable, Equatable, Codable, Sendable {
         self.episodeTitle = episodeTitle
         self.position = position
         self.duration = duration
+    }
+
+    /// Select from one series. Older libraries have progress but no watch dates.
+    public static func nextToWatch(in episodes: [Self]) -> Self? {
+        let saved = episodes.filter { $0.state == .completed }.sorted {
+            ($0.episodeNumber, $0.key.episodeID) < ($1.episodeNumber, $1.key.episodeID)
+        }
+        let latest = saved.filter { $0.lastWatchedAt != nil && $0.position > 0 }.max {
+            ($0.lastWatchedAt ?? .distantPast) < ($1.lastWatchedAt ?? .distantPast)
+        }
+        if let latest {
+            if latest.canResumeOffline { return latest }
+            if let next = saved.first(where: { $0.episodeNumber > latest.episodeNumber && !$0.isFinishedOffline }) {
+                return next
+            }
+        }
+        if let unfinished = saved.first(where: \.canResumeOffline) { return unfinished }
+        if latest == nil, let finished = saved.last(where: \.isFinishedOffline),
+           let next = saved.first(where: { $0.episodeNumber > finished.episodeNumber && !$0.isFinishedOffline }) {
+            return next
+        }
+        return saved.first(where: { !$0.isFinishedOffline }) ?? saved.first
     }
 
     fileprivate mutating func resetTransfer(to state: OfflineDownloadState, failure: String? = nil,
@@ -137,6 +162,8 @@ public actor OfflineDownloads {
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (Duration) async throws -> Void
     private var isImporting = false
+    private var nextProgressPublication = ContinuousClock.now
+    private var progressPublication: Task<Void, Never>?
     private var observers: [UUID: AsyncStream<[OfflineDownloadItem]>.Continuation] = [:]
 
     public init(directory: URL, limits: Limits = .init(), provider: @escaping Provider) throws {
@@ -158,6 +185,7 @@ public actor OfflineDownloads {
     deinit {
         job?.task.cancel()
         cooldown?.task.cancel()
+        progressPublication?.cancel()
         for observer in observers.values { observer.finish() }
     }
 
@@ -335,6 +363,7 @@ public actor OfflineDownloads {
         var updated = records
         updated[index].item.position = position
         updated[index].item.duration = duration
+        updated[index].item.lastWatchedAt = now()
         try commit(updated)
     }
 
@@ -437,7 +466,7 @@ public actor OfflineDownloads {
                 return
             }
         }
-        publish()
+        publishProgress()
     }
 
     private func finish(token: UUID, destination: URL, result: Result<Data, any Error>) {
@@ -580,7 +609,27 @@ public actor OfflineDownloads {
         publish()
     }
 
+    private func publishProgress() {
+        guard !observers.isEmpty, progressPublication == nil else { return }
+        let deadline = nextProgressPublication
+        guard ContinuousClock.now < deadline else { publish(); return }
+        progressPublication = Task { [weak self] in
+            do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+            await self?.flushPendingProgress()
+        }
+    }
+
+    private func flushPendingProgress() {
+        guard !Task.isCancelled else { return }
+        publish()
+    }
+
     private func publish() {
+        // State changes publish immediately, including the newest byte count.
+        progressPublication?.cancel()
+        progressPublication = nil
+        guard !observers.isEmpty else { return }
+        nextProgressPublication = ContinuousClock.now.advanced(by: .milliseconds(250))
         let items = snapshot()
         for observer in observers.values { observer.yield(items) }
     }
