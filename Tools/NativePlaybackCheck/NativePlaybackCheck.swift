@@ -46,8 +46,11 @@ enum NativePlaybackCheck {
         do {
             let service = NativeCatalogService(quality: quality)
             let detail = try await service.detail(id: arguments[0])
-            guard let episode = detail.episodes.first(where: { $0.number == number }) else { throw CatalogError.invalidID }
-            print("catalogueEpisodes=\(detail.episodes.count) selected=\(episode.number)")
+            let total = detail.reportedEpisodeCount ?? detail.episodes.count
+            print("reportedEpisodes=\(total) catalogueEpisodes=\(detail.episodes.count) websiteListed=\(detail.websiteEpisodes?.count ?? 0) requested=\(number)")
+            guard let episode = detail.episodes.first(where: { $0.number == number && $0.isAvailable }) else {
+                throw CatalogError.unavailablePlayback
+            }
             let started = Date()
             let source = try await service.playback(seriesID: detail.series.id, episodeID: episode.id, fresh: true)
             let preparedSeconds = Date().timeIntervalSince(started)

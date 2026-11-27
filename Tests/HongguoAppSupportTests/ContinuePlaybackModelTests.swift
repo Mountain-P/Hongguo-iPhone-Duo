@@ -46,6 +46,58 @@ struct ContinuePlaybackModelTests {
         #expect(launcher.route?.continuation.seconds == 0)
     }
 
+    @Test(arguments: [true, false]) func websiteOnlyDetailResumesTheMatchingLegacyFileAtTheSavedPosition(hasWebsiteEpisodes: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let saved = record(id: "902", number: 3, seconds: 46)
+        let access = try await legacyDownload(saved, in: directory)
+        #expect(await access.detail(for: saved) == nil)
+        let service = ContinueServiceProbe(immediateDetails: [1: try websiteOnlyDetail(hasWebsiteEpisodes)], offlinePlayback: access)
+        let launcher = ContinuePlaybackModel(), box = ContinueBox(record: saved)
+        launch(launcher, service: service, box: box)
+        let operation = try #require(launcher.operation)
+        await operation.value
+        let route = try #require(launcher.route)
+        #expect(route.detail.series.id == saved.series.id)
+        #expect(route.continuation.episode.id == saved.episode.id && route.continuation.seconds == 46)
+        #expect(await service.detailCalls == 1 && box.factories == 1)
+    }
+
+    @Test func websiteOnlyDetailDoesNotSubstituteAnotherEpisodeAccountOrMissingFile() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let saved = record(id: "902", number: 3, seconds: 46)
+        let access = try await legacyDownload(saved, in: directory)
+        let source = try #require(await access.source(seriesID: saved.series.id, episodeID: saved.episode.id))
+        let online = try websiteOnlyDetail()
+        let service = ContinueServiceProbe(immediateDetails: [1: online, 2: online, 3: online], offlinePlayback: access)
+
+        let anotherID = ContinueBox(record: record(id: "999", number: 3))
+        let anotherOwner = ContinueBox(record: saved)
+        anotherOwner.context = .init(owner: .account(id: "different-owner"), revision: UUID(), sceneActive: true)
+        let missingFile = ContinueBox(record: saved)
+        for box in [anotherID, anotherOwner, missingFile] {
+            if box === missingFile { try FileManager.default.removeItem(at: source.url) }
+            let launcher = ContinuePlaybackModel()
+            launch(launcher, service: service, box: box)
+            let operation = try #require(launcher.operation)
+            await operation.value
+            #expect(launcher.route == nil && box.factories == 0 && !launcher.canRetry)
+            #expect(launcher.errorMessage?.contains("劇集詳情") == true)
+        }
+        #expect(await service.videoCalls == 0)
+    }
+
+    @Test func emptyWebsiteListWithoutADownloadExplainsThereAreNoEpisodes() async throws {
+        let service = ContinueServiceProbe(immediateDetails: [1: try websiteOnlyDetail(false)])
+        let launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
+        launch(launcher, service: service, box: box)
+        let operation = try #require(launcher.operation)
+        await operation.value
+        #expect(launcher.route == nil && !launcher.canRetry && box.factories == 0)
+        #expect(launcher.errorMessage?.contains("尚未列出") == true)
+    }
+
     @Test func deletingTheRecordDuringPreparationDoesNotSilentlyTurnContinueIntoEpisodeOne() async throws {
         let service = ContinueServiceProbe(), launcher = ContinuePlaybackModel(), box = ContinueBox(record: record())
         launch(launcher, service: service, box: box)
@@ -557,6 +609,27 @@ struct ContinuePlaybackModelTests {
         .init(seriesID: "100", episodeID: episodeID, position: position, duration: 90)
     }
 
+    private func websiteOnlyDetail(_ hasEpisodes: Bool = true) throws -> SeriesDetail {
+        let page = try #require(WebsiteEpisode(token: "v1_fixture_page", number: 3))
+        return .init(series: .init(id: "100", title: "Fixture"), episodes: [], websiteEpisodes: hasEpisodes ? [page] : [])
+    }
+
+    private func legacyDownload(_ saved: WatchRecord, in directory: URL) async throws -> OfflinePlaybackAccess {
+        let scope = OfflinePlaybackAccess.scope(for: .guest)
+        let store = try OfflineDownloads(directory: directory) { _, destination, _, _ in
+            try Data([1, 2, 3, 4]).write(to: destination)
+        }
+        let entry = OfflineDownloadItem(key: .init(scope: scope, seriesID: saved.series.id, episodeID: saved.episode.id),
+                                        seriesTitle: saved.series.title, episodeNumber: saved.episode.number)
+        try await store.enqueue(entry)
+        for _ in 0..<300 {
+            if await store.snapshot().first?.state == .completed { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(await store.snapshot().first?.state == .completed)
+        return OfflinePlaybackAccess(scope: scope) { store }
+    }
+
     private func launch(_ launcher: ContinuePlaybackModel, seriesID: String = "100", service: ContinueServiceProbe,
                         box: ContinueBox, requiresRecord: Bool = true, selection: ContinuePlaybackSelection = .preferred) {
         launcher.start(series: .init(id: seriesID, title: "Fixture"), requiresRecord: requiresRecord, selection: selection, context: box.context,
@@ -592,12 +665,16 @@ private final class ContinueBox {
 }
 
 private actor ContinueServiceProbe: CatalogService {
+    nonisolated let offlinePlayback: OfflinePlaybackAccess?
     private(set) var detailCalls = 0
     private(set) var videoCalls = 0
     private var gates: [String: CheckedContinuation<SeriesDetail, any Error>] = [:]
     private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private let immediateDetails: [Int: SeriesDetail]
-    init(immediateDetails: [Int: SeriesDetail] = [:]) { self.immediateDetails = immediateDetails }
+    init(immediateDetails: [Int: SeriesDetail] = [:], offlinePlayback: OfflinePlaybackAccess? = nil) {
+        self.immediateDetails = immediateDetails
+        self.offlinePlayback = offlinePlayback
+    }
 
     func detail(id: String) async throws -> SeriesDetail {
         detailCalls += 1

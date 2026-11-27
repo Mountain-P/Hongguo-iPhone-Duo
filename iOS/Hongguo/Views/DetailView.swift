@@ -21,6 +21,7 @@ private struct DownloadSelection: Identifiable {
 struct DetailView: View {
     let series: Series
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var downloads: OfflineDownloadModel
     @State private var detail: SeriesDetail?
     @State private var error: String?
     @State private var refreshFailed = false
@@ -28,6 +29,8 @@ struct DetailView: View {
     @State private var loadID = UUID()
     @State private var lastLoadedKey = ""
     @State private var route: PlaybackRoute?
+    @State private var openingDownload = false
+    @State private var downloadError: String?
     @State private var loadedService: (any CatalogService)?
     @State private var showingPlaybackSetup = false
     @State private var downloadSelection: DownloadSelection?
@@ -45,6 +48,12 @@ struct DetailView: View {
     private var current: Series { hasCurrentSnapshot ? detail?.series ?? series : series }
     private var discovery: SeriesDiscoveryMetadata? { hasCurrentSnapshot ? detail?.discovery : nil }
     private var loadKey: String { "\(series.id):\(model.revision.uuidString):\(model.downloads.scope)" }
+    private var offlineStart: OfflineDownloadItem? {
+        guard loadedService?.usesHongguoWebsiteCatalog ?? (model.catalogSource == .website) else { return nil }
+        return OfflineDownloadItem.nextToWatch(in: downloads.items.filter {
+            $0.key.scope == downloads.scope && $0.key.seriesID == series.id
+        })
+    }
     private var related: [Series] {
         var seen: Set<String> = [series.id]
         return (discovery?.related ?? []).filter { seen.insert($0.id).inserted }
@@ -61,9 +70,24 @@ struct DetailView: View {
                             .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 8)
                     }.buttonStyle(.borderedProminent).controlSize(.large)
                 }
-                if !model.isPlaybackConfigured {
-                    StatusCard(icon: "play.rectangle", title: "設定播放服務後開始觀看",
-                               message: "官網目錄可以用來找劇；App 會向播放服務確認完整分集與取源結果，不使用網頁預覽的集數限制。",
+                if hasCurrentSnapshot, let detail, let entries = detail.websiteEpisodes,
+                   usesOfficialCatalog {
+                    websiteEpisodes(entries, detail: detail)
+                }
+                if let item = offlineStart {
+                    Button {
+                        Task { await playDownloaded(item) }
+                    } label: {
+                        Label(item.canResumeOffline ? "續看已下載的第 \(item.episodeNumber) 集" : "播放已下載的第 \(item.episodeNumber) 集",
+                              systemImage: "play.circle.fill")
+                    }
+                    .buttonStyle(.bordered).disabled(openingDownload)
+                    .accessibilityIdentifier("detail.playDownloaded")
+                    if let downloadError { Text(downloadError).font(.footnote).foregroundStyle(Theme.muted) }
+                }
+                if !model.isPlaybackConfigured, model.catalogSource == .bridge {
+                    StatusCard(icon: "play.rectangle", title: "設定自訂播放服務",
+                               message: "輸入你的服務網址，即可取得該服務提供的劇集。",
                                actionTitle: "設定播放服務", action: { showingPlaybackSetup = true })
                 }
                 if let discovery { sourceFacts(discovery) }
@@ -82,11 +106,13 @@ struct DetailView: View {
                         Button("播放設定") { showingPlaybackSetup = true }.buttonStyle(.bordered)
                     }
                 }
-                if let detail, hasCurrentSnapshot, loadedService != nil { episodeSection(detail, scroll: scroll) }
+                if let detail, hasCurrentSnapshot, loadedService != nil, detail.episodes.contains(where: \.isAvailable) {
+                    episodeSection(detail, scroll: scroll)
+                }
                 if !related.isEmpty { relatedSection }
-                if let url = URL(string: "https://hongguoduanju.com/player/\(series.id)") {
-                    Link(destination: url) { Label("在紅果官網開啟", systemImage: "arrow.up.right.square").font(.subheadline) }
-                        .padding(.top, 8)
+                if usesOfficialCatalog, detail?.websiteEpisodes == nil,
+                   let url = WebsiteEpisode.seriesURL(seriesID: series.id) {
+                    Link(destination: url) { Label("在紅果官網開啟劇頁", systemImage: "arrow.up.right.square").font(.subheadline) }
                 }
             }.padding(20)
         }
@@ -147,7 +173,9 @@ struct DetailView: View {
                 if !current.tags.isEmpty {
                     Text(current.tags.joined(separator: " · ")).font(.caption).foregroundStyle(Theme.muted)
                 }
-                if let detail, hasCurrentSnapshot { Text("共 \(detail.episodes.count) 集").font(.caption).foregroundStyle(Theme.muted) }
+                if let detail, hasCurrentSnapshot, detail.websiteEpisodes == nil, !detail.episodes.isEmpty {
+                    Text("已列出 \(detail.episodes.count) 集").font(.caption).foregroundStyle(Theme.muted)
+                }
                 Button {
                     guard hasCurrentSnapshot else { return }
                     model.toggleFavorite(current)
@@ -157,6 +185,37 @@ struct DetailView: View {
                 }.buttonStyle(.bordered).controlSize(.large)
                     .disabled(!hasCurrentSnapshot)
             }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var usesOfficialCatalog: Bool {
+        if let loadedService { return loadedService.usesHongguoWebsiteCatalog }
+        return model.catalogSource == .website && !model.isPlaybackConfigured && hasCurrentSnapshot
+    }
+
+    private func websiteEpisodes(_ entries: [WebsiteEpisode], detail: SeriesDetail) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("官網選集", systemImage: "safari").font(.headline)
+            let availability = entries.isEmpty ? "官網目前沒有公開分集連結" : "官網目前列出 \(entries.count) 集"
+            Text(detail.reportedEpisodeCount.map { "全劇 \($0) 集，\(availability)" } ?? availability)
+                .font(.subheadline).foregroundStyle(Theme.muted)
+            if entries.isEmpty, let url = WebsiteEpisode.seriesURL(seriesID: detail.series.id) {
+                Link(destination: url) { Label("在紅果官網開啟劇頁", systemImage: "arrow.up.right.square") }
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 84), spacing: 10)], alignment: .leading, spacing: 10) {
+                ForEach(entries, id: \.number) { entry in
+                    if let url = entry.url(seriesID: detail.series.id) {
+                        Link(destination: url) {
+                            Label("第 \(entry.number) 集", systemImage: "arrow.up.right")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                                .background(Theme.surface, in: RoundedRectangle(cornerRadius: 10))
+                        }
+                        .accessibilityLabel("在紅果官網開啟第 \(entry.number) 集")
+                        .accessibilityIdentifier("detail.websiteEpisode.\(entry.number)")
+                    }
+                }
+            }
         }
     }
 
@@ -221,7 +280,6 @@ struct DetailView: View {
                 Spacer()
                 Text("\(detail.episodes.count) 集").font(.caption2).foregroundStyle(Theme.muted)
             }
-            if detail.episodes.isEmpty { Text("來源尚未提供分集資料。").font(.subheadline).foregroundStyle(Theme.muted) }
             if loadedService is NativeCatalogService, detail.episodes.contains(where: \.isAvailable) {
                 Button { downloadSelection = DownloadSelection(detail: detail) } label: {
                     Label("選集下載", systemImage: "arrow.down.circle")
@@ -365,6 +423,7 @@ struct DetailView: View {
         locationTask?.cancel(); locationTask = nil
         episodeJumpFocused = false
         if !keepSnapshot {
+            downloadError = nil
             episodeIndex = nil; selectedEpisodeGroupID = nil; locatedEpisodeID = nil
             episodeJumpText = ""; episodeJumpMessage = nil
             dismissPlayback(); loadedService = nil; detail = nil
@@ -411,6 +470,26 @@ struct DetailView: View {
         }
         if let locatedEpisodeID, episodeIndex?.group(containing: locatedEpisodeID) == nil {
             self.locatedEpisodeID = nil; episodeJumpMessage = nil
+        }
+    }
+
+    private func playDownloaded(_ item: OfflineDownloadItem) async {
+        guard !openingDownload else { return }
+        let key = loadKey
+        openingDownload = true
+        downloadError = nil
+        defer { openingDownload = false }
+        let saved = await downloads.playback(item, continuingSeries: true)
+        guard key == loadKey, route == nil else { return }
+        guard let saved, let episode = saved.detail.episodes.first(where: { $0.id == saved.episodeID }) else {
+            downloadError = downloads.error ?? "無法開啟這一集的離線檔案。"
+            return
+        }
+        let updateHistory = model.playbackProgressHandler(for: current)
+        route = PlaybackRoute(detail: saved.detail, episode: episode, seconds: saved.resume, service: saved.service) {
+            episode, seconds, duration in
+            saved.onProgress(episode, seconds, duration)
+            updateHistory(episode, seconds, duration)
         }
     }
 

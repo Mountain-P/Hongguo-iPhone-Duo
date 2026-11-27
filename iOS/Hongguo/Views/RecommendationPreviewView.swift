@@ -457,8 +457,17 @@ struct RecommendationPreviewView: View {
             Spacer()
             if preview.loadingID == series.id { ProgressView("正在準備第 1 集…").tint(.white) }
             if let error = preview.detailErrors[series.id] {
-                Text(error).font(.footnote)
-                Button("重試第一集") { preview.retry(seriesID: series.id) }.buttonStyle(.bordered)
+                switch error {
+                case .website(let firstEpisode):
+                    if let firstEpisode {
+                        Link("在紅果官網試看第 1 集", destination: firstEpisode).buttonStyle(.bordered)
+                    } else {
+                        Text("官網目前沒有列出第 1 集的試看連結。").font(.footnote)
+                    }
+                case .failed(let message):
+                    Text(message).font(.footnote)
+                    Button("重試第一集") { preview.retry(seriesID: series.id) }.buttonStyle(.bordered)
+                }
             }
             Text(series.title).font(.title3.weight(.semibold)).lineLimit(3)
             if let source = preview.sourceLabelByID[series.id] {

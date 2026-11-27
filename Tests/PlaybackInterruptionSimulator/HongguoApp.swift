@@ -18,7 +18,14 @@ struct HongguoApp: App {
 
     var body: some Scene {
         WindowGroup {
-            if HistoryOfflineQA.offline {
+            if let index = CommandLine.arguments.firstIndex(of: "qa-catalog-detail"),
+               let seriesID = CommandLine.arguments.dropFirst(index + 1).first {
+                NavigationStack { DetailView(series: Series(id: seriesID, title: "")) }
+                    .environmentObject(app)
+                    .environmentObject(app.downloads)
+                    .preferredColorScheme(.dark)
+                    .tint(Theme.accent)
+            } else if HistoryOfflineQA.offline {
                 ZStack { NavigationStack { LibraryView().environmentObject(app).environmentObject(app.downloads) } }
                     .task {
                         do { try await HistoryOfflineQA.observe() }

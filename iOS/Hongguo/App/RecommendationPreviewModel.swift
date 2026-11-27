@@ -14,6 +14,15 @@ struct RecommendationFeedMedia: Identifiable, Sendable {
 }
 
 
+enum PreviewPreparationIssue: Error {
+    case website(firstEpisode: URL?)
+    case failed(String)
+
+    init(_ error: any Error) {
+        self = (error as? Self) ?? .failed(error.localizedDescription)
+    }
+}
+
 @MainActor
 final class RecommendationPreviewModel: ObservableObject {
     @Published private(set) var queue = RecommendationPreviewQueue()
@@ -24,7 +33,7 @@ final class RecommendationPreviewModel: ObservableObject {
     private var rankingProfile: PersonalizedRecommendationProfile?
     @Published private(set) var lease: RecommendationFeedActivation.Lease?
     @Published private(set) var loadingID: String?
-    @Published private(set) var detailErrors: [String: String] = [:]
+    @Published private(set) var detailErrors: [String: PreviewPreparationIssue] = [:]
     @Published private(set) var isLoadingPage = false
     @Published private(set) var pageError: String?
     private(set) var revision: UUID?
@@ -284,7 +293,7 @@ final class RecommendationPreviewModel: ObservableObject {
             joined = try acquireMetadata(seriesID: lease.seriesID, service: playback, priority: .userInitiated)
             activeMetadataOwner = joined
         } catch {
-            loadingID = nil; detailErrors[lease.seriesID] = error.localizedDescription
+            loadingID = nil; detailErrors[lease.seriesID] = PreviewPreparationIssue(error)
             return
         }
         detailTask = Task { [weak self] in
@@ -309,7 +318,7 @@ final class RecommendationPreviewModel: ObservableObject {
             } catch is CancellationError { return }
             catch {
                 if self.activation.accepts(lease), self.detailGeneration == request, !Task.isCancelled {
-                    self.detailErrors[lease.seriesID] = error.localizedDescription
+                    self.detailErrors[lease.seriesID] = PreviewPreparationIssue(error)
                 }
             }
         }
@@ -451,6 +460,14 @@ final class RecommendationPreviewModel: ObservableObject {
             if let bridge = service as? BridgeService { detail = try await bridge.verifiedDetail(id: seriesID) }
             else { detail = try await service.detail(id: seriesID) }
             try Task.checkCancellation()
+            if detail.series.id == seriesID, detail.episodes.isEmpty, let listed = detail.websiteEpisodes {
+                if let offline = service.offlinePlayback, let saved = await offline.fallbackDetail(seriesID: seriesID),
+                   let first = try? RecommendationPreviewQueue.firstEpisode(in: saved, expectedSeriesID: seriesID),
+                   await offline.source(seriesID: seriesID, episodeID: first.id) != nil {
+                    return RecommendationFeedMedia(series: detail.series, episode: first, service: service)
+                }
+                throw PreviewPreparationIssue.website(firstEpisode: listed.first { $0.number == 1 }?.url(seriesID: seriesID))
+            }
             let episode = try RecommendationPreviewQueue.firstEpisode(in: detail, expectedSeriesID: seriesID)
             return RecommendationFeedMedia(series: detail.series, episode: episode, service: service)
         }

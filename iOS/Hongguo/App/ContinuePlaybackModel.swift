@@ -68,12 +68,14 @@ struct ContinuePlaybackRoute: Identifiable {
 }
 
 private enum ContinuePlaybackError: Error, LocalizedError, Equatable {
-    case recordRemoved, recordChanged, preparationTimedOut
+    case recordRemoved, recordChanged, preparationTimedOut, websiteEpisodesOnly, noWebsiteEpisodes
     var errorDescription: String? {
         switch self {
         case .recordRemoved: "這筆觀看紀錄已移除，請從劇集詳情選擇播放。"
         case .recordChanged: "觀看紀錄已變更，請重新選擇播放位置。"
         case .preparationTimedOut: "劇集準備逾時，請重試。"
+        case .websiteEpisodesOnly: "這部劇目前只能從官網選集。請打開劇集詳情，選擇要看的集數。"
+        case .noWebsiteEpisodes: "官網尚未列出這部劇的集數，目前也沒有可續播的下載。"
         }
     }
 }
@@ -117,6 +119,21 @@ final class ContinuePlaybackModel: ObservableObject {
         let currentContext: @MainActor () -> ContinuePlaybackContext
         let latestRecord: @MainActor () -> WatchRecord?
         let progressFactory: @MainActor (SeriesDetail) -> ProgressHandler
+
+        var offlinePlayback: OfflinePlaybackAccess? {
+            guard let access = service.offlinePlayback, access.scope == OfflinePlaybackAccess.scope(for: context.owner) else { return nil }
+            return access
+        }
+
+        @MainActor
+        func legacyDownload() async -> (detail: SeriesDetail, episodeID: String)? {
+            guard selection == .preferred, let record = latestRecord(), record.series.id == series.id,
+                  let access = offlinePlayback,
+                  let saved = await access.fallbackDetail(seriesID: series.id, continuing: record),
+                  let target = PlaybackContinuation.preferred(seriesID: series.id, episodes: saved.episodes, record: record),
+                  await access.source(seriesID: series.id, episodeID: target.episode.id) != nil else { return nil }
+            return (saved, target.episode.id)
+        }
     }
     private struct PendingPreview {
         let request: UUID
@@ -184,22 +201,28 @@ final class ContinuePlaybackModel: ObservableObject {
             // Do not retain the model across an uncooperative transport suspension.
             defer { self?.finish(request: request) }
             do {
-                let detail: SeriesDetail
+                var detail: SeriesDetail
+                var verifiedEpisodeID: String?
                 if intent.selection == .preferred, let record = intent.latestRecord(), record.series.id == intent.series.id,
-                   let saved = await intent.service.offlinePlayback?.detail(for: record) {
+                   let saved = await intent.offlinePlayback?.detail(for: record) {
                     detail = saved
                 } else {
                     do { detail = try await loader(intent.service, intent.series.id) }
                     catch {
                         try Task.checkCancellation()
                         guard intent.selection == .preferred, PlaybackRecovery.shouldRetry(error, attempt: 0),
-                              let saved = await intent.service.offlinePlayback?.fallbackDetail(seriesID: intent.series.id,
+                              let saved = await intent.offlinePlayback?.fallbackDetail(seriesID: intent.series.id,
                                   continuing: intent.latestRecord()) else { throw error }
                         detail = saved
                     }
+                    if detail.series.id == intent.series.id, detail.episodes.isEmpty, detail.websiteEpisodes != nil,
+                       let download = await intent.legacyDownload() {
+                        detail = download.detail
+                        verifiedEpisodeID = download.episodeID
+                    }
                 }
                 try Task.checkCancellation()
-                try self?.accept(detail: detail, intent: intent, request: request)
+                try self?.accept(detail: detail, intent: intent, request: request, verifiedEpisodeID: verifiedEpisodeID)
             } catch is CancellationError { self?.discardCancelled(request: request) }
             catch {
                 self?.recordFailure(error, intent: intent, request: request)
@@ -218,11 +241,14 @@ final class ContinuePlaybackModel: ObservableObject {
             && intent.currentContext() == intent.context
     }
 
-    private func accept(detail: SeriesDetail, intent: LaunchIntent, request: UUID) throws {
+    private func accept(detail: SeriesDetail, intent: LaunchIntent, request: UUID, verifiedEpisodeID: String?) throws {
         guard accepts(intent, request: request) else { discardCancelled(request: request); return }
         guard detail.series.id == intent.series.id else { throw CatalogError.malformedResponse }
         let record = intent.latestRecord()
         if intent.requiresRecord, record?.series.id != intent.series.id { throw ContinuePlaybackError.recordRemoved }
+        if detail.episodes.isEmpty, let pages = detail.websiteEpisodes {
+            throw pages.isEmpty ? ContinuePlaybackError.noWebsiteEpisodes : ContinuePlaybackError.websiteEpisodesOnly
+        }
         if case .preview(let snapshot) = intent.selection {
             guard snapshot.seriesID == intent.series.id, let preview = snapshot.continuation(in: detail) else {
                 throw CatalogError.unavailablePlayback
@@ -240,6 +266,10 @@ final class ContinuePlaybackModel: ObservableObject {
         }
         guard let continuation = PlaybackContinuation.preferred(seriesID: intent.series.id, episodes: detail.episodes, record: record) else {
             throw CatalogError.unavailablePlayback
+        }
+        if let verifiedEpisodeID, record?.series.id != intent.series.id
+            || !detail.episodes.contains(where: { $0.id == record?.episode.id }) || continuation.episode.id != verifiedEpisodeID {
+            throw ContinuePlaybackError.recordChanged
         }
         // No suspension between the live context check and capturing the original-scope handler.
         present(detail: detail, continuation: continuation, service: intent.service, progressFactory: intent.progressFactory)

@@ -3,6 +3,12 @@ import HongguoCore
 import SwiftUI
 import UIKit
 
+extension CatalogService {
+    var usesHongguoWebsiteCatalog: Bool {
+        self is NativeCatalogService || self is DirectWebService || (self as? HomeRelayService)?.usesServerLibrary == false
+    }
+}
+
 @MainActor
 struct PlayerScreen: View {
     @Environment(\.dismiss) private var dismiss
@@ -15,6 +21,7 @@ struct PlayerScreen: View {
     private let onClose: (() -> Void)?
     private let onSeriesSwipe: ((Int) -> Void)?
     private let isPreview: Bool
+    private let websiteSeriesURL: URL?
     private let playbackSession: PlaybackRouteSession?
     private let onOpenSeries: (() -> Void)?
     private let onTransitionFrameConsumed: ((UUID) -> Void)?
@@ -53,6 +60,7 @@ struct PlayerScreen: View {
         self.onClose = onClose
         self.onSeriesSwipe = onSeriesSwipe
         self.isPreview = isPreview
+        self.websiteSeriesURL = service.usesHongguoWebsiteCatalog ? WebsiteEpisode.seriesURL(seriesID: series.id) : nil
         self.playbackSession = session
         self.onOpenSeries = onOpenSeries
         self.onTransitionFrameConsumed = onTransitionFrameConsumed
@@ -687,7 +695,14 @@ struct PlayerScreen: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Theme.accent)
                 if !isPreview {
-                    Button("選擇其他集數", action: presentEpisodePicker).buttonStyle(.bordered)
+                    if let websiteSeriesURL {
+                        Link(destination: websiteSeriesURL) { Label("在紅果官網開啟劇頁", systemImage: "arrow.up.right.square") }
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("player.openWebsite")
+                    }
+                    if model.episodes.count > 1 {
+                        Button("選擇其他集數", action: presentEpisodePicker).buttonStyle(.bordered)
+                    }
                 }
             }
             .padding(24)

@@ -201,22 +201,12 @@ struct NativeCatalogEntry: Sendable {
 enum NativeCatalogParser {
     static func detail(html: String, seriesID: String) throws -> NativeCatalogEntry {
         let payload = try WebsiteParser.seriesPayload(html: html, seriesID: seriesID)
-        guard let raw = payload["vid_list"] as? [Any], !raw.isEmpty, raw.count <= 5000 else {
-            throw CatalogError.malformedResponse
-        }
-        let ids = raw.map { string($0) }
-        try ids.forEach(validateID)
-        guard Set(ids).count == ids.count else { throw CatalogError.malformedResponse }
         let contentType = payload["content_type"].map { string($0) } ?? "1004"
         guard (1...16).contains(contentType.utf8.count), contentType.utf8.allSatisfy({ (48...57).contains($0) }) else {
             throw CatalogError.malformedResponse
         }
-        let series = try WebsiteParser.card(payload)
-        // accessible_episode_cnt describes the website preview, not the native model endpoint.
-        // Request-time denials from the source are still terminal and propagate to the player.
-        let episodes = ids.enumerated().map { Episode(id: $0.element, number: $0.offset + 1, title: "第 \($0.offset + 1) 集") }
-        let discovery = try? ArtistDiscoveryParser.metadata(html: html, seriesID: seriesID)
-        return NativeCatalogEntry(detail: SeriesDetail(series: series, episodes: episodes, discovery: discovery), contentType: contentType)
+        let detail = try WebsiteParser.episodeDetail(payload, html: html, seriesID: seriesID, native: true)
+        return NativeCatalogEntry(detail: detail, contentType: contentType)
     }
 }
 

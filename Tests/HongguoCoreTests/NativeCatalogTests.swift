@@ -189,6 +189,69 @@ struct NativeCatalogTests {
     }
 
     @Test
+    func websiteLocatorsStaySeparateFromNativeIDsAndAreLimitedToListedEntries() throws {
+        let tokens = ["v1_aB-1", "v1_c2_d", "v1_E3"]
+        let html = try nativeCatalogueHTML(episodes: tokens, accessible: 2, reported: 91)
+        for detail in [try NativeCatalogParser.detail(html: html, seriesID: "100").detail,
+                       try WebsiteParser.detail(html: html, seriesID: "100")] {
+            #expect(detail.series.id == "100" && detail.reportedEpisodeCount == 91)
+            #expect(detail.episodes.isEmpty)
+            let listed = try #require(detail.websiteEpisodes)
+            #expect(listed.map(\.number) == [1, 2])
+            #expect(listed.map(\.token) == Array(tokens.prefix(2)))
+            #expect(listed.map { $0.url(seriesID: "100")?.absoluteString } == [
+                "https://hongguoduanju.com/player/100", "https://hongguoduanju.com/player/100/v1_c2_d"
+            ])
+            #expect(listed.first?.url(seriesID: "../malformed") == nil)
+            #expect(try JSONDecoder().decode(SeriesDetail.self, from: JSONEncoder().encode(detail)) == detail)
+        }
+        let onlyListed = try nativeCatalogueHTML(episodes: tokens, accessible: 10, reported: 91)
+        #expect(try WebsiteParser.detail(html: onlyListed, seriesID: "100").websiteEpisodes?.count == 3)
+        let none = try nativeCatalogueHTML(episodes: [], accessible: 0, reported: 91)
+        for detail in [try NativeCatalogParser.detail(html: none, seriesID: "100").detail,
+                       try WebsiteParser.detail(html: none, seriesID: "100")] {
+            #expect(detail.websiteEpisodes == [] && detail.reportedEpisodeCount == 91 && detail.episodes.isEmpty)
+        }
+        let legacy = try JSONDecoder().decode(SeriesDetail.self, from: JSONEncoder().encode(
+            SeriesDetail(series: .init(id: "100", title: "示範"), episodes: [.init(id: "200", number: 1, title: "第一集")])))
+        #expect(legacy.websiteEpisodes == nil && legacy.reportedEpisodeCount == nil)
+    }
+
+    @Test
+    func websiteOnlyCatalogueCannotDispatchPublicTokensOrOldIDsToNativeResolver() async throws {
+        let transport = NativeCatalogueTransport(body: try nativeCatalogueHTML(episodes: ["v1_1", "v1_2"], accessible: 2, reported: 91))
+        let recorder = NativePreparationRecorder()
+        let service = NativeCatalogService(transport: transport) { episodeID, contentType, fresh in
+            await recorder.prepare(episodeID: episodeID, contentType: contentType, fresh: fresh)
+        }
+        #expect(try await service.detail(id: "100").websiteEpisodes?.count == 2)
+        for id in ["v1_2", "999"] {
+            await #expect(throws: CatalogError.invalidID) { try await service.playback(seriesID: "100", episodeID: id, fresh: false) }
+        }
+        #expect(await recorder.calls.isEmpty)
+    }
+
+    @Test
+    func rejectsMalformedOrMixedWebsiteLocatorsRatherThanPassingThemToEitherPlayer() throws {
+        let rejected = [["v1_"], ["v1_a/b"], [" v1_a"], ["v1_a%2Fb"], ["v1_a?b"], ["v1_😀"], ["v1_" + String(repeating: "x", count: 510)],
+                        ["v1_a", "200"], ["200", "v1_a"], ["v1_a", "v1_a"]]
+        for tokens in rejected {
+            let html = try nativeCatalogueHTML(episodes: tokens)
+            #expect(throws: (any Error).self) { try NativeCatalogParser.detail(html: html, seriesID: "100") }
+            #expect(throws: (any Error).self) { try WebsiteParser.detail(html: html, seriesID: "100") }
+        }
+        for html in [try nativeCatalogueHTML(episodes: ["v1_a"], accessible: -1), try nativeCatalogueHTML(episodes: ["v1_a"], reported: 0),
+                     try nativeCatalogueHTML(episodes: ["v1_a"], reported: 5001)] {
+            #expect(throws: CatalogError.malformedResponse) { try WebsiteParser.detail(html: html, seriesID: "100") }
+        }
+        #expect(WebsiteEpisode(token: "v1_x", number: 0) == nil)
+        #expect(WebsiteEpisode.seriesURL(seriesID: "https://example.com") == nil)
+        #expect(throws: (any Error).self) {
+            try JSONDecoder().decode(WebsiteEpisode.self, from: Data(#"{"token":"v1_bad/../path","number":1}"#.utf8))
+        }
+    }
+
+    @Test
     func completeNativeListDoesNotUseWebsitePreviewCount() throws {
         let html = try nativeCatalogueHTML(episodes: ["200", "201", "202", "203"], accessible: 1)
         let native = try NativeCatalogParser.detail(html: html, seriesID: "100")
@@ -430,8 +493,8 @@ struct NativeCatalogTests {
 }
 
 private func nativeCatalogueHTML(seriesID: String = "100", episodes: [String] = ["200", "201", "202", "203"], accessible: Int = 1,
-                                 contentType: String? = nil) throws -> String {
-    var detail: [String: Any] = ["series_id": seriesID, "series_name": "原生完整目錄", "episode_cnt": episodes.count,
+                                 contentType: String? = nil, reported: Int? = nil) throws -> String {
+    var detail: [String: Any] = ["series_id": seriesID, "series_name": "原生完整目錄", "episode_cnt": reported ?? episodes.count,
                                  "vid_list": episodes, "accessible_episode_cnt": accessible]
     if let contentType { detail["content_type"] = contentType }
     let payload: [String: Any] = ["loaderData": ["detail_page": ["isSuccess": true, "seriesDetail": detail]]]

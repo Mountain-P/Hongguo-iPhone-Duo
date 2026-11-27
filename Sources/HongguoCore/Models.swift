@@ -25,12 +25,52 @@ public struct Episode: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// A public website episode locator. It is never passed to the native playback service.
+public struct WebsiteEpisode: Codable, Hashable, Identifiable, Sendable {
+    public let token: String
+    public let number: Int
+    public var id: String { token }
+
+    public init?(token: String, number: Int) {
+        guard (1...5000).contains(number), (4...512).contains(token.utf8.count), token.hasPrefix("v1_"),
+              token.utf8.dropFirst(3).allSatisfy({ byte in
+                  (65...90).contains(byte) || (97...122).contains(byte) || (48...57).contains(byte) || byte == 45 || byte == 95
+              }) else { return nil }
+        self.token = token
+        self.number = number
+    }
+
+    public func url(seriesID: String) -> URL? {
+        guard let series = Self.seriesURL(seriesID: seriesID) else { return nil }
+        return number == 1 ? series : series.appendingPathComponent(token)
+    }
+
+    public static func seriesURL(seriesID: String) -> URL? {
+        guard (try? validateID(seriesID)) != nil else { return nil }
+        return DirectWebService.siteURL.appendingPathComponent("player").appendingPathComponent(seriesID)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        let token = try fields.decode(String.self, forKey: .token)
+        let number = try fields.decode(Int.self, forKey: .number)
+        guard let value = Self(token: token, number: number) else {
+            throw DecodingError.dataCorruptedError(forKey: .token, in: fields, debugDescription: "Invalid website episode")
+        }
+        self = value
+    }
+}
+
 public struct SeriesDetail: Codable, Hashable, Sendable {
     public var series: Series
     public var episodes: [Episode]
     public var discovery: SeriesDiscoveryMetadata?
-    public init(series: Series, episodes: [Episode], discovery: SeriesDiscoveryMetadata? = nil) {
+    public var websiteEpisodes: [WebsiteEpisode]?
+    public var reportedEpisodeCount: Int?
+    public init(series: Series, episodes: [Episode], discovery: SeriesDiscoveryMetadata? = nil,
+                websiteEpisodes: [WebsiteEpisode]? = nil, reportedEpisodeCount: Int? = nil) {
         self.series = series; self.episodes = episodes; self.discovery = discovery
+        self.websiteEpisodes = websiteEpisodes; self.reportedEpisodeCount = reportedEpisodeCount
     }
 }
 

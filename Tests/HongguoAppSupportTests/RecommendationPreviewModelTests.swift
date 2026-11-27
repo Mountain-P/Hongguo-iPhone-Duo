@@ -608,6 +608,28 @@ struct RecommendationPreviewModelTests {
                              currentStableID: current, snapshot: .init(seriesID: current, episodeID: current + "1", position: seconds, duration: 90))
     }
 
+    @Test func websitePreviewOffersOnlyTheListedFirstEpisodeWithoutStartingNativePlayback() async throws {
+        let source = PreviewCatalogueGate(), model = configured(source)
+        defer { cleanUp(model, source) }
+        try await loadFirst(model, source, ids: ["10", "20"], more: false)
+        for (id, number) in [("10", 1), ("20", 2)] {
+            activate(id, model)
+            try await wait { await source.hasDetail(id) }
+            let pending = try #require(model.detailTask)
+            let episode = try #require(WebsiteEpisode(token: "v1_abcdefghijklmnopqrstuvwxyz0", number: number))
+            let detail = SeriesDetail(series: Series(id: id, title: "劇"), episodes: [], websiteEpisodes: [episode])
+            await source.releaseWebsiteDetail(detail)
+            await pending.value
+            guard case .website(let link) = model.detailErrors[id] else {
+                Issue.record("Expected a website preview result")
+                return
+            }
+            #expect(link == (number == 1 ? episode.url(seriesID: id) : nil))
+            #expect(model.media[id] == nil)
+        }
+        #expect(await source.playbackRequests.isEmpty)
+    }
+
     private func configured(_ source: PreviewCatalogueGate, sessionStore: PreviewSessionStore? = nil) -> RecommendationPreviewModel {
         let model = RecommendationPreviewModel(sessionStore: sessionStore)
         model.configure(revision: UUID(), filterRevision: UUID(), preferences: .init(),
@@ -700,6 +722,9 @@ private actor PreviewCatalogueGate: CatalogService, RecommendationProvenanceProv
     }
     func releaseHome(_ page: Int, items: [Series], more: Bool = false) {
         homes.removeValue(forKey: page)?.resume(returning: .init(items: items, page: page, hasMore: more))
+    }
+    func releaseWebsiteDetail(_ detail: SeriesDetail) {
+        details.removeValue(forKey: detail.series.id)?.resume(returning: detail)
     }
     func releaseDetail(_ id: String, episodeID: String? = nil) {
         details.removeValue(forKey: id)?.resume(returning: .init(series: .init(id: id, title: "劇\(id)"),

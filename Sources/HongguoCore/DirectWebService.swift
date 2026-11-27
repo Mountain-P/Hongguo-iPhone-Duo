@@ -134,17 +134,42 @@ public enum WebsiteParser {
     }
 
     public static func detail(html: String, seriesID: String) throws -> SeriesDetail {
-        let detail = try seriesPayload(html: html, seriesID: seriesID)
-        guard let raw = detail["vid_list"] as? [Any], !raw.isEmpty, raw.count <= 5000 else { throw CatalogError.malformedResponse }
+        let payload = try seriesPayload(html: html, seriesID: seriesID)
+        return try episodeDetail(payload, html: html, seriesID: seriesID, native: false)
+    }
+
+    static func episodeDetail(_ payload: [String: Any], html: String, seriesID: String, native: Bool) throws -> SeriesDetail {
+        guard let raw = payload["vid_list"] as? [Any], raw.count <= 5000 else { throw CatalogError.malformedResponse }
         let ids = raw.map { string($0) }
-        try ids.forEach(validateID)
         guard Set(ids).count == ids.count else { throw CatalogError.malformedResponse }
-        let accessible = integer(detail["accessible_episode_cnt"])
-        if let accessible, accessible < 0 { throw CatalogError.malformedResponse }
-        let series = try card(detail)
-        return SeriesDetail(series: series, episodes: ids.enumerated().map { index, id in
-            Episode(id: id, number: index + 1, title: "第 \(index + 1) 集", isAvailable: accessible.map { index < $0 } ?? true)
-        }, discovery: try? ArtistDiscoveryParser.metadata(html: html, seriesID: seriesID))
+        let series = try card(payload)
+        let accessible = integer(payload["accessible_episode_cnt"])
+        let discovery = try? ArtistDiscoveryParser.metadata(html: html, seriesID: seriesID)
+
+        let reported = integer(payload["episode_cnt"])
+        if raw.isEmpty {
+            guard accessible == 0, let reported, (1...5000).contains(reported) else { throw CatalogError.malformedResponse }
+            return SeriesDetail(series: series, episodes: [], discovery: discovery, websiteEpisodes: [], reportedEpisodeCount: reported)
+        }
+        if ids.first?.hasPrefix("v1_") == true {
+            let entries = try raw.enumerated().map { offset, value in
+                guard let token = value as? String, let episode = WebsiteEpisode(token: token, number: offset + 1) else { throw CatalogError.malformedResponse }
+                return episode
+            }
+            guard payload["episode_cnt"] == nil || (entries.count...5000).contains(reported ?? -1),
+                  payload["accessible_episode_cnt"] == nil || (0...5000).contains(accessible ?? -1) else { throw CatalogError.malformedResponse }
+            return SeriesDetail(series: series, episodes: [], discovery: discovery,
+                                websiteEpisodes: Array(entries.prefix(min(accessible ?? entries.count, entries.count))),
+                                reportedEpisodeCount: reported)
+        }
+
+        try ids.forEach(validateID)
+        if !native, let accessible, accessible < 0 { throw CatalogError.malformedResponse }
+        // The old numeric catalogue and website preview have separate availability rules.
+        let episodes = ids.enumerated().map { index, id in
+            Episode(id: id, number: index + 1, title: "第 \(index + 1) 集", isAvailable: native || (accessible.map { index < $0 } ?? true))
+        }
+        return SeriesDetail(series: series, episodes: episodes, discovery: discovery)
     }
 
     /// The website and the native playback API use the same authoritative series/vid binding.
